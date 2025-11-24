@@ -3,10 +3,20 @@ from __future__ import annotations
 from pathlib import Path
 import pandas as pd
 import streamlit as st
+from utils.auth import check_password
 
 # =========================
 # CONFIG GÉNÉRALE
 # =========================
+
+# ---- Authentification ----
+if not check_password():
+    # On arrête ici si pas loggé (seul le login est affiché)
+    st.stop()
+
+# ---- Suite de ton app (accueil, navigation, etc.) ----
+st.title("📊 Tableau de bord – Fiabilité des transformateurs")
+
 st.set_page_config(
     page_title="Fiabilité & Gestion de stock— Transformateurs",
     page_icon="🛠️",
