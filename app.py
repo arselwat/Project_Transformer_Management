@@ -197,4 +197,4 @@ with row3[0]:
 # =========================
 # PIED DE PAGE
 # =========================
-st.markdown('<div class="footer">© 2025 — Fiabilité & Stock • Interface Streamlit</div>', unsafe_allow_html=True)
+st.markdown('<div class="footer">© 2025 mumputujeanbaptiste@gmail.com— Fiabilité et gestion de Stock • Interface</div>', unsafe_allow_html=True)
