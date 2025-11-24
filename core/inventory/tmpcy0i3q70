@@ -1,0 +1,91 @@
+# core/inventory/recommendations.py
+from __future__ import annotations
+from typing import List, Dict, Any
+import math
+
+# Hypothèse: inv.list_parts_as_dicts() retourne au moins:
+# code, nom, quantite, seuil_min, localisation, prix_unitaire, fournisseur, (optionnel) famille, tags
+
+FAMILLE_KEYWORDS = {
+    "isolation": ["isolateur", "isolation", "papier", "bakélite", "pressboard"],
+    "refroidissement": ["ventilateur", "pompe huile", "radiateur", "échangeur", "ventilo"],
+    "huile": ["huile", "joint", "joint torique", "joint spi"],
+    "mesure": ["capteur", "thermomètre", "thermometre", "sonde", "capteur température", "capteur pression"],
+    "bt": ["bornier", "cosse", "connecteur", "barre", "bt"],
+    "ht": ["isolateur ht", "traverse", "bushing", "ht"],
+    "divers": []  # catch-all
+}
+
+def _infer_family(part: Dict[str, Any]) -> str:
+    fam = (part.get("famille") or "").strip().lower()
+    if fam:
+        return fam
+    name = (part.get("nom") or "").lower()
+    for fam, keys in FAMILLE_KEYWORDS.items():
+        if any(k in name for k in keys):
+            return fam
+    return "divers"
+
+def _recommended_qty(beta: float, part: Dict[str, Any]) -> int:
+    """
+    Règle simple: si β>1 (usure), on augmente le kit pour pièces sensibles.
+    Pour β<=1 (aléatoire/jeunesse), kit minimal.
+    On peut raffiner par famille.
+    """
+    base = 1
+    fam = _infer_family(part)
+    if beta > 3.0:
+        mul = 3
+    elif beta > 2.0:
+        mul = 2
+    elif beta > 1.0:
+        mul = 1
+    else:
+        mul = 1  # jeunesse/aléatoire
+
+    # pondérations familiales (ex: refroidissement & huile sensibles en β>1)
+    if fam in ("refroidissement", "huile", "isolation"):
+        base += 1 if beta > 1.0 else 0
+
+    qty = base * mul
+    return max(1, int(qty))
+
+# core/inventory/recommendations.py  (FACULTATIF si tu as déjà le tien)
+from __future__ import annotations
+from typing import List, Dict
+
+def build_pm_kit_for_equipment(equipment_code: str, beta: float, parts: List[Dict]) -> List[Dict]:
+    """
+    Règle simple :
+      - beta < 1  : vieillissement infantile -> focus 'connexion', 'contact', 'vibration'
+      - 1 <= beta < 2 : aléatoire -> 'isolation', 'huile', 'joint'
+      - beta >= 2 : vieillissement/usage -> 'huile', 'joint', 'ventilation', 'isolateur'
+    On propose 6 pièces si possible, et une 'quantite_recommandee'=min(2, max(1, seuil - dispo)) à titre indicatif.
+    """
+    if not parts:
+        return []
+    beta = float(beta or 1.5)
+    keysets = []
+    if beta < 1.0:
+        keysets = ["contact", "connexion", "vibration", "cable"]
+    elif beta < 2.0:
+        keysets = ["isolation", "huile", "joint", "capteur"]
+    else:
+        keysets = ["huile", "joint", "ventilation", "isolateur", "filtre"]
+
+    sel = []
+    for kw in keysets:
+        for p in parts:
+            name = f"{p.get('nom','')} {p.get('famille','')}".lower()
+            if kw in name:
+                d = dict(p)
+                dispo = int(d.get("quantite_dispo", d.get("quantite", 0)) or 0)
+                seuil = int(d.get("seuil_min", 0) or 0)
+                reco = max(1, min(2, max(0, seuil - dispo)))
+                d["quantite_recommandee"] = reco
+                sel.append(d)
+                if len(sel) >= 6:
+                    break
+        if len(sel) >= 6:
+            break
+    return sel

@@ -1,0 +1,19 @@
+# Environnements virtuels
+.venv/
+.venv_build/
+venv/
+env/
+
+# Variables d'environnement
+.env
+.env.*
+*.secret
+
+# Python
+__pycache__/
+*.pyc
+
+# Build / distribution
+dist/
+reports/*.pdf
+*.log

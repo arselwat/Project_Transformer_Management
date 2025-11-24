@@ -1,0 +1,64 @@
+# core/notify/alerts_plus.py
+from __future__ import annotations
+from typing import Dict, List
+from pathlib import Path
+import csv
+import os
+
+from core.notify.alerts import (
+    load_recipients, _smtp_config_ok, _twilio_config_ok,
+    send_email, send_whatsapp_text, send_whatsapp_with_media, fmt_pm
+)
+from core.maintenance.reporting_plus import export_pm_plan_with_kits_pdf
+
+def export_kits_csv(kits_by_eq: Dict[str, List[Dict]], out_dir="reports") -> str:
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    out_csv = Path(out_dir) / "pm_kits.csv"
+    with open(out_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["equipment_code","code","nom","famille","quantite_dispo","seuil_min","quantite_recommandee","localisation","fournisseur","prix_unitaire"])
+        for eq, kit in kits_by_eq.items():
+            for it in kit:
+                w.writerow([
+                    eq, it.get("code",""), it.get("nom",""), it.get("famille",""),
+                    it.get("quantite_dispo",""), it.get("seuil_min",""), it.get("quantite_recommandee",""),
+                    it.get("localisation",""), it.get("fournisseur",""), it.get("prix_unitaire",""),
+                ])
+    return str(out_csv)
+
+def notify_pm_with_kits(
+    due_tasks: List[Dict],
+    kits_by_eq: Dict[str, List[Dict]],
+    metrics_table: List[Dict],
+) -> Dict:
+    cfg = load_recipients()
+    result = {"count": len(due_tasks), "email": None, "whatsapp": None, "pdf": None, "csv": None}
+    if not due_tasks:
+        return result
+
+    # Générer le PDF (plan + kit + métriques) et CSV (kits)
+    pdf_path = export_pm_plan_with_kits_pdf(due_tasks, kits_by_eq, metrics_table)
+    csv_path = export_kits_csv(kits_by_eq)
+    result["pdf"] = pdf_path
+    result["csv"] = csv_path
+
+    msg = fmt_pm(due_tasks, int(cfg.get("pm_due_within_days", 7)))
+
+    # E-mail avec 2 PJ
+    if cfg.get("emails") and _smtp_config_ok():
+        result["email"] = send_email(
+            subject="Alerte maintenance — Plan + Kits",
+            body=msg + "\n\n(PJ : PDF du plan + CSV des kits)",
+            to_list=cfg["emails"],
+            attachments=[pdf_path, csv_path]
+        )
+
+    # WhatsApp : texte + (media_url optionnel pour PDF)
+    if cfg.get("whatsapp_numbers") and _twilio_config_ok():
+        media_url = ""
+        base = str(cfg.get("whatsapp_media_base","")).strip()
+        if base:
+            media_url = base.rstrip("/") + "/" + os.path.basename(pdf_path)
+        result["whatsapp"] = send_whatsapp_with_media(msg, cfg["whatsapp_numbers"], media_url)
+
+    return result

@@ -1,0 +1,83 @@
+# core/inventory/recommendations.py
+from __future__ import annotations
+from typing import List, Dict, Any
+import math
+
+# Hypothèse: inv.list_parts_as_dicts() retourne au moins:
+# code, nom, quantite, seuil_min, localisation, prix_unitaire, fournisseur, (optionnel) famille, tags
+
+FAMILLE_KEYWORDS = {
+    "isolation": ["isolateur", "isolation", "papier", "bakélite", "pressboard"],
+    "refroidissement": ["ventilateur", "pompe huile", "radiateur", "échangeur", "ventilo"],
+    "huile": ["huile", "joint", "joint torique", "joint spi"],
+    "mesure": ["capteur", "thermomètre", "thermometre", "sonde", "capteur température", "capteur pression"],
+    "bt": ["bornier", "cosse", "connecteur", "barre", "bt"],
+    "ht": ["isolateur ht", "traverse", "bushing", "ht"],
+    "divers": []  # catch-all
+}
+
+def _infer_family(part: Dict[str, Any]) -> str:
+    fam = (part.get("famille") or "").strip().lower()
+    if fam:
+        return fam
+    name = (part.get("nom") or "").lower()
+    for fam, keys in FAMILLE_KEYWORDS.items():
+        if any(k in name for k in keys):
+            return fam
+    return "divers"
+
+def _recommended_qty(beta: float, part: Dict[str, Any]) -> int:
+    """
+    Règle simple: si β>1 (usure), on augmente le kit pour pièces sensibles.
+    Pour β<=1 (aléatoire/jeunesse), kit minimal.
+    On peut raffiner par famille.
+    """
+    base = 1
+    fam = _infer_family(part)
+    if beta > 3.0:
+        mul = 3
+    elif beta > 2.0:
+        mul = 2
+    elif beta > 1.0:
+        mul = 1
+    else:
+        mul = 1  # jeunesse/aléatoire
+
+    # pondérations familiales (ex: refroidissement & huile sensibles en β>1)
+    if fam in ("refroidissement", "huile", "isolation"):
+        base += 1 if beta > 1.0 else 0
+
+    qty = base * mul
+    return max(1, int(qty))
+
+def build_pm_kit_for_equipment(eq_code: str, beta: float, parts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Retourne une liste de lignes:
+    {
+      code, nom, famille, quantite_dispo, seuil_min, localisation,
+      quantite_recommandee, disponible(bool), prix_unitaire, fournisseur
+    }
+    """
+    rows = []
+    for p in parts:
+        fam = _infer_family(p)
+        rec = _recommended_qty(beta, p)
+        qte = int(p.get("quantite") or 0)
+        seuil = int(p.get("seuil_min") or 0)
+        dispo = qte >= rec and qte > seuil
+        rows.append({
+            "equipment_code": eq_code,
+            "code": p.get("code"),
+            "nom": p.get("nom"),
+            "famille": fam,
+            "quantite_dispo": qte,
+            "seuil_min": seuil,
+            "localisation": p.get("localisation") or "",
+            "quantite_recommandee": rec,
+            "disponible": dispo,
+            "prix_unitaire": float(p.get("prix_unitaire") or 0.0),
+            "fournisseur": p.get("fournisseur") or ""
+        })
+    # tri: montrer d’abord ce qui n’est pas dispo (à approvisionner)
+    rows.sort(key=lambda r: (r["disponible"], -r["quantite_recommandee"]))
+    return rows

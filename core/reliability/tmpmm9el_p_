@@ -1,0 +1,96 @@
+# core/reliability/weibull.py
+from __future__ import annotations
+from dataclasses import dataclass
+import numpy as np
+import math
+from typing import Any, Tuple
+
+# ---------- Modèle paramétrique minimal ----------
+@dataclass
+class WeibullFit:
+    beta: float
+    eta: float
+    gamma: float = 0.0
+
+# ---------- Helpers robustes ----------
+def _params_from_fit(fit: Any) -> Tuple[float, float, float]:
+    """
+    Extrait (beta, eta, gamma) depuis:
+      - instance avec attributs .beta/.eta/(.gamma)
+      - dict {"beta":..,"eta":..,"gamma":..}
+    Lève ValueError si β ou η manquants/invalide.
+    """
+    beta = None
+    eta  = None
+    gamma = 0.0
+
+    if fit is None:
+        raise ValueError("fit is None")
+
+    # objet avec attributs
+    if hasattr(fit, "beta") and hasattr(fit, "eta"):
+        beta = getattr(fit, "beta", None)
+        eta  = getattr(fit, "eta", None)
+        gamma = getattr(fit, "gamma", 0.0)
+
+    # dict
+    if beta is None and isinstance(fit, dict):
+        beta = fit.get("beta", None)
+        eta  = fit.get("eta",  None)
+        gamma = fit.get("gamma", 0.0)
+
+    # conversion + garde-fous
+    try:
+        beta = float(beta)
+        eta  = float(eta)
+        gamma = float(gamma if gamma is not None else 0.0)
+    except Exception as e:
+        raise ValueError(f"Invalid β/η values on fit: {e}")
+
+    if not (beta > 0.0 and eta > 0.0):
+        raise ValueError("β and η must be > 0")
+
+    return beta, eta, gamma
+
+def _x_from_t(t, gamma):
+    """Décale le temps (γ), borne à ≥0."""
+    x = np.asarray(t, dtype=float)
+    return np.maximum(x, gamma) - gamma
+
+# ---------- Fonctions universelles (pas d'appel à fit.R()) ----------
+def R(t, fit: Any):
+    beta, eta, gamma = _params_from_fit(fit)
+    x = _x_from_t(t, gamma)
+    # evite divisions par 0 / overflow
+    eta = max(eta, 1e-12)
+    with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+        z = (x / eta) ** beta
+        out = np.exp(-z)
+    return out
+
+def F(t, fit: Any):
+    return 1.0 - R(t, fit)
+
+def pdf(t, fit: Any):
+    beta, eta, gamma = _params_from_fit(fit)
+    x = _x_from_t(t, gamma)
+    eta = max(eta, 1e-12)
+    with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+        base = (x / eta)
+        dens = (beta / eta) * np.power(base, np.maximum(beta - 1.0, 0.0)) * np.exp(-np.power(base, beta))
+    # nulle pour x<0 (déjà géré par max), mais on met à 0 si t<γ strictement
+    dens = np.where((np.asarray(t, dtype=float) - gamma) >= 0.0, dens, 0.0)
+    return dens
+
+def hazard(t, fit: Any):
+    f = pdf(t, fit)
+    r = R(t, fit)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        h = np.where(r > 0.0, f / np.clip(r, 1e-300, None), np.nan)
+    return h
+
+# ---------- (optionnel) utilitaire d’adaptation ----------
+def as_weibull_fit(fit: Any) -> WeibullFit:
+    """Transforme objet/dict en WeibullFit."""
+    b, e, g = _params_from_fit(fit)
+    return WeibullFit(beta=b, eta=e, gamma=g)

@@ -1,0 +1,41 @@
+from __future__ import annotations
+import time
+from typing import Dict, Any, Tuple
+from .config import load_alerts_config
+from .senders import send_email_alert, send_whatsapp_alert
+
+# anti-spam: { (level, code): last_ts }
+_LAST_SENT: Dict[Tuple[str,str], float] = {}
+
+def _format_subject(ev: dict, prefix: str) -> str:
+    site = ev.get("site","")
+    eq   = ev.get("equipment","")
+    lvl  = ev.get("level","INFO")
+    code = ev.get("code","EVT")
+    return f"{prefix}{lvl} [{code}] {site}/{eq}"
+
+def _format_body(ev: dict) -> str:
+    parts = []
+    for k in ["ts","site","equipment","level","code","msg","value","threshold"]:
+        parts.append(f"{k}: {ev.get(k,'')}")
+    return "\n".join(parts)
+
+def notify_event(ev: dict) -> dict:
+    cfg = load_alerts_config()
+    now = time.time()
+    key = (str(ev.get("level","")), str(ev.get("code","")))
+    last = _LAST_SENT.get(key, 0.0)
+    if (now - last) < float(cfg.min_period_s):
+        return {"ok": True, "skipped": True, "reason": "anti-spam"}
+
+    subject = _format_subject(ev, cfg.subject_prefix or "")
+    body    = _format_body(ev)
+    results = {}
+
+    if cfg.enable_email:
+        results["email"] = send_email_alert(subject, body, cfg.smtp)
+    if cfg.enable_whatsapp:
+        results["whatsapp"] = send_whatsapp_alert(body, cfg.twilio)
+
+    _LAST_SENT[key] = now
+    return {"ok": True, "results": results}

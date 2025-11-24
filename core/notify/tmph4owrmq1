@@ -1,0 +1,62 @@
+from __future__ import annotations
+import smtplib, ssl, base64, json
+from email.mime.text import MIMEText
+from typing import Dict, Any
+import requests
+
+from .config import SMTPConfig, TwilioConfig
+
+def send_email_alert(subject: str, body: str, smtp: SMTPConfig) -> Dict[str, Any]:
+    try:
+        if not smtp.host or not smtp.port or not smtp.from_addr or not smtp.to_addrs:
+            return {"ok": False, "error": "SMTP config incomplète"}
+        msg = MIMEText(body, _charset="utf-8")
+        msg["Subject"] = subject
+        msg["From"] = smtp.from_addr
+        msg["To"]   = ", ".join(smtp.to_addrs)
+
+        if smtp.use_ssl:
+            ctx = ssl.create_default_context()
+            with smtplib.SMTP_SSL(smtp.host, smtp.port, context=ctx) as s:
+                if smtp.user: s.login(smtp.user, smtp.password)
+                s.sendmail(smtp.from_addr, smtp.to_addrs, msg.as_string())
+        else:
+            with smtplib.SMTP(smtp.host, smtp.port, timeout=20) as s:
+                if smtp.use_starttls:
+                    s.starttls(context=ssl.create_default_context())
+                if smtp.user:
+                    s.login(smtp.user, smtp.password)
+                s.sendmail(smtp.from_addr, smtp.to_addrs, msg.as_string())
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+def send_whatsapp_alert(body: str, tw: TwilioConfig) -> Dict[str, Any]:
+    try:
+        if not tw.sid or not tw.token or not tw.whatsapp_from or not tw.whatsapp_to:
+            return {"ok": False, "error": "Twilio config incomplète"}
+        # Twilio REST API simple via requests
+        url = f"https://api.twilio.com/2010-04-01/Accounts/{tw.sid}/Messages.json"
+        data = {
+            "From": f"whatsapp:{tw.whatsapp_from.replace('whatsapp:','')}",
+            "To":   f"whatsapp:{tw.whatsapp_to.replace('whatsapp:','')}",
+            "Body": body,
+        }
+        auth = (tw.sid, tw.token)
+        resp = requests.post(url, data=data, auth=auth, timeout=20)
+        if resp.status_code >= 200 and resp.status_code < 300:
+            return {"ok": True, "twilio": resp.json()}
+        else:
+            try:
+                return {"ok": False, "error": resp.text, "status": resp.status_code, "json": resp.json()}
+            except Exception:
+                return {"ok": False, "error": resp.text, "status": resp.status_code}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+# --- Alias rétrocompatibles (pour anciens imports) ---
+def send_email_smtp(subject: str, body: str, smtp: SMTPConfig):
+    return send_email_alert(subject, body, smtp)
+
+def send_whatsapp_twilio(body: str, tw: TwilioConfig):
+    return send_whatsapp_alert(body, tw)

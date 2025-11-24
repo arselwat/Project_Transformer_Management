@@ -1,0 +1,291 @@
+# core/reliability/reporting_full.py
+from __future__ import annotations
+
+import datetime
+from pathlib import Path
+from typing import Dict, List, Optional
+
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.units import mm
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, PageBreak
+)
+from reportlab.lib.styles import getSampleStyleSheet
+import unicodedata
+import math
+
+# --------------------------------------------------------------------
+# Sanitize: texte sûr pour polices Type1 (latin-1) => évite erreurs PDF
+# --------------------------------------------------------------------
+def SAN(s) -> str:
+    s = str(s)
+    s = (s.replace("’", "'").replace("‘", "'")
+           .replace("“", '"').replace("”", '"')
+           .replace("–", "-").replace("—", "-")
+           .replace("•", "-").replace("…", "...")
+           .replace("\u00A0", " "))
+    s = "".join(ch if ord(ch) <= 255 else " " for ch in s)
+    s = unicodedata.normalize("NFKD", s)
+    s = s.encode("latin-1", "ignore").decode("latin-1", "ignore")
+    return s
+
+# --------------------------------------------------------------------
+# Politique de maintenance pilotée par β (Weibull)
+# --------------------------------------------------------------------
+def maintenance_mode_from_beta(beta: float) -> str:
+    if beta < 0.9:
+        return "Maintenance corrective ciblée (mode infantile / défauts précoces)"
+    elif beta <= 1.2:
+        return "Maintenance aléatoire / opportuniste (taux de défaillance ~ constant)"
+    else:
+        return "Maintenance préventive/predictive renforcée (vieillissement)"
+
+def policy_bullets_from_beta(beta: float) -> List[str]:
+    bullets = []
+    if beta < 0.9:
+        bullets += [
+            "RCA systématique des défaillances précoces, fiabilisation fournisseurs/process.",
+            "Burn-in / essais renforcés avant mise en service.",
+            "Surveillance ciblée des équipements neufs/révisés.",
+        ]
+    elif beta <= 1.2:
+        bullets += [
+            "Standardiser les procédures de dépannage (réduire MTTR).",
+            "Stock critique minimal des pièces les plus consommées.",
+            "Maintenance opportuniste lors des arrêts planifiés.",
+        ]
+    else:
+        bullets += [
+            "Préventif calendaire/usage : inspections et remplacements programmés.",
+            "CBM (analyses huile, température en ligne, vibrations, diag gaz) pour anticiper.",
+            "Plan de renouvellement des organes faiblement fiables.",
+        ]
+    # Toujours valables
+    bullets += [
+        "Digitaliser les historiques panne/réparation (réduction MTTR).",
+        "Former les équipes & mise à jour des fiches de procédure d’intervention.",
+    ]
+    return bullets
+
+# --------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------
+def _fmt_f(value, nd=2, default="n/a"):
+    try:
+        if value is None or (isinstance(value, float) and math.isnan(value)):
+            return default
+        return f"{float(value):.{nd}f}"
+    except Exception:
+        return default
+
+def _eta_to_interval_hours(beta: float, eta: float, R_target: float) -> Optional[float]:
+    """
+    Propose un intervalle t* tel que R(t*) ≈ R_target pour Weibull(β, η).
+    R(t) = exp(-(t/η)^β) => t* = η * ( -ln R* )^(1/β)
+    """
+    try:
+        if beta and eta and R_target and 0 < R_target < 1:
+            return eta * ((-math.log(R_target)) ** (1.0 / beta))
+    except Exception:
+        pass
+    return None
+
+# --------------------------------------------------------------------
+# Construction des pages images (les courbes sont déjà exportées par la page indicateurs)
+# fig_paths_per_eq doit être un dict : { eq: {"R":/path, "F":..., "pdf":..., "hazard":..., "M":/option} }
+# --------------------------------------------------------------------
+def _add_curves_section(story, styles, title: str, fig_paths_per_eq: Dict[str, Dict[str, str]], R_target: float, fits: Dict):
+    story.append(Paragraph(SAN(title), styles["Heading2"]))
+    if not fig_paths_per_eq:
+        story.append(Paragraph(SAN("Aucune courbe disponible."), styles["BodyText"]))
+        return
+
+    for i, eq in enumerate(sorted(fig_paths_per_eq.keys())):
+        if i > 0:
+            story.append(PageBreak())
+
+        story.append(Paragraph(SAN(f"Courbes — {eq}"), styles["Heading3"]))
+
+        # ordre d'affichage simple et sûr
+        paths = fig_paths_per_eq[eq]
+        ordered = [paths.get("R"), paths.get("F"), paths.get("pdf"), paths.get("hazard")]
+        if paths.get("M"):
+            ordered.append(paths["M"])
+
+        for p in ordered:
+            if p and Path(p).exists():
+                img = Image(str(p), width=170*mm, height=120*mm)
+                story.append(img)
+                story.append(Spacer(1, 6))
+
+        # rappel paramètres & cible
+        ft = fits.get(eq)
+        beta = float(getattr(ft, "beta", float("nan"))) if ft else float("nan")
+        eta  = float(getattr(ft, "eta",  float("nan"))) if ft else float("nan")
+        story.append(Paragraph(SAN(f"Paramètres estimés : β={_fmt_f(beta,2)}, η={_fmt_f(eta,1)} h — Cible R*={_fmt_f(R_target,2)}"), styles["Normal"]))
+
+# --------------------------------------------------------------------
+# Section : Plan de maintenance (piloté par β) + éventuels kits & stock
+# kits_by_eq : dict eq -> [ {code, nom, famille, quantite_dispo, seuil_min, quantite_recommandee, localisation, fournisseur} ]
+# metrics_table : liste dict (MTBF/MTTR +/- optimisés, β, η, γ...) pour récapitulatif
+# --------------------------------------------------------------------
+def _add_maintenance_plan_section(story, styles,
+                                  fits: Dict,
+                                  R_target: float = 0.80,
+                                  kits_by_eq: Optional[Dict[str, List[dict]]] = None,
+                                  metrics_table: Optional[List[dict]] = None):
+    story.append(PageBreak())
+    story.append(Paragraph(SAN("Plan de maintenance recommandé (piloté par β)"), styles["Heading2"]))
+    story.append(Spacer(1, 6))
+
+    # Tableau récap métriques si fourni
+    if metrics_table:
+        cols = ["equipment_code","MTBF","MTTR","MTBF_opt","MTTR_opt","beta","eta","gamma"]
+        header = ["Equipement","MTBF (h)","MTTR (h)","MTBF opt","MTTR opt","beta","eta","gamma"]
+        data = [header]
+        for r in metrics_table:
+            row = [
+                SAN(r.get("equipment_code","")),
+                SAN(_fmt_f(r.get("MTBF"),1)),
+                SAN(_fmt_f(r.get("MTTR"),1)),
+                SAN(_fmt_f(r.get("MTBF_opt"),1)),
+                SAN(_fmt_f(r.get("MTTR_opt"),1)),
+                SAN(_fmt_f(r.get("beta"),2)),
+                SAN(_fmt_f(r.get("eta"),1)),
+                SAN(_fmt_f(r.get("gamma"),1)),
+            ]
+            data.append(row)
+        tbl = Table(data, repeatRows=1)
+        tbl.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (-1,0), colors.lightgrey),
+            ("GRID", (0,0), (-1,-1), 0.3, colors.grey),
+            ("FONTSIZE", (0,0), (-1,-1), 8),
+            ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+        ]))
+        story.append(tbl)
+        story.append(Spacer(1, 8))
+
+    # Détails par équipement
+    eqs = sorted(list(fits.keys()))
+    for idx, eq in enumerate(eqs):
+        ft = fits.get(eq)
+        if not ft:
+            continue
+        beta = float(getattr(ft, "beta", float("nan")))
+        eta  = float(getattr(ft, "eta",  float("nan")))
+
+        story.append(Paragraph(SAN(f"Équipement : {eq}"), styles["Heading3"]))
+        story.append(Paragraph(SAN(f"Mode recommandé : {maintenance_mode_from_beta(beta)}"), styles["BodyText"]))
+
+        # intervalle t* recommandé pour atteindre R*
+        t_star = _eta_to_interval_hours(beta, eta, R_target)
+        if t_star:
+            story.append(Paragraph(SAN(f"Intervalle conseillé pour maintenir R(t) ≥ {int(R_target*100)}% : t* ≈ {int(t_star)} h"), styles["BodyText"]))
+
+        story.append(Paragraph(SAN("Actions proposées :"), styles["BodyText"]))
+        for li in policy_bullets_from_beta(beta):
+            story.append(Paragraph(SAN("• " + li), styles["BodyText"]))
+
+        # Kits & disponibilité
+        kit_list = (kits_by_eq or {}).get(eq, [])
+        story.append(Spacer(1, 4))
+        story.append(Paragraph(SAN("Kit de pièces recommandé"), styles["BodyText"]))
+        if not kit_list:
+            story.append(Paragraph(SAN("Aucune pièce détectée (renseigner famille/mots-clés)."), styles["BodyText"]))
+        else:
+            data = [["Code","Nom","Famille","Dispo","Seuil","Qte rec.","Localisation","Fournisseur","Etat stock"]]
+            for k in kit_list:
+                dispo = int(k.get("quantite_dispo", 0) or 0)
+                qrec  = int(k.get("quantite_recommandee", 0) or 0)
+                etat = "OK" if dispo >= qrec and qrec > 0 else ("Sous-seuil" if dispo < (int(k.get("seuil_min",0) or 0)) else "A compléter")
+                data.append([
+                    SAN(k.get("code","")),
+                    SAN(k.get("nom","")),
+                    SAN(k.get("famille","")),
+                    SAN(str(dispo)),
+                    SAN(str(k.get("seuil_min",""))),
+                    SAN(str(qrec)),
+                    SAN(k.get("localisation","")),
+                    SAN(k.get("fournisseur","")),
+                    SAN(etat),
+                ])
+            tbl = Table(data, repeatRows=1)
+            tbl.setStyle(TableStyle([
+                ("BACKGROUND", (0,0), (-1,0), colors.lightgrey),
+                ("GRID", (0,0), (-1,-1), 0.3, colors.grey),
+                ("FONTSIZE", (0,0), (-1,-1), 8),
+                ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+            ]))
+            story.append(tbl)
+
+        story.append(Spacer(1, 10))
+
+# --------------------------------------------------------------------
+# Entrée principale
+# - failures_df : DataFrame (déjà consolidé) pour ce rapport (pour contexte tête)
+# - fits : dict eq -> objet ayant .beta et .eta (fit Weibull)
+# - fig_paths_per_eq : dict eq -> { "R": path, "F": path, "pdf": path, "hazard": path, "M": path (option) }
+# - metrics_table : liste de lignes dict (option) MTBF/MTTR & β/η/γ (si tu l’as déjà calculée)
+# - kits_by_eq : dict eq -> liste dict pièces (option)
+# --------------------------------------------------------------------
+def export_full_report_pdf(
+    failures_df,
+    fits: Dict[str, object],
+    out_dir: str = "reports",
+    R_target: float = 0.80,
+    fig_paths_per_eq: Optional[Dict[str, Dict[str, str]]] = None,
+    metrics_table: Optional[List[dict]] = None,
+    kits_by_eq: Optional[Dict[str, List[dict]]] = None,
+    title: str = "Analyse de fiabilite & Optimisation + Plan de maintenance"
+) -> str:
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(exist_ok=True, parents=True)
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M")
+    out_path = out_dir / f"full_report_{stamp}.pdf"
+
+    styles = getSampleStyleSheet()
+    doc = SimpleDocTemplate(
+        str(out_path),
+        pagesize=A4,
+        topMargin=20*mm, bottomMargin=15*mm,
+        leftMargin=15*mm, rightMargin=15*mm,
+    )
+    story: List = []
+
+    # Titre
+    story.append(Paragraph(SAN(title), styles["Title"]))
+    story.append(Spacer(1, 6))
+
+    # En-tête minimal sur le dataset (évite d’injecter le DataFrame entier)
+    try:
+        n = len(failures_df) if failures_df is not None else 0
+        story.append(Paragraph(SAN(f"Jeu de donnees : {n} lignes."), styles["Normal"]))
+    except Exception:
+        story.append(Paragraph(SAN("Jeu de donnees : (indetermine)."), styles["Normal"]))
+    story.append(Paragraph(SAN(f"Nombre d’equipements analyses : {len(fits)}"), styles["Normal"]))
+    story.append(Paragraph(SAN(f"Cible de fiabilite R* : {int(R_target*100)}%"), styles["Normal"]))
+    story.append(Spacer(1, 8))
+
+    # Section courbes (si fournie par la page indicateurs)
+    if fig_paths_per_eq:
+        _add_curves_section(story, styles, "Courbes d’analyse (R, F, f, h, M)", fig_paths_per_eq, R_target, fits)
+    else:
+        story.append(Paragraph(SAN("Courbes non fournies par la page d’indicateurs."), styles["BodyText"]))
+
+    # Plan de maintenance + kits + metrics
+    _add_maintenance_plan_section(
+        story, styles,
+        fits=fits,
+        R_target=R_target,
+        kits_by_eq=kits_by_eq,
+        metrics_table=metrics_table
+    )
+
+    # Pied
+    story.append(Paragraph(SAN(f"Rapport genere le {datetime.datetime.now().strftime('%d/%m/%Y %H:%M')}"), styles["Normal"]))
+
+    # IMPORTANT : ne jamais faire story.append(a, b)
+    doc.build(story)
+    return str(out_path)

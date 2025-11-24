@@ -1,0 +1,82 @@
+# core/notify/config.py
+from __future__ import annotations
+import os, json
+from dataclasses import dataclass
+from pathlib import Path
+
+@dataclass
+class SMTPConfig:
+    host: str = ""
+    port: int = 587
+    user: str = ""
+    password: str = ""
+    from_addr: str = ""
+    to_addrs: list[str] = None
+    use_ssl: bool = False      # 465
+    use_starttls: bool = True  # 587
+
+@dataclass
+class TwilioConfig:
+    sid: str = ""
+    token: str = ""
+    whatsapp_from: str = ""  # ex: "+1415xxxxxxx"
+    whatsapp_to: str = ""    # ex: "+2438xxxxxxxx"
+
+@dataclass
+class AlertsConfig:
+    enable_email: bool = False
+    enable_whatsapp: bool = False
+    subject_prefix: str = "[ALERTE TRANSFO]"
+    smtp: SMTPConfig = SMTPConfig()
+    twilio: TwilioConfig = TwilioConfig()
+
+def _as_bool(v: str | None, default=False) -> bool:
+    if v is None: return default
+    return str(v).strip().lower() in {"1","true","yes","y","on"}
+
+def load_alerts_config() -> AlertsConfig:
+    # Base depuis JSON (facultatif)
+    cfg_json = {}
+    json_path = Path("config/alerts.json")
+    if json_path.exists():
+        try:
+            cfg_json = json.loads(json_path.read_text(encoding="utf-8"))
+        except Exception:
+            cfg_json = {}
+
+    def jget(path: list[str], default=None):
+        cur = cfg_json
+        for k in path:
+            if not isinstance(cur, dict) or k not in cur:
+                return default
+            cur = cur[k]
+        return cur
+
+    # SMTP
+    smtp = SMTPConfig(
+        host = os.getenv("SMTP_HOST", jget(["smtp","host"], "")),
+        port = int(os.getenv("SMTP_PORT", jget(["smtp","port"], 587) or 587)),
+        user = os.getenv("SMTP_USER", jget(["smtp","user"], "")),
+        password = os.getenv("SMTP_PASS", jget(["smtp","password"], "")),
+        from_addr = os.getenv("SMTP_FROM", jget(["smtp","from"], "")),
+        to_addrs = [s.strip() for s in os.getenv("SMTP_TO", ",".join(jget(["smtp","to"], []) or [])).split(",") if s.strip()],
+        use_ssl = _as_bool(os.getenv("SMTP_SSL", str(jget(["smtp","use_ssl"], False))), False),
+        use_starttls = _as_bool(os.getenv("SMTP_STARTTLS", str(jget(["smtp","use_starttls"], True))), True),
+    )
+
+    # Twilio
+    twilio = TwilioConfig(
+        sid = os.getenv("TWILIO_SID", jget(["twilio","sid"], "")),
+        token = os.getenv("TWILIO_TOKEN", jget(["twilio","token"], "")),
+        whatsapp_from = os.getenv("WHATSAPP_FROM", jget(["twilio","whatsapp_from"], "")),
+        whatsapp_to = os.getenv("WHATSAPP_TO", jget(["twilio","whatsapp_to"], "")),
+    )
+
+    cfg = AlertsConfig(
+        enable_email   = _as_bool(os.getenv("ENABLE_EMAIL",   str(jget(["enable_email"], False)))),
+        enable_whatsapp= _as_bool(os.getenv("ENABLE_WHATSAPP",str(jget(["enable_whatsapp"], False)))),
+        subject_prefix = os.getenv("ALERT_SUBJECT_PREFIX", jget(["subject_prefix"], "[ALERTE TRANSFO]")),
+        smtp = smtp,
+        twilio = twilio,
+    )
+    return cfg

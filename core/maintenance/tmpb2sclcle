@@ -1,0 +1,128 @@
+from __future__ import annotations
+from pathlib import Path
+from typing import Dict, List, Tuple
+import pandas as pd
+import datetime as dt
+
+from core.reliability.weibull import fit_weibull
+from core.inventory import services as inv
+from core.inventory.recommendations import build_pm_kit_for_equipment
+from pathlib import Path
+import pandas as pd
+
+def _read_events_any(path_str: str) -> pd.DataFrame:
+    p = Path(path_str)
+    frames = []
+    if p.exists():
+        frames.append(pd.read_csv(p, dtype=str))
+    bk = p.with_suffix(".backup.csv")
+    if bk.exists():
+        frames.append(pd.read_csv(bk, dtype=str))
+    if not frames:
+        return pd.DataFrame()
+    df = pd.concat(frames, ignore_index=True)
+    return df
+
+EVT_CSV  = Path("data/realtime_events.csv")
+FAIL_CSV = Path("data/failures_saved.csv")
+
+def _beta_by_equipment() -> Dict[str, float]:
+    """Calcule β par équipement à partir de failures_saved.csv (si >=3 TTF)."""
+    betas: Dict[str, float] = {}
+    if not FAIL_CSV.exists():
+        return betas
+    try:
+        df = pd.read_csv(FAIL_CSV)
+        if "equipment_code" not in df.columns or "ttf_h" not in df.columns:
+            return betas
+        for eq, grp in df.groupby("equipment_code"):
+            x = pd.to_numeric(grp["ttf_h"], errors="coerce").dropna().values
+            if len(x) >= 3:
+                try:
+                    ft = fit_weibull(x)
+                    betas[str(eq)] = float(ft.beta)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return betas
+
+def _priority(level: str) -> str:
+    level = (level or "").upper()
+    if level == "ALARM":
+        return "High"
+    if level == "WARN":
+        return "Medium"
+    return "Low"
+
+def ingest_events_to_tasks(events_csv: str = "data/realtime_events.csv") -> Dict:
+    """
+    Lit les événements non traités (processed != 1) et propose :
+    - une liste de tâches correctives (dict)
+    - des kits pièces par équipement (via β si dispo, sinon β=1.3)
+    Marque ensuite les événements comme 'processed=1' dans le CSV.
+    """
+    p = Path(events_csv)
+    if not p.exists():
+        return {"tasks": [], "kits_by_eq": {}, "events_loaded": 0, "marked_processed": 0}
+
+    df = pd.read_csv(p)
+    if df.empty:
+        return {"tasks": [], "kits_by_eq": {}, "events_loaded": 0, "marked_processed": 0}
+
+    if "processed" not in df.columns:
+        df["processed"] = 0
+
+    df_new = df[df["processed"] != 1].copy()
+    if df_new.empty:
+        return {"tasks": [], "kits_by_eq": {}, "events_loaded": len(df), "marked_processed": 0}
+
+    # Prépare β par équipement
+    betas = _beta_by_equipment()
+    # Liste pièces
+    try:
+        parts = inv.list_parts_as_dicts()
+    except Exception:
+        try:
+            parts = inv.list_parts()
+        except Exception:
+            parts = []
+
+    tasks: List[Dict] = []
+    kits_by_eq: Dict[str, List[Dict]] = {}
+
+    today = dt.date.today().isoformat()
+    for _, r in df_new.iterrows():
+        eq = str(r.get("equipment", ""))
+        lvl = str(r.get("level", "INFO"))
+        code = str(r.get("code", "EVENT"))
+        msg  = str(r.get("msg", ""))
+
+        task = {
+            "equipment_code": eq,
+            "title": f"[{lvl}] {code}",
+            "priority": _priority(lvl),
+            "due_date": today,
+            "type": "corrective",
+            "source": "realtime_event",
+            "description": msg or f"Auto-généré depuis événement {code}",
+        }
+        tasks.append(task)
+
+        if eq not in kits_by_eq:
+            b = betas.get(eq, 1.3)
+            try:
+                kits_by_eq[eq] = build_pm_kit_for_equipment(eq, b, parts) or []
+            except Exception:
+                kits_by_eq[eq] = []
+
+    # Marque 'processed=1' pour les lignes traitées (par ts)
+    df.loc[df_new.index, "processed"] = 1
+    df.to_csv(p, index=False)
+
+    return {
+        "tasks": tasks,
+        "kits_by_eq": kits_by_eq,
+        "events_loaded": len(df),
+        "marked_processed": len(df_new),
+    }

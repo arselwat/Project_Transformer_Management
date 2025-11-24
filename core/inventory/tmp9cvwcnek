@@ -1,0 +1,143 @@
+from __future__ import annotations
+
+from typing import List, Dict, Any, Tuple
+from .storage import load_parts, save_parts, append_movement
+
+
+# ---------- Lecture / listes ----------
+def list_parts_as_dicts() -> List[Dict[str, Any]]:
+    return load_parts()
+
+# Rétro-compat (appelé ailleurs)
+def list_parts() -> List[Dict[str, Any]]:
+    return load_parts()
+
+def get_part(code: str) -> Dict[str, Any] | None:
+    code = (code or "").strip()
+    for p in load_parts():
+        if (p.get("code") or "").strip() == code:
+            return p
+    return None
+
+
+# ---------- CRUD ----------
+def add_part(d: Dict[str, Any]) -> Tuple[bool, str]:
+    code = (d.get("code") or "").strip()
+    if not code:
+        return False, "Code manquant"
+    parts = load_parts()
+    if any((p.get("code") or "").strip() == code for p in parts):
+        return False, f"Le code {code} existe déjà"
+    parts.append({
+        "code": code,
+        "nom": d.get("nom", ""),
+        "famille": d.get("famille", ""),
+        "quantite_dispo": float(d.get("quantite_dispo") or 0),
+        "seuil_min": float(d.get("seuil_min") or 0),
+        "localisation": d.get("localisation", ""),
+        "prix_unitaire": float(d.get("prix_unitaire") or 0),
+        "fournisseur": d.get("fournisseur", ""),
+    })
+    save_parts(parts)
+    return True, "Ajouté"
+
+def update_part(code: str, fields: Dict[str, Any]) -> Tuple[bool, str]:
+    code = (code or "").strip()
+    parts = load_parts()
+    idx = next((i for i, p in enumerate(parts) if (p.get("code") or "").strip() == code), -1)
+    if idx < 0:
+        return False, "Introuvable"
+    p = parts[idx].copy()
+    for k in ["nom", "famille", "localisation", "fournisseur"]:
+        if k in fields:
+            p[k] = fields[k]
+    for k in ["quantite_dispo", "seuil_min", "prix_unitaire"]:
+        if k in fields:
+            try:
+                p[k] = float(fields[k])
+            except Exception:
+                pass
+    parts[idx] = p
+    save_parts(parts)
+    return True, "Modifié"
+
+def delete_part_by_code(code: str) -> Tuple[bool, str]:
+    code = (code or "").strip()
+    parts = load_parts()
+    new = [p for p in parts if (p.get("code") or "").strip() != code]
+    if len(new) == len(parts):
+        return False, "Introuvable"
+    save_parts(new)
+    return True, "Supprimé"
+
+
+# ---------- Mouvements ----------
+def move_in(code: str, qty: float, reason: str = "IN", ref: str = "", user: str = "") -> Tuple[bool, str]:
+    try:
+        qty = float(qty)
+    except Exception:
+        return False, "Quantité invalide"
+    if qty <= 0:
+        return False, "Quantité <= 0"
+
+    parts = load_parts()
+    for p in parts:
+        if (p.get("code") or "").strip() == (code or "").strip():
+            p["quantite_dispo"] = float(p.get("quantite_dispo") or 0) + qty
+            save_parts(parts)
+            append_movement({"type": "IN", "code": code, "qty": qty, "reason": reason, "ref": ref, "user": user})
+            return True, "Entrée enregistrée"
+    return False, "Introuvable"
+
+def move_out(code: str, qty: float, reason: str = "OUT", ref: str = "", user: str = "", allow_negative: bool = False) -> Tuple[bool, str]:
+    try:
+        qty = float(qty)
+    except Exception:
+        return False, "Quantité invalide"
+    if qty <= 0:
+        return False, "Quantité <= 0"
+
+    parts = load_parts()
+    for p in parts:
+        if (p.get("code") or "").strip() == (code or "").strip():
+            cur = float(p.get("quantite_dispo") or 0)
+            if not allow_negative and cur < qty:
+                return False, f"Stock insuffisant (dispo={cur})"
+            p["quantite_dispo"] = cur - qty
+            save_parts(parts)
+            append_movement({"type": "OUT", "code": code, "qty": qty, "reason": reason, "ref": ref, "user": user})
+            return True, "Sortie enregistrée"
+    return False, "Introuvable"
+
+def adjust_stock(code: str, delta: float, reason: str = "ADJUST", ref: str = "", user: str = "") -> Tuple[bool, str]:
+    try:
+        delta = float(delta)
+    except Exception:
+        return False, "Delta invalide"
+
+    parts = load_parts()
+    for p in parts:
+        if (p.get("code") or "").strip() == (code or "").strip():
+            p["quantite_dispo"] = float(p.get("quantite_dispo") or 0) + delta
+            save_parts(parts)
+            append_movement({"type": "ADJUST", "code": code, "qty": delta, "reason": reason, "ref": ref, "user": user})
+            return True, "Ajusté"
+    return False, "Introuvable"
+
+def reserve_parts(req: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Utilisé par la page Maintenance :
+    req = [ {"code": "X", "qty": 2, "reason": "PM TR-01"}, ... ]
+    """
+    done = 0
+    errors = []
+    for r in req or []:
+        code = (r.get("code") or "").strip()
+        qty = float(r.get("qty") or 0)
+        reason = r.get("reason", "PM")
+        ok, msg = move_out(code, qty, reason=reason, ref="PM", user="app")
+        if ok:
+            done += 1
+        else:
+            errors.append({"code": code, "qty": qty, "error": msg})
+    return {"done": done, "errors": errors}

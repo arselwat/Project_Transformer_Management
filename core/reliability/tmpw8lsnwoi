@@ -1,0 +1,67 @@
+# core/reliability/metrics_plus.py
+from __future__ import annotations
+from typing import List, Dict
+import numpy as np
+import pandas as pd
+
+from core.reliability.weibull import fit_weibull
+
+def compute_mtbf_mttr_by_eq(df: pd.DataFrame) -> List[Dict]:
+    """
+    df attend:
+      - equipment_code
+      - ttf_h (TTF en heures)
+      - duree_rep_h (optionnel pour MTTR)
+    """
+    out = []
+    if df is None or df.empty:
+        return out
+    if "equipment_code" not in df.columns:
+        return out
+
+    for eq, dfe in df.groupby("equipment_code"):
+        mtbf = float(np.nanmean(dfe["ttf_h"])) if "ttf_h" in dfe.columns else None
+        mttr = float(np.nanmean(dfe["duree_rep_h"])) if "duree_rep_h" in dfe.columns else None
+        out.append({"equipment_code": str(eq), "MTBF": mtbf, "MTTR": mttr})
+    return out
+
+def compute_weibull_params_by_eq(df: pd.DataFrame) -> Dict[str, Dict]:
+    """Retourne {eq: {beta, eta, gamma(None)}} en se basant sur fit_weibull(ttf)."""
+    params = {}
+    if df is None or df.empty or "equipment_code" not in df.columns or "ttf_h" not in df.columns:
+        return params
+    for eq, dfe in df.groupby("equipment_code"):
+        x = dfe["ttf_h"].dropna().values
+        if len(x) >= 3:
+            try:
+                ft = fit_weibull(x)
+                params[str(eq)] = {"beta": float(ft.beta), "eta": float(ft.eta), "gamma": None}
+            except Exception:
+                pass
+    return params
+
+def merge_metrics_and_optim(
+    mtbf_mttr: List[Dict],
+    weib_params: Dict[str, Dict],
+    optim_intervals: Dict[str, float] | None = None,
+    optim_mttr: Dict[str, float] | None = None,
+) -> List[Dict]:
+    """
+    - optim_intervals: Proposition d'intervalle (heures) qui correspond à un MTBF* cible (protection fiabilité).
+    - optim_mttr: MTTRcible par eq si tu as une proposition (ex via standardisation).
+    """
+    m = {r["equipment_code"]: dict(r) for r in mtbf_mttr}
+    # paramètres Weibull
+    for eq, p in (weib_params or {}).items():
+        m.setdefault(eq, {"equipment_code": eq})
+        m[eq]["beta"] = p.get("beta")
+        m[eq]["eta"]  = p.get("eta")
+        m[eq]["gamma"]= p.get("gamma")
+    # optim
+    for eq, t in (optim_intervals or {}).items():
+        m.setdefault(eq, {"equipment_code": eq})
+        m[eq]["MTBF_opt"] = float(t)  # on assimile l'intervalle conseillé à un objectif MTBF*
+    for eq, t in (optim_mttr or {}).items():
+        m.setdefault(eq, {"equipment_code": eq})
+        m[eq]["MTTR_opt"] = float(t)
+    return list(m.values())

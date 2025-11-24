@@ -1,0 +1,116 @@
+# core/maintenance/reporting_plus.py
+from __future__ import annotations
+from typing import List, Dict, Optional
+from pathlib import Path
+from datetime import datetime
+
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.units import mm
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+
+# ---------------------------------------------------------------------
+# Entrées attendues :
+# - due_tasks: List[Dict]  (id, equipment_code, title, priority, next_due_date, days_left, ...)
+# - kits_by_eq: Dict[str, List[Dict]]  (par équipement, liste d'items: code, nom, quantite_dispo, quantite_recommandee, ...)
+# - metrics_table: List[Dict] (par équipement: MTBF, MTTR, Optim_MTBF, Optim_MTTR, beta, eta, gamma)
+# ---------------------------------------------------------------------
+
+def _mk_table(data, colWidths=None):
+    t = Table(data, colWidths=colWidths, hAlign="LEFT")
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#ECEFF4")),
+        ("TEXTCOLOR",  (0,0), (-1,0), colors.HexColor("#2E3440")),
+        ("GRID",       (0,0), (-1,-1), 0.25, colors.HexColor("#D8DEE9")),
+        ("FONTSIZE",   (0,0), (-1,-1), 9),
+        ("ALIGN",      (0,0), (-1,-1), "LEFT"),
+        ("VALIGN",     (0,0), (-1,-1), "MIDDLE"),
+        ("ROWBACKGROUNDS",(0,1),(-1,-1), [colors.white, colors.HexColor("#FAFAFA")]),
+    ]))
+    return t
+
+def export_pm_plan_with_kits_pdf(
+    due_tasks: List[Dict],
+    kits_by_eq: Dict[str, List[Dict]],
+    metrics_table: List[Dict],
+    out_dir: str = "reports",
+    title: str = "Plan de maintenance + Kits",
+) -> str:
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    out_path = str(Path(out_dir) / f"pm_plan_kits_{ts}.pdf")
+
+    doc = SimpleDocTemplate(out_path, pagesize=A4, leftMargin=18*mm, rightMargin=18*mm, topMargin=16*mm, bottomMargin=16*mm)
+    styles = getSampleStyleSheet()
+    elements = []
+
+    # Titre
+    elements.append(Paragraph(f"<b>{title}</b>", styles["Title"]))
+    elements.append(Spacer(1, 6))
+
+    # Section 1: Tableau synthèse MTBF/MTTR (mesuré & optimisé) + paramètres Weibull
+    if metrics_table:
+        elements.append(Paragraph("<b>1) Synthèse fiabilité & optimisation par équipement</b>", styles["Heading2"]))
+        head = ["Équipement", "MTBF (h)", "MTTR (h)", "MTBF* (opt.)", "MTTR* (opt.)", "β (forme)", "η (h)", "γ"]
+        data = [head]
+        for r in metrics_table:
+            data.append([
+                r.get("equipment_code","?"),
+                f"{r.get('MTBF', 0):.1f}" if r.get("MTBF") else "n/a",
+                f"{r.get('MTTR', 0):.1f}" if r.get("MTTR") else "n/a",
+                f"{r.get('MTBF_opt', 0):.1f}" if r.get("MTBF_opt") else "n/a",
+                f"{r.get('MTTR_opt', 0):.1f}" if r.get("MTTR_opt") else "n/a",
+                f"{r.get('beta', 0):.2f}"  if r.get("beta") else "n/a",
+                f"{r.get('eta', 0):.1f}"   if r.get("eta") else "n/a",
+                f"{r.get('gamma', 0):.1f}" if r.get("gamma") else "—"
+            ])
+        elements.append(_mk_table(data, colWidths=[28*mm,22*mm,22*mm,26*mm,26*mm,18*mm,18*mm,12*mm]))
+        elements.append(Spacer(1, 8))
+
+    # Section 2: Tâches dues
+    if due_tasks:
+        elements.append(Paragraph("<b>2) Tâches dues (préventif/prédictif/correctif)</b>", styles["Heading2"]))
+        head = ["ID", "Équipement", "Titre", "Priorité", "Échéance", "J-"]
+        data = [head]
+        for t in due_tasks:
+            data.append([
+                str(t.get("id","")),
+                t.get("equipment_code",""),
+                t.get("title",""),
+                str(t.get("priority","")),
+                str(t.get("next_due_date","")),
+                str(t.get("days_left","")),
+            ])
+        elements.append(_mk_table(data, colWidths=[12*mm, 24*mm, 68*mm, 18*mm, 28*mm, 12*mm]))
+        elements.append(Spacer(1, 8))
+
+    # Section 3: Kits recommandés par équipement
+    elements.append(Paragraph("<b>3) Kits pièces recommandés (selon β)</b>", styles["Heading2"]))
+    if not kits_by_eq:
+        elements.append(Paragraph("Aucun kit proposé (renseignez familles ou mots-clés dans les noms de pièces).", styles["Normal"]))
+    else:
+        for eq, kit in kits_by_eq.items():
+            elements.append(Paragraph(f"<b>{eq}</b>", styles["Heading3"]))
+            if not kit:
+                elements.append(Paragraph("— Aucun élément.", styles["Normal"]))
+                elements.append(Spacer(1, 4))
+                continue
+            head = ["Code", "Nom", "Famille", "Dispo", "Seuil", "Recommandé", "Localisation", "PU"]
+            data = [head]
+            for it in kit:
+                data.append([
+                    it.get("code",""),
+                    it.get("nom",""),
+                    it.get("famille",""),
+                    str(it.get("quantite_dispo","")),
+                    str(it.get("seuil_min","")),
+                    str(it.get("quantite_recommandee","")),
+                    it.get("localisation",""),
+                    f"{float(it.get('prix_unitaire') or 0.0):.2f}",
+                ])
+            elements.append(_mk_table(data, colWidths=[22*mm,48*mm,24*mm,14*mm,14*mm,20*mm,26*mm,16*mm]))
+            elements.append(Spacer(1, 6))
+
+    doc.build(elements)
+    return out_path

@@ -1,0 +1,3 @@
+equipment_code,name,site,rated_mva,V1n_kV,V2n_kV,f_nominal,vector_group,status,commissioned_on,notes
+TR-001,,makala1,100.0,220.0,20.0,50.0,Yyn5,active,2025-1-08,
+TR-002,,bumbu,75.0,110.0,55.0,50.0,Dyn5,active,2024-9-14,RAS

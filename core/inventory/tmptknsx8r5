@@ -1,0 +1,164 @@
+# core/inventory/services.py
+from __future__ import annotations
+from dataclasses import dataclass, asdict
+from pathlib import Path
+import os, csv, time
+import pandas as pd
+from typing import List, Dict
+
+DATA_DIR = Path(os.environ.get("FS_DATA_DIR", Path(__file__).resolve().parents[2] / "data"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+PARTS_CSV = (DATA_DIR / "inventory_parts.csv").resolve()
+MOVES_CSV = (DATA_DIR / "stock_movements.csv").resolve()
+BOM_CSV   = (DATA_DIR / "bom_tasks.csv").resolve()
+
+CANON = ["code","nom","famille","quantite_dispo","seuil_min","localisation","prix_unitaire","fournisseur"]
+
+def _flush_csv(path: Path, rows: List[Dict], header: List[str]):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not path.exists() or path.stat().st_size == 0
+    with open(path, "a", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=header, quoting=csv.QUOTE_MINIMAL)
+        if write_header: w.writeheader()
+        for r in rows:
+            w.writerow({k: r.get(k, "") for k in header})
+        f.flush(); os.fsync(f.fileno())
+
+def _read_csv(path: Path) -> pd.DataFrame:
+    if not path.exists(): return pd.DataFrame()
+    try:
+        return pd.read_csv(path, dtype=str)
+    except Exception:
+        return pd.read_csv(path, dtype=str, engine="python", on_bad_lines="skip")
+
+def normalize_parts_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty: return pd.DataFrame(columns=CANON)
+    d = df.copy()
+    # alias → canon
+    aliases = {
+        "name":"nom","family":"famille","qty":"quantite_dispo","quantite":"quantite_dispo",
+        "unit_price":"prix_unitaire","price":"prix_unitaire","location":"localisation"
+    }
+    for src, dst in aliases.items():
+        if src in d.columns and dst not in d.columns:
+            d[dst] = d[src]
+    for col in CANON:
+        if col not in d.columns: d[col] = ""
+    d["quantite_dispo"] = pd.to_numeric(d["quantite_dispo"], errors="coerce").fillna(0).astype(int)
+    d["seuil_min"]      = pd.to_numeric(d["seuil_min"], errors="coerce").fillna(0).astype(int)
+    d["prix_unitaire"]  = pd.to_numeric(d["prix_unitaire"], errors="coerce").fillna(0.0).astype(float)
+    d = d[CANON].drop_duplicates(subset=["code"]).reset_index(drop=True)
+    return d
+
+def list_parts_as_dicts() -> List[Dict]:
+    df = _read_csv(PARTS_CSV)
+    if df.empty: return []
+    return normalize_parts_df(df).to_dict("records")
+
+def list_parts() -> List[Dict]:
+    return list_parts_as_dicts()
+
+def upsert_parts(rows: List[Dict]) -> int:
+    """Ajoute ou met à jour des pièces (par code)."""
+    df = _read_csv(PARTS_CSV)
+    base = normalize_parts_df(df)
+    add  = normalize_parts_df(pd.DataFrame(rows))
+    if base.empty:
+        base = add
+    else:
+        base = pd.concat([base[~base["code"].isin(add["code"])], add], ignore_index=True)
+    base.to_csv(PARTS_CSV, index=False)
+    return len(add)
+
+def reserve_parts(req: List[Dict]) -> Dict:
+    """
+    req: [{"code": "...", "qty": 2, "reason": "PM TR-01", "task_id": "T123"}]
+    Retour: {"done": n, "errors": [ ... ]}
+    """
+    df = normalize_parts_df(_read_csv(PARTS_CSV))
+    if df.empty: return {"done": 0, "errors": ["Inventaire vide"]}
+    done = 0; errors = []
+    moves = []
+    for r in (req or []):
+        code = str(r.get("code","")).strip()
+        qty  = int(r.get("qty",0) or 0)
+        if not code or qty <= 0:
+            errors.append({"code":code,"error":"code/qty invalide"}); continue
+        if code not in df["code"].values:
+            errors.append({"code":code,"error":"inconnu"}); continue
+        idx = df.index[df["code"]==code][0]
+        dispo = int(df.at[idx, "quantite_dispo"])
+        if dispo < qty:
+            errors.append({"code":code,"error":f"disponible={dispo} < {qty}"}); continue
+        df.at[idx, "quantite_dispo"] = dispo - qty
+        done += 1
+        moves.append({
+            "ts": time.time(), "type":"RESERVE", "code":code, "qty":qty,
+            "reason": r.get("reason",""), "task_id": r.get("task_id","")
+        })
+    df.to_csv(PARTS_CSV, index=False)
+    if moves: _flush_csv(MOVES_CSV, moves, header=["ts","type","code","qty","reason","task_id"])
+    return {"done": done, "errors": errors}
+
+def release_parts(req: List[Dict]) -> Dict:
+    """Annulation/retour d'une réservation."""
+    df = normalize_parts_df(_read_csv(PARTS_CSV))
+    if df.empty: return {"done": 0, "errors": ["Inventaire vide"]}
+    done = 0; errors = []; moves=[]
+    for r in (req or []):
+        code = str(r.get("code","")).strip()
+        qty  = int(r.get("qty",0) or 0)
+        if not code or qty <= 0:
+            errors.append({"code":code,"error":"code/qty invalide"}); continue
+        if code not in df["code"].values:
+            errors.append({"code":code,"error":"inconnu"}); continue
+        idx = df.index[df["code"]==code][0]
+        df.at[idx, "quantite_dispo"] = int(df.at[idx, "quantite_dispo"]) + qty
+        done += 1
+        moves.append({
+            "ts": time.time(), "type":"RELEASE", "code":code, "qty":qty,
+            "reason": r.get("reason",""), "task_id": r.get("task_id","")
+        })
+    df.to_csv(PARTS_CSV, index=False)
+    if moves: _flush_csv(MOVES_CSV, moves, header=["ts","type","code","qty","reason","task_id"])
+    return {"done": done, "errors": errors}
+
+def consume_parts(req: List[Dict]) -> Dict:
+    """Consommation définitive (à la clôture d'une tâche). N'ajuste pas le stock (déjà retiré à réserve). Loggue seulement."""
+    moves=[]
+    for r in (req or []):
+        code = str(r.get("code","")).strip()
+        qty  = int(r.get("qty",0) or 0)
+        if not code or qty <= 0: continue
+        moves.append({
+            "ts": time.time(), "type":"CONSUME", "code":code, "qty":qty,
+            "reason": r.get("reason",""), "task_id": r.get("task_id","")
+        })
+    if moves: _flush_csv(MOVES_CSV, moves, header=["ts","type","code","qty","reason","task_id"])
+    return {"done": len(moves), "errors": []}
+
+def low_stock(threshold_factor: float = 1.0) -> List[Dict]:
+    df = normalize_parts_df(_read_csv(PARTS_CSV))
+    if df.empty: return []
+    cond = df["quantite_dispo"] <= (threshold_factor * df["seuil_min"])
+    return df[cond].to_dict("records")
+
+# ----- BOM par tâche -----
+def attach_bom_to_task(task_id: str, items: List[Dict]) -> int:
+    if not task_id: return 0
+    rows=[]
+    for it in (items or []):
+        rows.append({
+            "task_id": task_id, "code": it.get("code",""),
+            "qty": int(it.get("qty",0) or 0)
+        })
+    if rows:
+        _flush_csv(BOM_CSV, rows, header=["task_id","code","qty"])
+    return len(rows)
+
+def bom_for_task(task_id: str) -> List[Dict]:
+    df = _read_csv(BOM_CSV)
+    if df.empty: return []
+    df["qty"] = pd.to_numeric(df.get("qty"), errors="coerce").fillna(0).astype(int)
+    out = df[df.get("task_id")==task_id][["code","qty"]]
+    return out.to_dict("records")

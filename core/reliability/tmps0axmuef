@@ -1,0 +1,215 @@
+# core/reliability/unify.py
+from __future__ import annotations
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import numpy as np
+import pandas as pd
+
+# Tes modules existants
+from core.reliability.weibull import fit_weibull
+from core.reliability.metrics_plus import (
+    compute_mtbf_mttr_by_eq, compute_weibull_params_by_eq, merge_metrics_and_optim
+)
+from core.reliability.optimize import propose_intervals
+
+# (Optionnel) Organigramme complet, si dispo
+try:
+    from core.reliability.organigram import analyze_ttf_pipeline  # ton pipeline “Day 2”
+except Exception:
+    analyze_ttf_pipeline = None  # fallback si non dispo
+
+DATA_CSV = Path("data/failures_saved.csv")
+
+@dataclass
+class UnifyOptions:
+    force_weibull_2p: bool = True       # γ=0 partout pour cohérence industrielle
+    R_target: float = 0.80              # fiabilité cible pour propose_intervals
+    min_points: int = 3                 # nb mini d’observations par équipement
+
+@dataclass
+class UnifyBundle:
+    ttf: pd.DataFrame                   # données TTF normalisées
+    fits_df: pd.DataFrame               # β/η/γ par équipement (γ=0 si force_weibull_2p)
+    optim: Dict[str, Dict[str, Any]]    # propose_intervals par équipement
+    metrics_df: pd.DataFrame            # tableau final fusionné et “comblé”
+    pipeline_by_eq: Dict[str, Dict]     # résumé organigramme par équipement (si dispo)
+
+# ---------- utilitaires internes ----------
+def _load_ttf_df(session_df: Optional[pd.DataFrame]) -> pd.DataFrame:
+    if isinstance(session_df, pd.DataFrame):
+        df = session_df.copy()
+    elif DATA_CSV.exists():
+        df = pd.read_csv(DATA_CSV)
+    else:
+        return pd.DataFrame()
+
+    if "equipment_code" not in df.columns:
+        for c in ("equipment", "equip", "eq", "EQ", "Equipment"):
+            if c in df.columns:
+                df["equipment_code"] = df[c].astype(str)
+                break
+
+    if "equipment_code" not in df.columns:
+        return pd.DataFrame()
+
+    if "ttf_h" in df.columns:
+        df["ttf_h"] = pd.to_numeric(df["ttf_h"], errors="coerce")
+        df = df.dropna(subset=["ttf_h"])
+        df = df[df["ttf_h"] > 0]
+    else:
+        for c in ("hours", "time_to_fail_h", "ttf"):
+            if c in df.columns:
+                df["ttf_h"] = pd.to_numeric(df[c], errors="coerce")
+                df = df.dropna(subset=["ttf_h"])
+                df = df[df["ttf_h"] > 0]
+                break
+
+    return df
+
+def _fit_weibull_2p(x: np.ndarray) -> Dict[str, float]:
+    """Fit Weibull en forçant γ=0 (2 paramètres) pour cohérence globale."""
+    ft = fit_weibull(x)  # suppose MLE déterministe
+    beta = float(getattr(ft, "beta"))
+    eta  = float(getattr(ft, "eta"))
+    return {"beta": beta, "eta": eta, "gamma": 0.0}
+
+def _compute_fits(df_ttf: pd.DataFrame, opt: UnifyOptions) -> pd.DataFrame:
+    if df_ttf.empty:
+        return pd.DataFrame(columns=["equipment_code", "beta", "eta", "gamma"])
+
+    recs: List[Dict[str, Any]] = []
+    for eq, grp in df_ttf.groupby("equipment_code"):
+        x = grp["ttf_h"].dropna().values
+        if len(x) >= opt.min_points:
+            try:
+                if opt.force_weibull_2p:
+                    rec = _fit_weibull_2p(x)
+                else:
+                    ft = fit_weibull(x)  # 3P si ta fonction sort γ
+                    rec = {
+                        "beta": float(getattr(ft, "beta")),
+                        "eta":  float(getattr(ft, "eta")),
+                        "gamma": float(getattr(ft, "gamma", 0.0)),
+                    }
+                rec["equipment_code"] = str(eq)
+                recs.append(rec)
+            except Exception:
+                pass
+
+    fits_df = pd.DataFrame(recs, columns=["equipment_code", "beta", "eta", "gamma"])
+    # --- Normalisation robuste et vectorisée ---
+    for c in ["beta", "eta", "gamma"]:
+        if c not in fits_df.columns:
+            fits_df[c] = np.nan
+        fits_df[c] = pd.to_numeric(fits_df[c], errors="coerce")
+    if opt.force_weibull_2p:
+        fits_df["gamma"] = 0.0
+    else:
+        fits_df["gamma"] = fits_df["gamma"].fillna(0.0)
+    return fits_df
+
+def _compute_pipeline_per_eq(df_ttf: pd.DataFrame) -> Dict[str, Dict]:
+    """
+    Exécute ton organigramme complet par équipement si disponible.
+    Retourne un dict {eq: {...résumé pipeline...}}
+    """
+    out: Dict[str, Dict] = {}
+    if df_ttf.empty or analyze_ttf_pipeline is None:
+        return out
+
+    for eq, grp in df_ttf.groupby("equipment_code"):
+        x = grp["ttf_h"].dropna().values
+        if len(x) < 3:
+            continue
+        try:
+            # Essai 1 : signature expectant une série/array
+            try:
+                res = analyze_ttf_pipeline(x)
+            except Exception:
+                # Essai 2 : signature expectant un DataFrame
+                res = analyze_ttf_pipeline(pd.DataFrame({"ttf_h": x, "equipment_code": [eq]*len(x)}))
+
+            # Résumé minimal standardisé
+            dist = (res.get("distribution") or {}).get("name", "Weibull2P")
+            gd   = res.get("goodness", {}) or {}
+            tr   = res.get("trend", {}) or {}
+            out[str(eq)] = {
+                "distribution": dist,
+                "ks_p": gd.get("ks_p"),
+                "chi2_p": gd.get("chi2_p"),
+                "trend_test": tr.get("name"),
+                "trend_p": tr.get("p_value"),
+                "notes": res.get("decision"),
+            }
+        except Exception:
+            out[str(eq)] = {}
+    return out
+
+def compute_bundle(session_df: Optional[pd.DataFrame] = None,
+                   options: Optional[UnifyOptions] = None) -> UnifyBundle:
+    """
+    === LA SEULE PORTE D’ENTRÉE ===
+    Charge les TTF, calcule β/η/γ, propose les intervalles, fusionne MTBF/MTTR,
+    et récupère le résumé pipeline (organigramme) si dispo.
+    """
+    opt = options or UnifyOptions()
+    df_ttf = _load_ttf_df(session_df)
+
+    fits_df = _compute_fits(df_ttf, opt)
+
+    # Mesurés
+    m_meas_raw = compute_mtbf_mttr_by_eq(df_ttf) if not df_ttf.empty else []
+    m_meas_df = pd.DataFrame(m_meas_raw) if isinstance(m_meas_raw, list) else (m_meas_raw or pd.DataFrame())
+
+    # Paramètres dérivés
+    w_params_raw = compute_weibull_params_by_eq(df_ttf) if not df_ttf.empty else []
+    w_params_df = pd.DataFrame(w_params_raw) if isinstance(w_params_raw, list) else (w_params_raw or pd.DataFrame())
+    if not w_params_df.empty:
+        # Vectorisé : pas d'assignation record par record
+        for c in ["beta", "eta", "gamma"]:
+            if c not in w_params_df.columns:
+                w_params_df[c] = np.nan
+            w_params_df[c] = pd.to_numeric(w_params_df[c], errors="coerce")
+        if opt.force_weibull_2p:
+            w_params_df["gamma"] = 0.0
+        else:
+            w_params_df["gamma"] = w_params_df["gamma"].fillna(0.0)
+
+    # Optimisation — construire un dict d'objets avec attributs .beta/.eta/.gamma
+    fits_dict = {
+        r["equipment_code"]: type("F", (), r)
+        for r in fits_df.to_dict(orient="records")
+    }
+    try:
+        props = propose_intervals(fits_dict, R_target=opt.R_target)  # dict eq->{interval_opt_h,...}
+    except Exception:
+        props = {}
+
+    # Fusion propre via l'API existante (en lui donnant des records)
+    metrics_records = merge_metrics_and_optim(
+        m_meas_df.to_dict(orient="records") if not m_meas_df.empty else [],
+        w_params_df.to_dict(orient="records") if not w_params_df.empty else [],
+        optim_intervals=props,
+        optim_mttr=None
+    ) or []
+
+    metrics_df = pd.DataFrame(metrics_records)
+    # Join explicite avec fits_df pour garantir cohérence β/η/γ (on écrase ce qui venait d'ailleurs)
+    if not metrics_df.empty and not fits_df.empty:
+        metrics_df = (
+            metrics_df.drop(columns=[c for c in ("beta","eta","gamma") if c in metrics_df.columns], errors="ignore")
+            .merge(fits_df, on="equipment_code", how="left")
+        )
+
+    # Pipeline/organigramme par équipement
+    pipeline_by_eq = _compute_pipeline_per_eq(df_ttf)
+
+    return UnifyBundle(
+        ttf=df_ttf,
+        fits_df=fits_df,
+        optim=props,
+        metrics_df=metrics_df,
+        pipeline_by_eq=pipeline_by_eq,
+    )

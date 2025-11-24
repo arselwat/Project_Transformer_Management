@@ -1,0 +1,7 @@
+{
+  "host": "localhost",
+  "port": 1883,
+  "site": "bench1",
+  "equipement": "tr_230_20",
+  "topic_base": "lab/transfo"
+}

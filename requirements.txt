@@ -1,0 +1,25 @@
+# ---- Runtime principal (Streamlit + stats + graphiques) ----
+streamlit>=1.31,<2.0
+numpy>=1.25,<2.0
+pandas>=2.1,<3.0
+matplotlib>=3.8,<4.0
+scipy>=1.11,<2.0
+plotly>=5.18,<6.0
+reportlab>=3.6,<4.0
+requests>=2.31,<3.0
+paho-mqtt>=1.6,<2.0
+
+# ---- Import/export de fichiers ----
+openpyxl>=3.1,<4.0      # lecture Excel .xlsx
+xlrd>=2.0,<3.0          # lecture Excel .xls (ancien)
+python-docx>=0.8.11,<1.0
+pillow>=10.0,<12.0
+kaleido>=0.2,<0.3       # (optionnel) export d'images Plotly statiques
+
+# ---- Analyses complémentaires (organigramme/tests) ----
+altair>=5.0,<6.0        # charts alternatifs utilisés par Streamlit
+statsmodels>=0.14,<1.0  # (optionnel) tests/statistiques avancées
+pymannkendall>=1.4,<2.0 # (optionnel) test de Mann-Kendall si utilisé
+
+# ---- Build (machine de dev uniquement ; OK de laisser ici) ----
+pyinstaller>=6.0,<7.0

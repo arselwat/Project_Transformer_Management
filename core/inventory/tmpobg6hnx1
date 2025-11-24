@@ -1,0 +1,62 @@
+from __future__ import annotations
+from typing import List, Dict
+
+def build_pm_kit_for_equipment(equipment_code: str, beta: float, parts: List[Dict]) -> List[Dict]:
+    """
+    Fallback simple si ta version interne n'existe pas.
+    Logique indicative basée sur β :
+      - beta < 1.0  : vieillissement infantile → 'contact', 'connexion', 'vibration', 'câble'
+      - 1.0 ≤ beta < 2.0 : aléatoire → 'isolation', 'huile', 'joint', 'capteur'
+      - beta ≥ 2.0  : usure → 'huile', 'joint', 'ventilation', 'isolateur', 'filtre'
+    On propose jusqu'à 6 pièces max, et on calcule une 'quantite_recommandee' très simple.
+    Les champs attendus dans parts : code, nom, famille, quantite_dispo, seuil_min, localisation, prix_unitaire, fournisseur.
+    """
+    if not parts:
+        return []
+
+    try:
+        b = float(beta)
+    except Exception:
+        b = 1.5
+
+    # Mots-clés par zone
+    if b < 1.0:
+        keysets = ["contact", "connexion", "vibration", "cable"]
+    elif b < 2.0:
+        keysets = ["isolation", "huile", "joint", "capteur"]
+    else:
+        keysets = ["huile", "joint", "ventilation", "isolateur", "filtre"]
+
+    selected: List[Dict] = []
+    seen_codes = set()
+
+    for kw in keysets:
+        for p in parts:
+            name = f"{p.get('nom','')} {p.get('famille','')}".lower()
+            if kw in name:
+                code = str(p.get("code", "")).strip()
+                if not code or code in seen_codes:
+                    continue
+
+                d = dict(p)
+                dispo = int(d.get("quantite_dispo", d.get("quantite", 0)) or 0)
+                seuil = int(d.get("seuil_min", 0) or 0)
+
+                # Quantité recommandée très simple : max(1, min(2, manque))
+                manque = max(0, seuil - dispo)
+                reco = max(1, min(2, manque))
+                d["quantite_recommandee"] = reco
+
+                # Champs normalisés utiles en aval
+                d.setdefault("localisation", d.get("location", ""))
+                d.setdefault("prix_unitaire", float(d.get("prix_unitaire", d.get("unit_price", 0.0)) or 0.0))
+                d.setdefault("fournisseur", d.get("fournisseur", ""))
+
+                selected.append(d)
+                seen_codes.add(code)
+                if len(selected) >= 6:
+                    break
+        if len(selected) >= 6:
+            break
+
+    return selected

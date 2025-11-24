@@ -1,0 +1,309 @@
+# core/reliability/reporting_merged.py
+from __future__ import annotations
+import os, math, json, time
+from pathlib import Path
+from typing import Dict, Any, List, Tuple
+
+import pandas as pd
+
+# PDF
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+)
+from reportlab.lib.units import mm
+
+# ---------- Utils ----------
+def _fmt(x, nd=2):
+    try:
+        if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
+            return "-"
+        return f"{float(x):.{nd}f}"
+    except Exception:
+        return str(x)
+
+def _safe_get_fit(ft: Any, key: str, default=None):
+    """
+    ft peut être un dataclass (attrs), un dict, ou None.
+    """
+    if ft is None:
+        return default
+    if hasattr(ft, key):
+        return getattr(ft, key, default)
+    if isinstance(ft, dict):
+        return ft.get(key, default)
+    return default
+
+def _safe_interval(opt_map: Any, eq: str):
+    """
+    opt_map peut être None, dict[str, dict], dict[str, float], float...
+    On renvoie le champ 'interval_opt_h' si présent, sinon le float si c'est directement un nombre.
+    """
+    if opt_map is None:
+        return None
+    if isinstance(opt_map, dict):
+        v = opt_map.get(eq)
+        if isinstance(v, dict):
+            return v.get("interval_opt_h")
+        elif isinstance(v, (int, float)):
+            return float(v)
+        else:
+            return None
+    # si opt_map est un seul float (cas dégénéré)
+    if isinstance(opt_map, (int, float)):
+        return float(opt_map)
+    return None
+
+def _h1(txt): return Paragraph(f"<b>{txt}</b>", getSampleStyleSheet()["Heading1"])
+def _h2(txt): return Paragraph(f"<b>{txt}</b>", getSampleStyleSheet()["Heading2"])
+def _h3(txt): return Paragraph(f"<b>{txt}</b>", getSampleStyleSheet()["Heading3"])
+def _p(txt):  return Paragraph(txt, getSampleStyleSheet()["BodyText"])
+
+# ---------- DOCX → éléments PDF ----------
+def _append_procedure_from_docx(story: List, docx_path: Path):
+    """
+    Lit le DOCX utilisateur et le reproduit (titres, paragraphes, tableaux).
+    Nécessite: python-docx
+    """
+    try:
+        from docx import Document
+    except Exception:
+        story.append(_h2("Procédure de maintenance"))
+        story.append(_p("Impossible de charger le DOCX (python-docx manquant). Installez `pip install python-docx`."))
+        story.append(Spacer(1, 6))
+        return
+
+    if not docx_path.exists():
+        story.append(_h2("Procédure de maintenance"))
+        story.append(_p(f"Fichier introuvable: {docx_path}"))
+        story.append(Spacer(1, 6))
+        return
+
+    doc = Document(str(docx_path))
+
+    story.append(_h1("Procédure de maintenance (intégrale du DOCX)"))
+    story.append(Spacer(1, 6))
+
+    # Paragraphes
+    for para in doc.paragraphs:
+        txt = para.text.strip()
+        if not txt:
+            continue
+        style_name = (para.style.name or "").lower()
+        if "heading 1" in style_name or "title" in style_name:
+            story.append(_h1(txt))
+        elif "heading 2" in style_name:
+            story.append(_h2(txt))
+        elif "heading 3" in style_name:
+            story.append(_h3(txt))
+        else:
+            story.append(_p(txt))
+        story.append(Spacer(1, 2))
+
+    # Tables (reproduites)
+    for t in doc.tables:
+        data = []
+        widths = []
+        for r in t.rows:
+            row = [c.text.strip() for c in r.cells]
+            data.append(row)
+        if not data:
+            continue
+
+        # largeur colonnes: répartir équitablement
+        ncol = max(len(r) for r in data)
+        col_widths = [ (180*mm)/max(ncol,1) ] * ncol
+
+        tbl = Table(data, colWidths=col_widths)
+        tbl.setStyle(TableStyle([
+            ("GRID", (0,0), (-1,-1), 0.6, colors.grey),
+            ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f1f5f9")),
+            ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+            ("VALIGN", (0,0), (-1,-1), "TOP"),
+            ("FONTSIZE", (0,0), (-1,-1), 9),
+            ("LEFTPADDING", (0,0), (-1,-1), 4),
+            ("RIGHTPADDING", (0,0), (-1,-1), 4),
+            ("TOPPADDING", (0,0), (-1,-1), 3),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 3),
+        ]))
+        story.append(tbl)
+        story.append(Spacer(1, 8))
+
+# ---------- Inventaire ----------
+def _append_inventory_sections(story: List):
+    """
+    Ajoute:
+    - Matériel à prévoir (pièces sous seuil)
+    - Mouvements de stock (si data/stock_movements.csv existe)
+    """
+    story.append(PageBreak())
+    story.append(_h1("Inventaire & Stock"))
+
+    # Matériel à prévoir
+    story.append(_h2("Matériel à prévoir (pièces sous seuil)"))
+    try:
+        from core.inventory import services as inv
+        parts = inv.list_parts()
+        # sous-seuil
+        low = inv.low_stock()
+        rows = [["Code","Nom","Qté","Seuil min","Localisation","Prix unitaire"]]
+        for p in low:
+            rows.append([
+                str(p.get("code","")),
+                str(p.get("nom","")),
+                str(p.get("quantite","")),
+                str(p.get("seuil_min","")),
+                str(p.get("localisation","")),
+                _fmt(p.get("prix_unitaire", 0.0), 2),
+            ])
+        if len(rows) == 1:
+            rows.append(["—","Aucune pièce sous seuil détectée","", "", "", ""])
+        tbl = Table(rows, colWidths=[25*mm, 55*mm, 15*mm, 20*mm, 40*mm, 25*mm])
+        tbl.setStyle(TableStyle([
+            ("GRID", (0,0), (-1,-1), 0.6, colors.grey),
+            ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f1f5f9")),
+            ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+            ("FONTSIZE", (0,0), (-1,-1), 9),
+        ]))
+        story.append(tbl)
+    except Exception:
+        story.append(_p("Module inventaire indisponible. Ajoutez core.inventory.services pour lister les pièces."))
+
+    story.append(Spacer(1, 8))
+
+    # Mouvements de stock
+    story.append(_h2("Mouvements de stock"))
+    mov_path = Path("data/stock_movements.csv")
+    if mov_path.exists():
+        try:
+            mdf = pd.read_csv(mov_path)
+            cols = [c for c in mdf.columns if c.lower() in {
+                "ts","date","code","nom","type","quantite","qte","from","to","comment"
+            }]
+            if not cols:
+                cols = mdf.columns.tolist()
+            data = [cols] + mdf[cols].astype(str).values.tolist()
+            tbl = Table(data, colWidths=[ (180*mm)/max(len(cols),1) ]*len(cols))
+            tbl.setStyle(TableStyle([
+                ("GRID", (0,0), (-1,-1), 0.6, colors.grey),
+                ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f1f5f9")),
+                ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+                ("FONTSIZE", (0,0), (-1,-1), 8.5),
+            ]))
+            story.append(tbl)
+        except Exception as e:
+            story.append(_p(f"Impossible de lire {mov_path}: {e}"))
+    else:
+        story.append(_p("Aucun mouvement enregistré (data/stock_movements.csv manquant)."))
+
+# ---------- Export principal ----------
+def export_merged_report_pdf(
+    failures_df: pd.DataFrame,
+    fits_by_eq: Dict[str, Any],
+    opt_by_eq: Dict[str, Any] | None = None,
+    out_dir: str = "reports",
+    procedure_docx_path: str | Path = "assets/PROCEDURE DE MAINTENANCE 2.docx",
+) -> str:
+    """
+    Génère un PDF fusionné (Indicateurs + Optimisation + Procédure DOCX + Inventaire).
+    - failures_df : pannes consolidées (pour compter MTBF/MTTR si souhaité)
+    - fits_by_eq : dict eq -> objet ou dict avec beta/eta/gamma
+    - opt_by_eq : dict eq -> {interval_opt_h: float, ...} OU eq -> float (intervalle)
+    - procedure_docx_path : chemin vers le DOCX à intégrer tel quel
+    """
+    out = Path(out_dir); out.mkdir(exist_ok=True, parents=True)
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    pdf_path = out / f"rapport_fusionne_{ts}.pdf"
+
+    doc = SimpleDocTemplate(str(pdf_path), pagesize=A4,
+                            leftMargin=15*mm, rightMargin=15*mm, topMargin=14*mm, bottomMargin=14*mm)
+
+    story: List = []
+    story.append(_h1("Rapport complet — Indicateurs & Optimisation & Procédure"))
+    story.append(_p(time.strftime("Généré le %d/%m/%Y %H:%M:%S")))
+    story.append(Spacer(1, 8))
+
+    # ---- Synthèse table ----
+    story.append(_h2("Synthèse par équipement"))
+    rows = [["Équipement","MTBF (h)","MTTR (h)","β","η (h)","γ (h)","Intervalle Opt (h)"]]
+    # MTBF/MTTR globaux par équipement (si colonnes existent)
+    mtbf_by = {}; mttr_by = {}
+    if {"equipment_code","ttf_h","ttr_h"}.issubset(set(failures_df.columns)):
+        try:
+            g = failures_df.groupby("equipment_code", dropna=True)
+            mtbf_by = g["ttf_h"].mean().to_dict()
+            mttr_by = g["ttr_h"].mean().to_dict()
+        except Exception:
+            pass
+
+    for eq, ft in fits_by_eq.items():
+        beta  = _safe_get_fit(ft, "beta")
+        eta   = _safe_get_fit(ft, "eta")
+        gamma = _safe_get_fit(ft, "gamma")
+        itv   = _safe_interval(opt_by_eq, eq)
+
+        rows.append([
+            str(eq),
+            _fmt(mtbf_by.get(eq) if isinstance(mtbf_by, dict) else None),
+            _fmt(mttr_by.get(eq) if isinstance(mttr_by, dict) else None),
+            _fmt(beta, 2),
+            _fmt(eta, 2),
+            _fmt(gamma, 2),
+            _fmt(itv, 1),
+        ])
+
+    tbl = Table(rows, colWidths=[30*mm, 22*mm, 22*mm, 14*mm, 22*mm, 18*mm, 28*mm])
+    tbl.setStyle(TableStyle([
+        ("GRID", (0,0), (-1,-1), 0.6, colors.grey),
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#eaf2fb")),
+        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+        ("FONTSIZE", (0,0), (-1,-1), 9),
+        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+    ]))
+    story.append(tbl)
+    story.append(Spacer(1, 8))
+
+    # ---- Fiches par équipement ----
+    for eq, ft in fits_by_eq.items():
+        story.append(PageBreak())
+        story.append(_h2(f"Fiche intervention — {eq}"))
+        beta  = _safe_get_fit(ft, "beta")
+        eta   = _safe_get_fit(ft, "eta")
+        gamma = _safe_get_fit(ft, "gamma")
+        itv   = _safe_interval(opt_by_eq, eq)
+
+        # Politique simple en fonction de β
+        policy = "RP (hasard)" if (beta is None or beta == 1) else ("Jeunesse (β<1) → surveillance dérives" if beta < 1 else "Usure (β>1) → CBM + préventif ciblé")
+        story.append(_p(f"Paramètres Weibull estimés : β={_fmt(beta)}, η={_fmt(eta)}, γ={_fmt(gamma)}"))
+        story.append(_p(f"Intervalle de visite optimisé (si calculé) : {_fmt(itv)} h"))
+        story.append(_p(f"Politique recommandée : {policy}"))
+        story.append(Spacer(1, 4))
+
+        # Mini tableau de tâches (placeholder – à enrichir si tu as une liste)
+        subtbl = Table(
+            [["Tâche","Périodicité","Responsable","Notes"],
+             ["Inspection thermique", "Selon charge / seuils", "Maint.", "IR caméra/sonde si dispo"],
+             ["Serrage borniers", "Visite", "Maint.", "Après coupure et consignation"],
+             ["Contrôle diélectrique", "Annuel", "Maint./Lab", "Selon normes IEC/IEEE"]],
+            colWidths=[60*mm, 30*mm, 35*mm, 55*mm]
+        )
+        subtbl.setStyle(TableStyle([
+            ("GRID", (0,0), (-1,-1), 0.5, colors.grey),
+            ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f6f8fa")),
+            ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+            ("FONTSIZE", (0,0), (-1,-1), 8.8),
+        ]))
+        story.append(subtbl)
+
+    # ---- Procédure depuis DOCX (fidèle) ----
+    story.append(PageBreak())
+    _append_procedure_from_docx(story, Path(procedure_docx_path))
+
+    # ---- Inventaire / mouvements ----
+    _append_inventory_sections(story)
+
+    # Build
+    doc.build(story)
+    return str(pdf_path)

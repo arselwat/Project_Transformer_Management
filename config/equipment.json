@@ -1,0 +1,13 @@
+{
+  "TR-01": {
+    "puissance_kVA": 0.0,
+    "tension_prim": "",
+    "tension_sec": "",
+    "courant_nom": "",
+    "refroid": "",
+    "fabricant": "",
+    "annee": "",
+    "numero_serie": "",
+    "localisation": ""
+  }
+}

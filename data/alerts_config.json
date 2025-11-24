@@ -1,0 +1,32 @@
+{
+  "enable_email": true,
+  "enable_whatsapp": false,
+  "subject_prefix": "[ALERTE TRANSFO] ",
+  "min_period_s": 5.0,
+  "cooldown_minutes": 1,
+  "levels": [
+    "WARN",
+    "ALARM"
+  ],
+  "site_filter": [],
+  "smtp": {
+    "host": "smtp.gmail.com",
+    "port": 587,
+    "user": "watendasongiarsel98@gmail.com",
+    "password": "jjtesbrqzyzqwpcd",
+    "from_addr": "watendasongiarsel98@gmail.com",
+    "to_addrs": [
+      "watendasongiarsel98@gmail.com",
+      "songiwat@gmail.com"
+    ],
+    "use_ssl": false,
+    "use_starttls": true
+  },
+  "twilio": {
+    "sid": "",
+    "token": "",
+    "whatsapp_from": "",
+    "whatsapp_to": ""
+  },
+  "enabled": true
+}

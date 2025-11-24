@@ -1,0 +1,37 @@
+{
+  "i_nom": 0.50,
+  "i_sec_nom": 5.0,
+  "warn": {
+    "t_core": 60.0,
+    "i_prim_rms_factor": 0.90,
+    "i_sec_factor": 0.90,
+    "pf_prim": 0.90,
+    "freq_dev": 0.40,
+    "v_dev_pct": 0.10,
+    "thd_i": 10.0
+  },
+  "alarm": {
+    "t_core": 70.0,
+    "i_prim_rms_factor": 1.00,
+    "i_sec_factor": 1.10,
+    "pf_prim": 0.80,
+    "freq_dev": 0.80,
+    "v_dev_pct": 0.15,
+    "thd_i": 15.0,
+    "overcurrent_hold_s": 60
+  },
+  "hysteresis": {
+    "t_core": 3.0,
+    "i_pct": 0.05,
+    "pf": 0.03,
+    "freq": 0.20,
+    "v_pct": 0.02
+  },
+  "windows": {
+    "t_core_s": 10,
+    "i_s": 3,
+    "pf_s": 10,
+    "freq_s": 5,
+    "v_ms": 500
+  }
+}

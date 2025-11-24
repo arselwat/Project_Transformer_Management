@@ -1,0 +1,91 @@
+{
+  "profiles": [
+    {
+      "id": "TR-025kVA-220-20",
+      "name": "Transfo 25 kVA \u2014 220/20 V",
+      "rated_va": 25000.0,
+      "V1n": 220.0,
+      "V2n": 20.0,
+      "f_nominal": 50.0,
+      "vector_group": "",
+      "thresholds": {
+        "TEMP_WARN": 60.0,
+        "TEMP_ALARM": 70.0,
+        "PF_WARN": 0.85,
+        "I1_WARN_MULT": 1.2,
+        "OVERLOAD_MULT": 1.0,
+        "MU_MIN": 0.01
+      }
+    },
+    {
+      "id": "TR-083kVA-400-230",
+      "name": "Transfo 83 kVA \u2014 400/230 V",
+      "rated_va": 83000,
+      "V1n": 400.0,
+      "V2n": 230.0,
+      "f_nominal": 50.0,
+      "impedance_pct": 5.5,
+      "copper_loss_w": 1600.0,
+      "iron_loss_w": 380.0,
+      "vector_group": "Yyn0",
+      "thresholds": {
+        "TEMP_WARN": 75.0,
+        "TEMP_ALARM": 85.0,
+        "PF_WARN": 0.9,
+        "I1_WARN_MULT": 1.15,
+        "OVERLOAD_MULT": 1.0
+      }
+    },
+    {
+      "id": "TR-100kVA-15kV-400",
+      "name": "Transfo 100 kVA \u2014 220 /20kV",
+      "rated_va": 100000000.0,
+      "V1n": 220000.0,
+      "V2n": 20000.0,
+      "f_nominal": 50.0,
+      "vector_group": "",
+      "thresholds": {
+        "TEMP_WARN": 60.0,
+        "TEMP_ALARM": 70.0,
+        "PF_WARN": 0.85,
+        "I1_WARN_MULT": 1.2,
+        "OVERLOAD_MULT": 1.0,
+        "MU_MIN": 0.01
+      }
+    },
+    {
+      "id": "TR-100kVA-220/20",
+      "name": "Transfo 100 kVA \u2014 200/20kV",
+      "rated_va": 100000000.0,
+      "V1n": 220000.0,
+      "V2n": 20000.0,
+      "f_nominal": 50.0,
+      "vector_group": "Yy0",
+      "thresholds": {
+        "TEMP_WARN": 60.0,
+        "TEMP_ALARM": 70.0,
+        "PF_WARN": 0.85,
+        "I1_WARN_MULT": 1.2,
+        "OVERLOAD_MULT": 1.2,
+        "MU_MIN": 0.01
+      }
+    },
+    {
+      "id": "TR-essai",
+      "name": "Transfo 200 kVA \u2014 220 /20kV",
+      "rated_va": 200000000.0,
+      "V1n": 220000.0,
+      "V2n": 20000.0,
+      "f_nominal": 50.0,
+      "vector_group": "Yy0",
+      "thresholds": {
+        "TEMP_WARN": 65.0,
+        "TEMP_ALARM": 75.0,
+        "PF_WARN": 0.8,
+        "I1_WARN_MULT": 1.2,
+        "OVERLOAD_MULT": 1.2000000000000002,
+        "MU_MIN": 0.01
+      }
+    }
+  ]
+}

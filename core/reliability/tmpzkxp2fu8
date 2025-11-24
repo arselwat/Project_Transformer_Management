@@ -1,0 +1,89 @@
+# core/reliability/metrics_plus.py
+from __future__ import annotations
+import numpy as np
+import pandas as pd
+from typing import Dict, List
+
+def compute_mtbf_mttr_by_eq(df_ttf: pd.DataFrame) -> Dict[str, Dict[str, float]]:
+    """
+    Entrée attendue: df avec 'equipment_code', 'ttf_h' (et optionnel 'duree_rep_h').
+    Retour: dict {eq: {"MTBF":..., "MTTR":...}, "global":{...}}
+    """
+    out = {}
+    if df_ttf.empty or "equipment_code" not in df_ttf.columns:
+        return out
+    for eq, d in df_ttf.groupby("equipment_code"):
+        mtbf = float(np.nanmean(d["ttf_h"])) if "ttf_h" in d.columns and len(d) else np.nan
+        mttr = float(np.nanmean(d.get("duree_rep_h", np.nan))) if "duree_rep_h" in d.columns else np.nan
+        out[eq] = {"MTBF": mtbf, "MTTR": mttr}
+    # global
+    mtbf_g = float(np.nanmean(df_ttf["ttf_h"])) if "ttf_h" in df_ttf.columns and len(df_ttf) else np.nan
+    mttr_g = float(np.nanmean(df_ttf.get("duree_rep_h", np.nan))) if "duree_rep_h" in df_ttf.columns else np.nan
+    out["global"] = {"MTBF": mtbf_g, "MTTR": mttr_g}
+    return out
+
+def _fit_beta_eta(x: np.ndarray) -> tuple[float,float] | None:
+    x = np.array([v for v in x if v and v>0], dtype=float)
+    if len(x) < 3:
+        return None
+    # MLE simplifiée via numpy (on s'appuie sur ta fonction fit_weibull upstream normalement)
+    # Ici: méthode des moments approximée pour fallback
+    m = np.mean(x); s = np.std(x, ddof=1) if len(x) > 1 else 0
+    if s <= 0 or m <= 0:
+        return None
+    c = s / m
+    # approx: beta ~ 1.086 / c  (grossière)
+    beta = max(0.1, min(10.0, 1.086 / max(c, 1e-6)))
+    # eta from mean = eta * Gamma(1 + 1/beta)  -> eta ~ m / Gamma(...)
+    try:
+        import mpmath as mp
+        eta = float(m / mp.gamma(1 + 1/beta))
+    except Exception:
+        eta = m  # fallback
+    return beta, eta
+
+def compute_weibull_params_by_eq(df_ttf: pd.DataFrame) -> Dict[str, Dict[str, float]]:
+    """
+    Retour: dict {eq: {"beta":..., "eta":..., "gamma":0.0}}
+    """
+    out = {}
+    if df_ttf.empty or "equipment_code" not in df_ttf.columns or "ttf_h" not in df_ttf.columns:
+        return out
+    for eq, d in df_ttf.groupby("equipment_code"):
+        x = d["ttf_h"].dropna().values
+        if len(x) >= 3:
+            est = _fit_beta_eta(x)
+            if est:
+                b, e = est
+                out[eq] = {"beta": float(b), "eta": float(e), "gamma": 0.0}
+    return out
+
+def merge_metrics_and_optim(mtbf_mttr: Dict[str, Dict[str, float]],
+                            wb_params: Dict[str, Dict[str, float]],
+                            optim_intervals: Dict[str, float] | None = None,
+                            optim_mttr: Dict[str, float] | None = None) -> List[Dict]:
+    rows = []
+    eqs = set(mtbf_mttr.keys()) | set(wb_params.keys()) | set((optim_intervals or {}).keys())
+    eqs.discard("global")
+    for eq in sorted(eqs):
+        r = {"equipment_code": eq}
+        if eq in mtbf_mttr:
+            r.update({
+                "MTBF": mtbf_mttr[eq].get("MTBF"),
+                "MTTR": mtbf_mttr[eq].get("MTTR"),
+            })
+        if eq in wb_params:
+            r.update({
+                "beta": wb_params[eq].get("beta"),
+                "eta": wb_params[eq].get("eta"),
+                "gamma": wb_params[eq].get("gamma", 0.0),
+            })
+        if optim_intervals and eq in optim_intervals:
+            r["interval_opt_h"] = float(optim_intervals[eq])
+        if optim_mttr and eq in optim_mttr:
+            r["MTTR_opt"] = float(optim_mttr[eq])
+        # simple proposition: MTBF_opt ≈ interval_opt_h si défini
+        if "interval_opt_h" in r:
+            r["MTBF_opt"] = r["interval_opt_h"]
+        rows.append(r)
+    return rows

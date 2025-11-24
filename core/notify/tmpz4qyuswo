@@ -1,0 +1,57 @@
+from __future__ import annotations
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+import json
+
+CONFIG_DIR  = Path("config")
+CONFIG_DIR.mkdir(exist_ok=True, parents=True)
+CONFIG_FILE = CONFIG_DIR / "alerts.json"
+
+@dataclass
+class SMTPConfig:
+    host: str = ""
+    port: int = 0
+    user: str = ""
+    password: str = ""
+    from_addr: str = ""
+    to_addrs: list[str] = field(default_factory=list)
+    use_ssl: bool = False
+    use_starttls: bool = False
+
+@dataclass
+class TwilioConfig:
+    sid: str = ""
+    token: str = ""
+    whatsapp_from: str = ""  # "whatsapp:+1415..."
+    whatsapp_to: str = ""    # "whatsapp:+243..."
+
+@dataclass
+class AlertsConfig:
+    enable_email: bool = False
+    enable_whatsapp: bool = False
+    subject_prefix: str = "[ALERT] "
+    min_period_s: float = 30.0
+    smtp: SMTPConfig = field(default_factory=SMTPConfig)
+    twilio: TwilioConfig = field(default_factory=TwilioConfig)
+
+def load_alerts_config() -> AlertsConfig:
+    if CONFIG_FILE.exists():
+        try:
+            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            smtp = SMTPConfig(**data.get("smtp", {}))
+            tw   = TwilioConfig(**data.get("twilio", {}))
+            return AlertsConfig(
+                enable_email=bool(data.get("enable_email", False)),
+                enable_whatsapp=bool(data.get("enable_whatsapp", False)),
+                subject_prefix=str(data.get("subject_prefix", "[ALERT] ")),
+                min_period_s=float(data.get("min_period_s", 30.0)),
+                smtp=smtp, twilio=tw
+            )
+        except Exception:
+            pass
+    return AlertsConfig()
+
+def save_alerts_config(cfg: AlertsConfig) -> Path:
+    data = asdict(cfg)
+    CONFIG_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    return CONFIG_FILE

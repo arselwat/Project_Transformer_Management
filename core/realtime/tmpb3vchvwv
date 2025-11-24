@@ -1,0 +1,116 @@
+# core/realtime/mqtt_io.py
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Optional, Dict, Any, List
+import json, time, queue, threading
+
+try:
+    import paho.mqtt.client as mqtt
+except Exception:
+    mqtt = None  # affichera un message clair dans l’UI
+
+@dataclass
+class MQTTConfig:
+    host: str = "localhost"
+    port: int = 1883
+    topic: str = "transfo/+/telemetry"  # wildcard accepté
+    username: Optional[str] = None
+    password: Optional[str] = None
+    tls: bool = False
+    cafile: Optional[str] = None
+    client_id: Optional[str] = None
+    keepalive: int = 30
+
+class MQTTManager:
+    """Client MQTT non bloquant: loop_start() + queue d'échantillons."""
+    def __init__(self, cfg: MQTTConfig):
+        self.cfg = cfg
+        self.client: Optional["mqtt.Client"] = None
+        self.q: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=5000)
+        self._started = False
+        self._lock = threading.Lock()
+
+    def _parse_payload(self, payload: bytes | str) -> Optional[Dict[str, Any]]:
+        try:
+            if isinstance(payload, bytes):
+                payload = payload.decode("utf-8", errors="ignore")
+            data = json.loads(payload)
+            m = {
+                "ts": float(data.get("ts", time.time())),
+                "v_prim_rms": float(data.get("v_prim_rms", data.get("V1", 230))),
+                "i_prim_rms": float(data.get("i_prim_rms", data.get("I1", 0))),
+                "v_sec": float(data.get("v_sec", data.get("V2", 20))),
+                "i_sec": float(data.get("i_sec", data.get("I2", 0))),
+                "p_sec": float(data.get("p_sec", data.get("P", 0))),
+                "pf_prim": float(data.get("pf_prim", data.get("pf", 0.95))),
+                "freq": float(data.get("freq", data.get("f", 50))),
+                "t_core": float(data.get("t_core", data.get("T", 35))),
+                "mu_oil": float(data.get("mu_oil", data.get("mu", 0.02))),
+                "status": str(data.get("status", "OK")),
+                "site": data.get("site"),
+                "equipment": data.get("equipment"),
+            }
+            return m
+        except Exception:
+            return None
+
+    def _on_connect(self, client, userdata, flags, rc, properties=None):
+        try:
+            client.subscribe(self.cfg.topic, qos=0)
+        except Exception:
+            pass
+
+    def _on_message(self, client, userdata, msg):
+        m = self._parse_payload(msg.payload)
+        if m:
+            try:
+                self.q.put_nowait(m)
+            except queue.Full:
+                try:
+                    _ = self.q.get_nowait()
+                    self.q.put_nowait(m)
+                except Exception:
+                    pass
+
+    def start(self) -> Dict[str, Any]:
+        if mqtt is None:
+            return {"ok": False, "error": "paho-mqtt non installé"}
+        with self._lock:
+            if self._started:
+                return {"ok": True, "info": "already started"}
+            try:
+                self.client = mqtt.Client(client_id=self.cfg.client_id or None)
+                if self.cfg.username:
+                    self.client.username_pw_set(self.cfg.username, self.cfg.password or None)
+                if self.cfg.tls:
+                    if self.cfg.cafile:
+                        self.client.tls_set(ca_certs=self.cfg.cafile)
+                    else:
+                        self.client.tls_set()
+                self.client.on_connect = self._on_connect
+                self.client.on_message = self._on_message
+                self.client.connect(self.cfg.host, self.cfg.port, keepalive=self.cfg.keepalive)
+                self.client.loop_start()
+                self._started = True
+                return {"ok": True}
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+
+    def stop(self):
+        with self._lock:
+            if self.client:
+                try: self.client.loop_stop()
+                except Exception: pass
+                try: self.client.disconnect()
+                except Exception: pass
+            self.client = None
+            self._started = False
+
+    def drain(self, max_items: int = 500) -> List[Dict[str, Any]]:
+        out = []
+        for _ in range(max_items):
+            try:
+                out.append(self.q.get_nowait())
+            except queue.Empty:
+                break
+        return out

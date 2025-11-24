@@ -1,0 +1,121 @@
+# core/maintenance/reporting_plus.py
+from __future__ import annotations
+from typing import List, Dict
+from pathlib import Path
+from datetime import datetime
+import pandas as pd
+from fpdf import FPDF
+
+REPORTS_DIR = Path("reports")
+REPORTS_DIR.mkdir(exist_ok=True, parents=True)
+
+def _cell(pdf: FPDF, w, h, txt, border=0, align="L", ln=0):
+    pdf.cell(w, h, txt, border=border, align=align, ln=ln)
+
+def export_pm_plan_with_kits_pdf(due_tasks: List[Dict], kits_by_eq: Dict[str, List[Dict]], metrics_table: List[Dict]) -> str:
+    """
+    Génère un PDF simple et lisible :
+    - Synthèse fiabilité (MTBF/MTTR, β/η/γ, interval_opt_h)
+    - Plan de maintenance (tâches dues)
+    - Kits par équipement (avec disponible OUI/NON)
+    """
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    out = REPORTS_DIR / f"pm_plan_kits_{ts}.pdf"
+
+    pdf = FPDF(format="A4", unit="mm")
+    pdf.set_auto_page_break(auto=True, margin=12)
+    pdf.add_page()
+    pdf.set_font("Arial", "B", 14)
+    pdf.cell(0, 8, "Plan de maintenance + Kits (Synthèse)", ln=1)
+    pdf.set_font("Arial", "", 10)
+    pdf.cell(0, 6, datetime.now().strftime("%d/%m/%Y %H:%M"), ln=1)
+
+    # 1) Synthèse fiabilité
+    pdf.set_font("Arial", "B", 12)
+    pdf.cell(0, 7, "1) Synthèse fiabilité & paramètres Weibull", ln=1)
+    if metrics_table:
+        dfm = pd.DataFrame(metrics_table)
+        cols = [c for c in ["equipment_code","MTBF","MTTR","beta","eta","gamma","interval_opt_h","MTBF_opt","MTTR_opt"] if c in dfm.columns]
+        pdf.set_font("Arial", "B", 9)
+        pdf.cell(35, 6, "Équipement", 1)
+        for c in cols[1:]:
+            pdf.cell(22, 6, c, 1, align="C")
+        pdf.ln(6)
+        pdf.set_font("Arial", "", 9)
+        for _, r in dfm.iterrows():
+            pdf.cell(35, 6, str(r.get("equipment_code","")), 1)
+            for c in cols[1:]:
+                val = r.get(c, "")
+                pdf.cell(22, 6, f"{val:.2f}" if isinstance(val,(int,float)) else str(val), 1, align="C")
+            pdf.ln(6)
+    else:
+        pdf.set_font("Arial", "", 10)
+        pdf.cell(0, 6, "Aucune métrique disponible (TTF insuffisants).", ln=1)
+
+    # 2) Plan de maintenance
+    pdf.ln(3)
+    pdf.set_font("Arial", "B", 12)
+    pdf.cell(0, 7, "2) Plan de maintenance (tâches dues)", ln=1)
+    if due_tasks:
+        pdf.set_font("Arial", "B", 9)
+        headers = [("Eq", 22), ("Titre", 60), ("Priorité", 22), ("Échéance", 30), ("J-jours", 22)]
+        for h, w in headers: pdf.cell(w, 6, h, 1, align="C")
+        pdf.ln(6)
+        pdf.set_font("Arial", "", 9)
+        for t in due_tasks:
+            pdf.cell(22, 6, str(t.get("equipment_code","")), 1)
+            pdf.cell(60, 6, str(t.get("title",""))[:45], 1)
+            pdf.cell(22, 6, str(t.get("priority","")), 1, align="C")
+            pdf.cell(30, 6, str(t.get("next_due_date","")), 1, align="C")
+            pdf.cell(22, 6, str(t.get("days_left","")), 1, align="C")
+            pdf.ln(6)
+    else:
+        pdf.set_font("Arial", "", 10)
+        pdf.cell(0, 6, "Aucune tâche due dans l’intervalle.", ln=1)
+
+    # 3) Kits par équipement
+    pdf.ln(3)
+    pdf.set_font("Arial", "B", 12)
+    pdf.cell(0, 7, "3) Kits pièces recommandés (avec disponibilité)", ln=1)
+    if kits_by_eq:
+        for eq, items in kits_by_eq.items():
+            pdf.set_font("Arial", "B", 10)
+            pdf.cell(0, 6, f"Équipement {eq}", ln=1)
+            if not items:
+                pdf.set_font("Arial", "", 9)
+                pdf.cell(0, 6, "— Aucun élément proposé —", ln=1)
+                continue
+            pdf.set_font("Arial", "B", 8)
+            headers = [("Code",22),("Nom",52),("Famille",24),("Qté",12),("Seuil",12),("Loc",16),("Qté cons.",16),("Disp.",14),("PU",14)]
+            for h,w in headers: pdf.cell(w, 6, h, 1, align="C")
+            pdf.ln(6)
+            pdf.set_font("Arial", "", 8)
+            for it in items:
+                disp = "OUI"
+                try:
+                    disp = "OUI" if (float(it.get("quantite_dispo",0)) - float(it.get("quantite_recommandee",0))) >= 0 else "NON"
+                except Exception:
+                    pass
+                row = [
+                    str(it.get("code","")),
+                    str(it.get("nom",""))[:30],
+                    str(it.get("famille",""))[:14],
+                    str(it.get("quantite_dispo","")),
+                    str(it.get("seuil_min","")),
+                    str(it.get("localisation",""))[:10],
+                    str(int(it.get("quantite_recommandee",0) or 0)),
+                    disp,
+                    f"{float(it.get('prix_unitaire',0.0) or 0):.2f}",
+                ]
+                widths = [22,52,24,12,12,16,16,14,14]
+                for w, val in zip(widths, row):
+                    align = "C" if w <= 16 else "L"
+                    pdf.cell(w, 6, val, 1, align=align)
+                pdf.ln(6)
+            pdf.ln(2)
+    else:
+        pdf.set_font("Arial", "", 10)
+        pdf.cell(0, 6, "— Aucun kit calculé —", ln=1)
+
+    pdf.output(out.as_posix())
+    return out.as_posix()

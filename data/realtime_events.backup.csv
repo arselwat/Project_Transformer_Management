@@ -1,0 +1,2 @@
+ts,site,equipment,level,code,msg,value,threshold,processed
+1762172209.6262214,bench1,tr_220_20,ALARM,TEMP_HIGH,Temp noyau élevée,71.0,70.0,0

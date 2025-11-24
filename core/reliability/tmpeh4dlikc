@@ -1,0 +1,302 @@
+# core/reliability/reporting_merged.py
+from __future__ import annotations
+from pathlib import Path
+from typing import Dict, Any, List
+import datetime
+import math
+import unicodedata
+import io
+
+import pandas as pd
+
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.units import mm, cm
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak, Image as RLImage
+
+# Courbes (R, F, f, h)
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+from core.reliability.weibull import R, F, pdf, hazard
+
+# ---------- Helpers ----------
+def SAN(s: Any) -> str:
+    s = "" if s is None else str(s)
+    s = (s.replace("’", "'").replace("‘", "'")
+           .replace("“", '"').replace("”", '"')
+           .replace("–", "-").replace("—", "-")
+           .replace("•", "-").replace("…", "...").replace("\u00A0", " "))
+    s = unicodedata.normalize("NFKD", s)
+    return s.encode("latin-1", "ignore").decode("latin-1", "ignore")
+
+def fnum(v: Any, nd: int = 1, default: str = "—") -> str:
+    try:
+        if v is None:
+            return default
+        if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+            return default
+        return f"{float(v):.{nd}f}"
+    except Exception:
+        return default
+
+def _as_dist_dict(d):
+    if isinstance(d, dict):
+        return d
+    if d is None:
+        return {}
+    return {"name": str(d)}
+
+def _get_interval_opt(optim_intervals: dict | None, eq: str):
+    try:
+        v = (optim_intervals or {}).get(eq)
+        if isinstance(v, dict):
+            return v.get("interval_opt_h")
+        if v is None:
+            return None
+        return float(v)
+    except Exception:
+        return None
+
+def _pipeline_path_str(pipe: dict) -> str:
+    mk  = pipe.get("trend_mk") or {}
+    dep = pipe.get("dependence") or {}
+    has_trend = bool(mk.get("has_trend"))
+    has_dep   = bool(dep.get("has_dep"))
+    chosen = "NHPP" if has_trend else ("BPP" if has_dep else "RP")
+    dist = _as_dist_dict(pipe.get("distribution")).get("name", "—")
+    return f"TTF>0 → MK(p={fnum(mk.get('p'),3)}) → {chosen} ; Dist={dist}"
+
+def _curve_image_for_eq(eq: str, ft, x_emp: pd.Series | None):
+    """Génère une image 2x2 (R,F,f,h) pour un équipement donné; renvoie un RLImage."""
+    try:
+        # Domain t basé sur données et/ou paramètres
+        eta = getattr(ft, "eta", None)
+        tmax_emp = float(x_emp.max()) if x_emp is not None and not x_emp.empty else 0.0
+        tmax = max(100.0, tmax_emp * 1.2 if tmax_emp > 0 else 0.0)
+        if eta:
+            tmax = max(tmax, float(eta) * 2.0)
+        t = np.linspace(0, tmax, 400)
+
+        fig, axes = plt.subplots(2, 2, figsize=(10, 6))
+        ax = axes[0,0]; ax.plot(t, R(t, ft)); ax.set_title("R(t)"); ax.set_xlabel("t (h)"); ax.set_ylabel("R"); ax.grid(alpha=.3)
+        ax = axes[0,1]; ax.plot(t, F(t, ft)); ax.set_title("F(t)"); ax.set_xlabel("t (h)"); ax.set_ylabel("F"); ax.grid(alpha=.3)
+        ax = axes[1,0]; ax.plot(t, pdf(t, ft)); ax.set_title("f(t)"); ax.set_xlabel("t (h)"); ax.set_ylabel("f"); ax.grid(alpha=.3)
+        ax = axes[1,1]; ax.plot(t, hazard(t, ft)); ax.set_title("h(t)"); ax.set_xlabel("t (h)"); ax.set_ylabel("h"); ax.grid(alpha=.3)
+        fig.suptitle(f"Courbes — {eq}", fontsize=12)
+        fig.tight_layout(rect=[0,0,1,0.96])
+
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=150)
+        plt.close(fig)
+        buf.seek(0)
+        img = RLImage(buf, width=17*cm, height=10.5*cm)
+        return img
+    except Exception:
+        return None
+
+# ---------- PDF ----------
+def export_merged_report_pdf(
+    *, df: pd.DataFrame, fits: Dict[str, Any],
+    pipeline_by_eq: Dict[str, Dict[str, Any]],
+    optim_intervals: Dict[str, Dict[str, Any]] | None,
+    metrics_table: List[Dict[str, Any]] | None = None,   # << ajouté
+    out_dir: str | Path = "reports",
+    title: str = "Rapport complet — Analyse & Optimisation",
+) -> str:
+    out_dir = Path(out_dir); out_dir.mkdir(exist_ok=True, parents=True)
+    date_now = datetime.datetime.now().strftime("%Y%m%d-%H%M")
+    out_path = out_dir / f"report_analyse_optim_{date_now}.pdf"
+
+    doc = SimpleDocTemplate(
+        str(out_path),
+        pagesize=A4,
+        topMargin=18*mm, bottomMargin=15*mm, leftMargin=16*mm, rightMargin=16*mm,
+    )
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(name="H1BlueX", parent=styles["Heading1"], textColor=colors.HexColor("#0b5fa5")))
+    styles.add(ParagraphStyle(name="H2BlueX", parent=styles["Heading2"], textColor=colors.HexColor("#0b5fa5")))
+    styles.add(ParagraphStyle(name="H3BlueX", parent=styles["Heading3"], textColor=colors.HexColor("#0b5fa5")))
+
+    # Pour accès rapide aux métriques “après”
+    metrics_map = {}
+    if isinstance(metrics_table, list):
+        for r in metrics_table:
+            eqk = SAN((r or {}).get("equipment_code",""))
+            if eqk:
+                metrics_map[eqk] = r or {}
+
+    story = []
+    story.append(Paragraph(SAN(title), styles["Title"]))
+    story.append(Paragraph(SAN(datetime.datetime.now().strftime("%d/%m/%Y %H:%M")), styles["BodyText"]))
+    story.append(Spacer(1, 10))
+
+    if "equipment_code" in df.columns:
+        eqs = sorted(df["equipment_code"].dropna().astype(str).unique().tolist())
+    else:
+        eqs = sorted({str(k) for k in (pipeline_by_eq or {}).keys()})
+
+    for i, eq in enumerate(eqs):
+        if i > 0:
+            story.append(PageBreak())
+        story.append(Paragraph(SAN(f"Équipement : {eq}"), styles["H1BlueX"]))
+        pipe = pipeline_by_eq.get(eq, {}) or {}
+
+        mk   = pipe.get("trend_mk", {}) or {}
+        dep  = pipe.get("dependence", {}) or {}
+        model= pipe.get("model", "")
+        dd   = _as_dist_dict(pipe.get("distribution"))
+
+        aic  = dd.get("aic"); ks_p = dd.get("ks_p"); chi2 = dd.get("chi2_p")
+        beta = dd.get("beta"); eta  = dd.get("eta");  gamma = dd.get("gamma")
+        itv  = _get_interval_opt(optim_intervals, eq)
+
+        # ---- Chaîne organigramme
+        story.append(Paragraph(SAN("Chaîne d’exécution — Organigramme"), styles["H2BlueX"]))
+        path_str = _pipeline_path_str(pipe)
+        story.append(Paragraph(SAN(path_str), styles["BodyText"]))
+        story.append(Spacer(1, 4))
+
+        # ---- Tableau détails organigramme
+        data = [
+            ["Étape", "Résultat"],
+            ["Nettoyage TTF > 0", f"n={pipe.get('cleaned_n', '—')}"],
+            ["Mann–Kendall", f"z={fnum(mk.get('z'),3)}, p={fnum(mk.get('p'),3)}, has_trend={mk.get('has_trend')}"],
+            ["Dépendance (Pearson)", f"r={fnum(dep.get('r'),3)}, p={fnum(dep.get('p'),3)}, has_dep={dep.get('has_dep')}"],
+            ["Modèle retenu", model or "—"],
+            ["Distribution (AIC min)", dd.get('name', '—')],
+            ["AIC / KS p / Chi2 p", f"{fnum(aic,2)} / {fnum(ks_p,3)} / {fnum(chi2,3)}"],
+            ["Weibull (β/η/γ)", f"{fnum(beta,2)} / {fnum(eta,1)} / {fnum(gamma,1)}"],
+            ["Intervalle optimisé (h)", fnum(itv,1)],
+        ]
+        tbl = Table(data, repeatRows=1, colWidths=[6.5*cm, 9.5*cm])
+        tbl.setStyle(TableStyle([
+            ("BACKGROUND",(0,0),(-1,0),colors.whitesmoke),
+            ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),
+            ("GRID",(0,0),(-1,-1),0.3,colors.grey),
+            ("FONTSIZE",(0,0),(-1,-1),9),
+            ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
+        ]))
+        story.append(tbl)
+        story.append(Spacer(1, 8))
+
+        # ---- Courbes (R,F,f,h)
+        x_emp = None
+        if "ttf_h" in df.columns:
+            x_emp = df.loc[df["equipment_code"] == eq, "ttf_h"].dropna().astype(float)
+        ft = fits.get(eq)
+        img = _curve_image_for_eq(eq, ft, x_emp)
+        if img:
+            story.append(img)
+            story.append(Spacer(1, 8))
+
+        # ---- Tableaux d’analyse : Avant / Après
+        story.append(Paragraph(SAN("Tableaux d’analyse — Avant vs Après optimisation"), styles["H2BlueX"]))
+        # Avant (empirique + théorique)
+        n_ttf = int(x_emp.size) if x_emp is not None else 0
+        mtbf_emp = float(x_emp.mean()) if x_emp is not None and n_ttf>0 else None
+        # MTTF théorique (si β,η)
+        mttf_th = None
+        try:
+            if beta and eta:
+                mttf_th = (gamma or 0.0) + float(eta) * math.gamma(1.0 + 1.0/float(beta))
+        except Exception:
+            mttf_th = None
+
+        data_before = [
+            ["Mesure", "Valeur"],
+            ["n TTF", str(n_ttf)],
+            ["MTBF empirique (h)", fnum(mtbf_emp,1)],
+            ["MTTF théorique (h)", fnum(mttf_th,1)],
+            ["β", fnum(beta,2)],
+            ["η (h)", fnum(eta,1)],
+            ["γ (h)", fnum(gamma,1)],
+            ["Modèle", model or "—"],
+            ["Distribution", dd.get("name","—")],
+            ["MK p", fnum(mk.get('p'),3)],
+            ["Pearson r/p", f"{fnum(dep.get('r'),3)} / {fnum(dep.get('p'),3)}"],
+        ]
+        tblB = Table(data_before, repeatRows=1, colWidths=[6.5*cm, 9.5*cm])
+        tblB.setStyle(TableStyle([
+            ("BACKGROUND",(0,0),(-1,0),colors.whitesmoke),
+            ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),
+            ("GRID",(0,0),(-1,-1),0.3,colors.grey),
+            ("FONTSIZE",(0,0),(-1,-1),9),
+            ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
+        ]))
+        story.append(tblB)
+        story.append(Spacer(1, 6))
+
+        # Après optimisation (en fonction des données disponibles)
+        mtbf_opt = None
+        mttr_opt = None
+        if metrics_map.get(eq):
+            mtbf_opt = metrics_map[eq].get("MTBF_opt")
+            mttr_opt = metrics_map[eq].get("MTTR_opt")
+        # Fiabilité à l’intervalle proposé
+        Ritv = None
+        try:
+            if itv and ft:
+                Ritv = float(R(itv, ft))
+        except Exception:
+            Ritv = None
+
+        data_after = [
+            ["Paramètre", "Valeur"],
+            ["Intervalle optimisé (h)", fnum(itv,1)],
+            ["Fiabilité à l’intervalle R(t)", fnum(Ritv,3)],
+            ["MTBF optimisé (h)", fnum(mtbf_opt,1)],
+            ["MTTR optimisé (h)", fnum(mttr_opt,1)],
+        ]
+        tblA = Table(data_after, repeatRows=1, colWidths=[6.5*cm, 9.5*cm])
+        tblA.setStyle(TableStyle([
+            ("BACKGROUND",(0,0),(-1,0),colors.whitesmoke),
+            ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),
+            ("GRID",(0,0),(-1,-1),0.3,colors.grey),
+            ("FONTSIZE",(0,0),(-1,-1),9),
+            ("VALIGN",(0,0),(-1,-1), "MIDDLE"),
+        ]))
+        story.append(tblA)
+        story.append(Spacer(1, 8))
+
+    # Récap global (inchangé mais on le garde)
+    story.append(PageBreak())
+    story.append(Paragraph(SAN("Récapitulatif global"), styles["H1BlueX"]))
+    head = ["Équipement","Modèle","Dist AIC min","β","η (h)","γ (h)","Intervalle opt (h)","n TTF","MTBF mesuré (h)"]
+    rows = []
+    if "equipment_code" in df.columns:
+        eqs = sorted(df["equipment_code"].dropna().astype(str).unique().tolist())
+    else:
+        eqs = sorted({str(k) for k in (pipeline_by_eq or {}).keys()})
+    for eq in eqs:
+        pipe = pipeline_by_eq.get(eq, {}) or {}
+        model= pipe.get("model","")
+        dd   = _as_dist_dict(pipe.get("distribution"))
+        beta = dd.get("beta"); eta = dd.get("eta"); gamma = dd.get("gamma")
+        itv  = _get_interval_opt(optim_intervals, eq)
+        if "ttf_h" in df.columns:
+            x = df.loc[df["equipment_code"] == eq, "ttf_h"].dropna().astype(float)
+            mtbf = x.mean() if not x.empty else None
+            n_ttf = len(x)
+        else:
+            mtbf, n_ttf = None, 0
+        rows.append([SAN(eq), SAN(model), SAN(dd.get("name","—")),
+                     fnum(beta,2), fnum(eta,1), fnum(gamma,1),
+                     fnum(itv,1), n_ttf, fnum(mtbf,1)])
+    data = [head] + (rows if rows else [["—"]*len(head)])
+    tbl = Table(data, repeatRows=1)
+    tbl.setStyle(TableStyle([
+        ("BACKGROUND",(0,0),(-1,0),colors.whitesmoke),
+        ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),
+        ("GRID",(0,0),(-1,-1),0.3,colors.grey),
+        ("FONTSIZE",(0,0),(-1,-1),8),
+        ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
+    ]))
+    story.append(tbl)
+    story.append(Spacer(1, 8))
+
+    story.append(Paragraph(SAN(f"Rapport généré le {datetime.datetime.now().strftime('%d/%m/%Y %H:%M')}"), styles["BodyText"]))
+    doc.build(story)
+    return str(out_path)

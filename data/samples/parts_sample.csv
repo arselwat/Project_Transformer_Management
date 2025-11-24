@@ -1,0 +1,4 @@
+code,nom,quantite,localisation,seuil_min,fournisseur,prix_unitaire
+PRT-001,Isolateur 20kV,15,Mag A,5,ElecSup,55.5
+PRT-002,Huile diélectrique 30L,8,Mag B,3,Fluidoil,120.0
+PRT-003,Joint 10mm,50,Mag A,10,GomaPlus,2.1

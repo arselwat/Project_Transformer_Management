@@ -1,0 +1,64 @@
+# core/notify/senders.py
+from __future__ import annotations
+from email.message import EmailMessage
+import smtplib, ssl
+from typing import Iterable
+from .config import AlertsConfig, load_alerts_config
+
+def send_email_smtp(subject: str, body: str, cfg: AlertsConfig | None = None) -> dict:
+    cfg = cfg or load_alerts_config()
+    if not cfg.enable_email:
+        return {"ok": False, "error": "email_disabled"}
+    s = cfg.smtp
+    if not (s.host and s.from_addr and s.to_addrs):
+        return {"ok": False, "error": "smtp_missing_config"}
+
+    msg = EmailMessage()
+    msg["Subject"] = f"{cfg.subject_prefix} {subject}".strip()
+    msg["From"] = s.from_addr
+    msg["To"] = ", ".join(s.to_addrs)
+    msg.set_content(body)
+
+    try:
+        if s.use_ssl or s.port == 465:
+            context = ssl.create_default_context()
+            with smtplib.SMTP_SSL(s.host, s.port, context=context, timeout=20) as server:
+                if s.user and s.password:
+                    server.login(s.user, s.password)
+                server.send_message(msg)
+        else:
+            with smtplib.SMTP(s.host, s.port, timeout=20) as server:
+                server.ehlo()
+                if s.use_starttls:
+                    context = ssl.create_default_context()
+                    server.starttls(context=context)
+                if s.user and s.password:
+                    server.login(s.user, s.password)
+                server.send_message(msg)
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+def send_whatsapp_twilio(body: str, cfg: AlertsConfig | None = None) -> dict:
+    cfg = cfg or load_alerts_config()
+    if not cfg.enable_whatsapp:
+        return {"ok": False, "error": "whatsapp_disabled"}
+    t = cfg.twilio
+    if not (t.sid and t.token and t.whatsapp_from and t.whatsapp_to):
+        return {"ok": False, "error": "twilio_missing_config"}
+
+    try:
+        from twilio.rest import Client  # type: ignore
+    except Exception as e:
+        return {"ok": False, "error": f"twilio_import:{e}"}
+
+    try:
+        client = Client(t.sid, t.token)
+        msg = client.messages.create(
+            from_="whatsapp:" + t.whatsapp_from,
+            to="whatsapp:" + t.whatsapp_to,
+            body=body[:1590]  # marge sécurité
+        )
+        return {"ok": True, "sid": getattr(msg, "sid", None)}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}

@@ -1,0 +1,123 @@
+import os, ssl, smtplib, json
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from pathlib import Path
+from typing import List, Optional
+from dotenv import load_dotenv
+
+from core.inventory import services as inv
+
+# Charger .env une seule fois
+load_dotenv()
+
+# Dossier de config locale pour stocker les destinataires
+CONFIG_DIR = Path("config")
+CONFIG_DIR.mkdir(exist_ok=True)
+RECIP_FILE = CONFIG_DIR / "alerts.json"
+
+DEFAULT_CONFIG = {
+    "emails": [],              # ["chef.maint@exemple.com", ...]
+    "whatsapp_numbers": [],    # ["+2438xxxxxxx", "+33xxxxxxxxx", ...]
+    "low_stock_factor": 1.0,   # seuil d'alerte (quantite <= seuil_min * factor)
+}
+
+def load_recipients() -> dict:
+    if RECIP_FILE.exists():
+        try:
+            return json.loads(RECIP_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return DEFAULT_CONFIG.copy()
+
+def save_recipients(cfg: dict):
+    RECIP_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+
+# ---------------- E-MAIL ----------------
+def send_email(subject: str, body: str, to_list: List[str]) -> Optional[str]:
+    if not to_list:
+        return "Aucun destinataire e-mail."
+    host = os.getenv("SMTP_HOST")
+    port = int(os.getenv("SMTP_PORT", "465"))
+    user = os.getenv("SMTP_USER")
+    pwd  = os.getenv("SMTP_PASS")
+    if not (host and user and pwd):
+        return "SMTP non configuré (voir .env)."
+
+    msg = MIMEMultipart()
+    msg["From"] = user
+    msg["To"] = ", ".join(to_list)
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain", "utf-8"))
+
+    try:
+        ctx = ssl.create_default_context()
+        with smtplib.SMTP_SSL(host, port, context=ctx) as server:
+            server.login(user, pwd)
+            server.sendmail(user, to_list, msg.as_string())
+        return None
+    except Exception as e:
+        return f"Erreur SMTP: {e}"
+
+# ---------------- WhatsApp (Twilio) ----------------
+def send_whatsapp(body: str, numbers: List[str]) -> Optional[str]:
+    if not numbers:
+        return "Aucun numéro WhatsApp."
+    sid = os.getenv("TWILIO_ACCOUNT_SID")
+    tok = os.getenv("TWILIO_AUTH_TOKEN")
+    wa_from = os.getenv("TWILIO_WHATSAPP_FROM")
+    if not (sid and tok and wa_from):
+        return "Twilio non configuré (voir .env)."
+    try:
+        from twilio.rest import Client
+        client = Client(sid, tok)
+        for n in numbers:
+            client.messages.create(
+                from_=wa_from,
+                to=f"whatsapp:{n}" if not str(n).startswith("whatsapp:") else n,
+                body=body
+            )
+        return None
+    except Exception as e:
+        return f"Erreur Twilio: {e}"
+
+# ---------------- Vérification & messages ----------------
+def format_low_stock_message(items: list) -> str:
+    if not items:
+        return "Aucune pièce sous seuil."
+    lines = ["ALERTE STOCK: pièces sous seuil:"]
+    for it in items:
+        lines.append(f"- {it['code']} | {it['nom']} | qte={it['quantite']} | seuil={it['seuil_min']}")
+    return "\n".join(lines)
+
+def check_low_stock_and_notify() -> dict:
+    """
+    Vérifie les pièces sous seuil et envoie les alertes (email + WhatsApp) selon la config.
+    Retourne un dict avec statut/envoyé.
+    """
+    cfg = load_recipients()
+    factor = float(cfg.get("low_stock_factor", 1.0))
+    under = inv.low_stock(threshold_factor=factor)
+
+    result = {"count": len(under), "email": None, "whatsapp": None}
+    if not under:
+        return result
+
+    # Corps du message
+    message = format_low_stock_message(under)
+
+    # e-mail
+    if cfg.get("emails"):
+        result["email"] = send_email(
+            subject="Alerte stock de maintenance",
+            body=message,
+            to_list=cfg["emails"]
+        )
+
+    # WhatsApp
+    if cfg.get("whatsapp_numbers"):
+        result["whatsapp"] = send_whatsapp(
+            body=message,
+            numbers=cfg["whatsapp_numbers"]
+        )
+
+    return result

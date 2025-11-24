@@ -1,0 +1,50 @@
+# core/notify/alerts_plus.py
+from __future__ import annotations
+from typing import List, Dict
+from pathlib import Path
+import csv
+from datetime import datetime
+
+from core.notify import alerts as base_alerts  # ton module existant
+from core.notify.alerts import load_recipients, save_recipients, send_email, send_whatsapp_text
+
+def _write_csv_for_attachment(rows: List[Dict]) -> str:
+    Path("reports").mkdir(exist_ok=True, parents=True)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    fp = Path("reports") / f"pm_metrics_{ts}.csv"
+    if not rows:
+        fp.write_text("equipment_code,MTBF,MTTR,beta,eta,gamma,interval_opt_h,MTBF_opt,MTTR_opt\n", encoding="utf-8")
+        return fp.as_posix()
+    cols = list({k for r in rows for k in r.keys()})
+    with fp.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=cols)
+        w.writeheader()
+        w.writerows(rows)
+    return fp.as_posix()
+
+def notify_pm_with_kits(due_tasks: List[Dict], kits_by_eq: Dict[str, List[Dict]], metrics_table: List[Dict]):
+    """
+    - génère un PDF (déjà fait en amont si besoin)
+    - génère un CSV des métriques
+    - envoie EMAIL (avec PDF + CSV) et WhatsApp (texte)
+    """
+    # PDF : on (re)génère depuis reporting_plus pour garantir l’existence
+    from core.maintenance.reporting_plus import export_pm_plan_with_kits_pdf
+    pdf_path = export_pm_plan_with_kits_pdf(due_tasks, kits_by_eq, metrics_table)
+    csv_path = _write_csv_for_attachment(metrics_table)
+
+    cfg = load_recipients()
+    within = int(cfg.get("pm_due_within_days", 7))
+    msg = base_alerts.fmt_pm(due_tasks, within)
+
+    ret = {"pdf": pdf_path, "csv": csv_path, "email": None, "whatsapp": None}
+    if cfg.get("emails") and base_alerts._smtp_config_ok():
+        ret["email"] = base_alerts.send_email(
+            subject="Alerte maintenance — Plan + Kits en PJ",
+            body=msg,
+            to_list=cfg["emails"],
+            attachments=[pdf_path, csv_path]
+        )
+    if cfg.get("whatsapp_numbers") and base_alerts._twilio_config_ok():
+        ret["whatsapp"] = send_whatsapp_text(msg, cfg["whatsapp_numbers"])
+    return ret

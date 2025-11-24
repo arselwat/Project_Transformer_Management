@@ -1,0 +1,3 @@
+ts_s,equipment_code,hours,load_pct,oil_temp_c,vibration_g,humidity_pct
+1761307444,TR-01,0.067,82.0,63.23,0.0413,30.0
+1761307452,TR-01,0.083,68.0,58.42,0.0403,32.4

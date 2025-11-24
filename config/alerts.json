@@ -1,0 +1,25 @@
+{
+  "enable_email": true,
+  "enable_whatsapp": true,
+  "subject_prefix": "[ALERT] ",
+  "min_period_s": 30.0,
+  "smtp": {
+    "host": "smtp.gmail.com",
+    "port": 587,
+    "user": "watendasongiarsel98@gmail.com",
+    "password": "jjtesbrqzyzqwpcd",
+    "from_addr": "watendasongiarsel98@gmail.com",
+    "to_addrs": [
+      "songiwat@gmail.com",
+      "watendasongiarsel98@gmail.com"
+    ],
+    "use_ssl": false,
+    "use_starttls": true
+  },
+  "twilio": {
+    "sid": "AC40750e9c8613e3ec0315367e928ed830",
+    "token": "d6c26c1fafdeb147157ec6bc5249f2e2",
+    "whatsapp_from": "whatsapp:+14155238886",
+    "whatsapp_to": "whatsapp:+243989503568"
+  }
+}

@@ -1,0 +1,333 @@
+# core/reliability/reporting_full.py
+from __future__ import annotations
+import os, math, datetime, unicodedata
+from pathlib import Path
+from typing import Dict, List, Union
+
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")  # backend non interactif
+import matplotlib.pyplot as plt
+
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.units import mm
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, PageBreak
+)
+from reportlab.lib.styles import getSampleStyleSheet
+
+# Fonctions fiabilité attendues depuis ton projet
+# (fit_weibull renvoie un objet avec .beta .eta ; R, F, pdf, hazard attendent (t, fit))
+from core.reliability.weibull import R, F, pdf, hazard
+
+# ---------------- SANITIZE TEXTE (éviter l’erreur “font helvetica”) ----------------
+def SAN(s):
+    """
+    Nettoie les guillemets/tirets spéciaux, remplace les caractères hors Latin-1.
+    -> évite l'erreur "Character '…' outside font range".
+    """
+    s = str(s)
+    s = (s.replace("’", "'").replace("‘", "'")
+           .replace("“", '"').replace("”", '"')
+           .replace("–", "-").replace("—", "-")
+           .replace("•", "-").replace("…", "...")
+           .replace("\u00A0", " "))  # NBSP
+    s = unicodedata.normalize("NFKD", s)
+    s = s.encode("latin-1", "ignore").decode("latin-1", "ignore")
+    return s
+
+# --------------- UTIL : lecture DataFrame ou chemin CSV -----------------
+def _df_from_any(df_or_path: Union[pd.DataFrame, str, Path]) -> pd.DataFrame:
+    if isinstance(df_or_path, pd.DataFrame):
+        df = df_or_path.copy()
+    else:
+        p = Path(df_or_path)
+        if not p.exists():
+            # renvoie DF vide si absent
+            return pd.DataFrame()
+        df = pd.read_csv(p)
+    # Harmonisation colonnes usuelles
+    low = {c.lower(): c for c in df.columns}
+    def col(name): return low.get(name, None)
+
+    # Normalisation minimale
+    if "equipment_code" not in df.columns and col("equipment_code"):
+        df = df.rename(columns={col("equipment_code"): "equipment_code"})
+    if "ttf_h" not in df.columns and col("ttf_h"):
+        df = df.rename(columns={col("ttf_h"): "ttf_h"})
+    if "duree_rep_h" not in df.columns and col("duree_rep_h"):
+        df = df.rename(columns={col("duree_rep_h"): "duree_rep_h"})
+
+    # Nettoyage TTF si présent
+    if "ttf_h" in df.columns:
+        df["ttf_h"] = pd.to_numeric(df["ttf_h"], errors="coerce")
+        df = df.dropna(subset=["ttf_h"])
+        df = df[df["ttf_h"] > 0]
+
+    return df
+
+# --------------- UTIL : compute métriques mesurées simples ----------------
+def _metrics_measured(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Retourne par équipement: MTBF, MTTR (mesuré).
+    - MTBF = moyenne des TTF si 'ttf_h' dispo
+    - MTTR = moyenne de 'duree_rep_h' si dispo
+    """
+    if "equipment_code" not in df.columns:
+        return pd.DataFrame()
+    rows = []
+    for eq, dfe in df.groupby("equipment_code"):
+        mtbf = float(dfe["ttf_h"].mean()) if "ttf_h" in dfe.columns and len(dfe["ttf_h"]) else float("nan")
+        mttr = float(dfe["duree_rep_h"].mean()) if "duree_rep_h" in dfe.columns and len(dfe["duree_rep_h"]) else float("nan")
+        rows.append({"equipment_code": eq, "MTBF": mtbf, "MTTR": mttr})
+    return pd.DataFrame(rows)
+
+# --------------- UTIL : optim simple t* pour une cible R* ----------------
+def _t_star(beta: float, eta: float, R_target: float = 0.80) -> float:
+    # R(t) = exp(-(t/eta)^beta)  => t* = eta * (-ln(R*))^(1/beta)
+    if beta <= 0 or eta <= 0 or not (0 < R_target < 1):
+        return float("nan")
+    return float(eta * (-math.log(R_target)) ** (1.0 / beta))
+
+# --------------- UTIL : procédure de maintenance pilotée par β -----------
+def _policy_text_for_beta(beta: float) -> List[str]:
+    """
+    Simplifié : adapte les actions selon la forme β.
+    """
+    if beta < 1.0:
+        return [
+            "Pannes précoces : renforcer les contrôles qualité et burn-in.",
+            "Cibler les défauts d’installation et de mise en service.",
+            "Surveillance rapprochée les premières centaines d’heures."
+        ]
+    elif 0.95 <= beta <= 1.05:
+        return [
+            "Taux de défaillance ~constant : maintenir un préventif calendaire simple.",
+            "Mettre l’accent sur la disponibilité des pièces et la rapidité d’intervention (réduire le MTTR).",
+        ]
+    else:  # beta > 1
+        return [
+            "Usure/fin de vie : renforcer inspections conditionnelles et remplacements planifiés.",
+            "Surveiller l’échauffement, l’huile, les cycles thermiques et les vibrations.",
+            "Mettre en place un plan de renouvellement / reconditionnement ciblé."
+        ]
+
+def _procedure_block_ref() -> List[str]:
+    """
+    Socle de procédure (extrait/condensé) inspiré du doc fourni par l’utilisateur.
+    """
+    return [
+        "Inspection visuelle périodique : fuites d’huile, corrosion, isolateurs, câbles, propreté.",
+        "Analyse d’huile : humidité (ppm), gaz dissous (DGA), indice de neutralisation, tension de claquage.",
+        "Mesures électriques : résistance d’isolement (MΩ), rapport de transformation, résistances d’enroulement.",
+        "Vérification d’accessoires : refroidissement, régulation de tension, protections.",
+        "Surveillance continue : température, vibrations, humidité.",
+        "Traçabilité : journal des interventions, résultats de tests, pièces remplacées."
+    ]
+
+# --------------- DESSINS COURBES -----------------------------------------
+def _fig_dir(base_out: Path) -> Path:
+    d = base_out / "_figs"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+def _plot_all_curves(eq: str, fit, tmax: float, mttr: float | None, out_dir: Path) -> Dict[str, str]:
+    """
+    Produit 5 graphes (R, F, f, h, M) pour un équipement et retourne les chemins PNG.
+    Maintenabilité M(t) = 1 - exp(-t/MTTR) si MTTR connu, sinon non tracé.
+    """
+    paths = {}
+    t = np.linspace(0, max(10.0, tmax), 200)
+
+    def savefig(name, build):
+        fig, ax = plt.subplots()
+        build(ax)
+        ax.grid(True, alpha=0.3)
+        p = out_dir / f"{eq}_{name}.png"
+        fig.savefig(p, dpi=130, bbox_inches="tight")
+        plt.close(fig)
+        return str(p)
+
+    # R(t)
+    paths["R"] = savefig("R", lambda ax: (
+        ax.plot(t, R(t, fit), linewidth=2),
+        ax.set_title(f"Fiabilité R(t) — {eq}"),
+        ax.set_xlabel("Temps (h)"), ax.set_ylabel("R(t)")
+    ))
+    # F(t)
+    paths["F"] = savefig("F", lambda ax: (
+        ax.plot(t, F(t, fit), linewidth=2),
+        ax.set_title(f"Répartition F(t) — {eq}"),
+        ax.set_xlabel("Temps (h)"), ax.set_ylabel("F(t)")
+    ))
+    # pdf f(t)
+    paths["pdf"] = savefig("pdf", lambda ax: (
+        ax.plot(t, pdf(t, fit), linewidth=2),
+        ax.set_title(f"Densité f(t) — {eq}"),
+        ax.set_xlabel("Temps (h)"), ax.set_ylabel("f(t)")
+    ))
+    # hazard h(t)
+    paths["hazard"] = savefig("hazard", lambda ax: (
+        ax.plot(t, hazard(t, fit), linewidth=2),
+        ax.set_title(f"Taux de défaillance h(t) — {eq}"),
+        ax.set_xlabel("Temps (h)"), ax.set_ylabel("h(t)")
+    ))
+    # Maintenabilité (si MTTR)
+    if mttr and mttr > 0:
+        def M(t): return 1.0 - np.exp(-t/mttr)
+        paths["M"] = savefig("M", lambda ax: (
+            ax.plot(t, M(t), linewidth=2),
+            ax.set_title(f"Maintenabilité M(t) — {eq} (MTTR={mttr:.1f}h)"),
+            ax.set_xlabel("Temps (h)"), ax.set_ylabel("M(t)")
+        ))
+    return paths
+
+# --------------- FONCTION PRINCIPALE -------------------------------------
+def export_full_report_pdf(
+    df_or_path: Union[pd.DataFrame, str, Path],
+    fits: Dict[str, object],
+    out_dir: str = "reports",
+    title: str = "Analyse & Optimisation — Transformateurs",
+    R_target: float = 0.80,
+    max_equip_plots: int = 6
+) -> str:
+    """
+    Génère un PDF complet (analyse + optimisation + procédure).
+    - df_or_path : DataFrame OU chemin vers CSV consolidé (attendu: equipment_code, ttf_h, (optionnel) duree_rep_h)
+    - fits : dict {eq: fit} avec .beta .eta
+    """
+    out_base = Path(out_dir)
+    out_base.mkdir(exist_ok=True, parents=True)
+    figs_dir = _fig_dir(out_base)
+    ts = datetime.datetime.now().strftime("%Y%m%d-%H%M")
+    pdf_path = out_base / f"full_report_{ts}.pdf"
+
+    df = _df_from_any(df_or_path)
+    # Mesures observées
+    meas = _metrics_measured(df) if not df.empty else pd.DataFrame()
+
+    # Table métriques fusionnée (mesuré + optim)
+    rows_table = []
+    for eq, fit in fits.items():
+        beta = float(getattr(fit, "beta", float("nan")))
+        eta  = float(getattr(fit, "eta",  float("nan")))
+        # MTBF mesuré
+        mtbf_m = float("nan"); mttr_m = float("nan")
+        if not meas.empty and eq in set(meas["equipment_code"]):
+            mtbf_m = float(meas.loc[meas["equipment_code"]==eq, "MTBF"].values[0])
+            if "MTTR" in meas.columns:
+                mttr_m = float(meas.loc[meas["equipment_code"]==eq, "MTTR"].values[0])
+        # Optimisation simple : t* pour la cible R*
+        t_star = _t_star(beta, eta, R_target=R_target)
+        # MTBF_opt approx = t* (on peut adopter cette règle simple pour la proposition d’intervalle)
+        mtbf_opt = t_star
+        # MTTR_opt — on laisse NaN (ou copie mesurée) si pas de politique de réduction MTTR
+        mttr_opt = float("nan")
+        rows_table.append({
+            "equipment_code": eq, "MTBF": mtbf_m, "MTTR": mttr_m,
+            "MTBF_opt": mtbf_opt, "MTTR_opt": mttr_opt,
+            "beta": beta, "eta": eta, "gamma": 0.0, "R_target": R_target, "t_star_h": t_star
+        })
+    df_metrics = pd.DataFrame(rows_table)
+
+    # Génération des figures pour quelques équipements (limité pour taille PDF)
+    eq_for_figs = list(fits.keys())[:max_equip_plots]
+    fig_paths_per_eq = {}
+    for eq in eq_for_figs:
+        fit = fits[eq]
+        # pour tmax, utiliser 1.5 * max(MTBF_mesuré, eta) par sécurité
+        mtbf_m = df_metrics.loc[df_metrics["equipment_code"]==eq, "MTBF"].values[0] if not df_metrics.empty else float("nan")
+        tmax = max(1000.0, np.nanmax([mtbf_m, float(getattr(fit, "eta", 1000.0))]) * 1.5)
+        mttr_m = df_metrics.loc[df_metrics["equipment_code"]==eq, "MTTR"].values[0] if "MTTR" in df_metrics.columns and not df_metrics.empty else float("nan")
+        fig_paths_per_eq[eq] = _plot_all_curves(eq, fit, tmax, mttr_m if not math.isnan(mttr_m) else None, figs_dir)
+
+    # -------------- Construction du PDF --------------
+    styles = getSampleStyleSheet()
+    story = []
+    story.append(Paragraph(SAN(title), styles["Title"]))
+    story.append(Paragraph(SAN(f"Généré le {datetime.datetime.now().strftime('%d/%m/%Y %H:%M')}"), styles["Normal"]))
+    story.append(Spacer(1, 8))
+
+    # Résumé métriques
+    story.append(Paragraph(SAN("Tableau de synthèse — Mesuré vs Optimisé"), styles["Heading2"]))
+    if df_metrics.empty:
+        story.append(Paragraph(SAN("Aucune métrique disponible."), styles["BodyText"]))
+    else:
+        head = ["Équipement","MTBF(h)","MTTR(h)","MTBF_opt(h)","MTTR_opt(h)","β","η","γ","R*","t*(h)"]
+        data = [head]
+        for _, r in df_metrics.iterrows():
+            data.append([
+                SAN(r["equipment_code"]),
+                SAN(f"{r['MTBF']:.1f}" if pd.notna(r["MTBF"]) else "n/a"),
+                SAN(f"{r['MTTR']:.1f}" if pd.notna(r["MTTR"]) else "n/a"),
+                SAN(f"{r['MTBF_opt']:.1f}" if pd.notna(r["MTBF_opt"]) else "n/a"),
+                SAN(f"{r['MTTR_opt']:.1f}" if pd.notna(r["MTTR_opt"]) else "n/a"),
+                SAN(f"{r['beta']:.2f}" if pd.notna(r["beta"]) else "n/a"),
+                SAN(f"{r['eta']:.1f}" if pd.notna(r["eta"]) else "n/a"),
+                SAN(f"{r['gamma']:.1f}" if pd.notna(r["gamma"]) else "0.0"),
+                SAN(f"{r['R_target']:.2f}"),
+                SAN(f"{r['t_star_h']:.1f}" if pd.notna(r["t_star_h"]) else "n/a"),
+            ])
+        tbl = Table(data, repeatRows=1)
+        tbl.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (-1,0), colors.lightgrey),
+            ("GRID", (0,0), (-1,-1), 0.3, colors.grey),
+            ("FONTSIZE", (0,0), (-1,-1), 8),
+            ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+        ]))
+        story.append(tbl)
+
+    # Courbes par équipement (R, F, f, h, M)
+    for i, eq in enumerate(eq_for_figs):
+        story.append(PageBreak() if i>0 else Spacer(1, 10))
+        story.append(Paragraph(SAN(f"Courbes — {eq}"), styles["Heading2"]))
+        paths = fig_paths_per_eq[eq]
+        # On met 2 images par ligne pour garder lisibilité
+        imgs = [paths.get("R"), paths.get("F"), paths.get("pdf"), paths.get("hazard")]
+        if paths.get("M"): imgs.append(paths["M"])
+        # place en grille simple
+        line = []
+        for k, p in enumerate(imgs, start=1):
+            if not p or not Path(p).exists():
+                continue
+            line.append(Image(p, width=85*mm, height=60*mm))
+            if len(line) == 2:
+                story.extend(line)
+                story.append(Spacer(1, 6))
+                line = []
+        if line:
+            story.extend(line)
+            story.append(Spacer(1, 6))
+
+        # Recommandation par β
+        beta = float(getattr(fits[eq], "beta", float("nan")))
+        eta  = float(getattr(fits[eq], "eta",  float("nan")))
+        story.append(Paragraph(SAN(f"Paramètres estimés : β={beta:.2f}, η={eta:.1f} h — Cible R*={R_target:.2f}"), styles["Normal"]))
+        story.append(Paragraph(SAN("Recommandations pilotées par β :"), styles["Heading3"]))
+        for li in _policy_text_for_beta(beta):
+            story.append(Paragraph(SAN("• " + li), styles["BodyText"]))
+
+    # Bloc “procédure de maintenance” générique
+    story.append(PageBreak())
+    story.append(Paragraph(SAN("Procédure de maintenance (référence + adaptation)"), styles["Heading2"]))
+    story.append(Paragraph(SAN("Socle de référence (extrait) :"), styles["Heading3"]))
+    for li in _procedure_block_ref():
+        story.append(Paragraph(SAN("• " + li), styles["BodyText"]))
+    story.append(Spacer(1, 8))
+    story.append(Paragraph(SAN("Adaptation selon β (formes de vieillissement) :"), styles["Heading3"]))
+    story.append(Paragraph(SAN(
+        "- β<1 : défauts précoces → tests renforcés au début du cycle de vie ;\n"
+        "- β≈1 : défauts aléatoires → préventif calendaire + focalisation sur MTTR ;\n"
+        "- β>1 : usure → maintenance conditionnelle, remplacements planifiés, t* calculé pour R*."
+    )), styles["BodyText"])
+
+    doc = SimpleDocTemplate(
+        str(pdf_path),
+        pagesize=A4,
+        topMargin=15*mm, bottomMargin=15*mm,
+        leftMargin=12*mm, rightMargin=12*mm
+    )
+    doc.build(story)
+    return str(pdf_path)

@@ -1,0 +1,253 @@
+# core/reliability/reporting_full.py
+from __future__ import annotations
+from pathlib import Path
+import datetime
+import unicodedata
+from typing import Dict, Any, Iterable
+
+import pandas as pd
+
+# ReportLab (PDF)
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.units import mm
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+)
+from reportlab.lib.styles import getSampleStyleSheet
+
+# Optionnel (si dispo) pour proposer t*
+try:
+    from core.reliability.optimize import propose_intervals
+    _HAS_OPT = True
+except Exception:
+    _HAS_OPT = False
+
+# Optionnel (si dispo) pour R(t)
+try:
+    from core.reliability.weibull import R
+    _HAS_R = True
+except Exception:
+    _HAS_R = False
+
+
+# ---------------------------
+# Sanitize (polices Latin-1)
+# ---------------------------
+def _SAN(s: Any) -> str:
+    s = str(s)
+    s = (s.replace("’", "'").replace("‘", "'")
+           .replace("“", '"').replace("”", '"')
+           .replace("–", "-").replace("—", "-")
+           .replace("•", "-").replace("…", "...")
+           .replace("\u00A0", " "))
+    s = "".join(ch if ord(ch) <= 255 else " " for ch in s)
+    s = unicodedata.normalize("NFKD", s)
+    s = s.encode("latin-1", "ignore").decode("latin-1", "ignore")
+    return s
+
+
+def _as_dataframe_failures(failures_ttf: Any) -> pd.DataFrame:
+    """
+    Accepte:
+      - pd.DataFrame (déjà en mémoire)
+      - str / Path (chemin CSV)
+    Normalise les colonnes: equipment_code, ttf_h, (optionnel) duree_rep_h
+    """
+    if isinstance(failures_ttf, pd.DataFrame):
+        df = failures_ttf.copy()
+    elif isinstance(failures_ttf, (str, Path)):
+        df = pd.read_csv(str(failures_ttf))
+    else:
+        raise TypeError("failures_ttf doit être un DataFrame ou un chemin CSV (str/Path).")
+
+    # normalisation souple des noms
+    lower = {c.lower(): c for c in df.columns}
+    ren = {}
+    if "equipment_code" in lower:
+        ren[lower["equipment_code"]] = "equipment_code"
+    if "ttf_h" in lower:
+        ren[lower["ttf_h"]] = "ttf_h"
+    if "duree_rep_h" in lower:
+        ren[lower["duree_rep_h"]] = "duree_rep_h"
+    if ren:
+        df = df.rename(columns=ren)
+
+    if "equipment_code" not in df.columns:
+        raise ValueError("Colonne 'equipment_code' manquante.")
+    # TTF : si présent, nettoie
+    if "ttf_h" in df.columns:
+        df["ttf_h"] = pd.to_numeric(df["ttf_h"], errors="coerce")
+        df = df.dropna(subset=["ttf_h"])
+        df = df[df["ttf_h"] > 0]
+
+    # MTTR éventuel
+    if "duree_rep_h" in df.columns:
+        df["duree_rep_h"] = pd.to_numeric(df["duree_rep_h"], errors="coerce")
+
+    return df
+
+
+def _metrics_by_eq(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Calcule MTBF/MTTR simple par équipement à partir de df:
+    - MTBF = moyenne des ttf_h si dispo
+    - MTTR = moyenne de duree_rep_h si dispo
+    """
+    if df.empty:
+        return pd.DataFrame(columns=["equipment_code", "MTBF", "MTTR", "n"])
+
+    grp = df.groupby("equipment_code", dropna=True)
+    rows = []
+    for eq, g in grp:
+        mtbf = g["ttf_h"].mean() if "ttf_h" in g.columns and not g["ttf_h"].dropna().empty else None
+        mttr = g["duree_rep_h"].mean() if "duree_rep_h" in g.columns and not g["duree_rep_h"].dropna().empty else None
+        rows.append({"equipment_code": eq, "MTBF": mtbf, "MTTR": mttr, "n": len(g)})
+    return pd.DataFrame(rows)
+
+
+def _params_from_fits(fits: Dict[str, Any]) -> pd.DataFrame:
+    """
+    Extrait beta/eta/gamma depuis l'objet de fit (si attributs présents).
+    """
+    rows = []
+    for eq, ft in (fits or {}).items():
+        beta  = getattr(ft, "beta", None)
+        eta   = getattr(ft, "eta", None)
+        gamma = getattr(ft, "gamma", None)
+        rows.append({"equipment_code": eq, "beta": beta, "eta": eta, "gamma": gamma})
+    return pd.DataFrame(rows)
+
+
+def _optim_intervals_from_fits(fits: Dict[str, Any], R_target: float = 0.80) -> pd.DataFrame:
+    """
+    Renvoie t* conseillé par équipement (fiabilité cible).
+    Si core.reliability.optimize.propose_intervals est dispo → utilise-le.
+    Sinon, fallback (balayage) si R(t) dispo.
+    """
+    out = []
+    if not fits:
+        return pd.DataFrame(columns=["equipment_code", "t_star_h"])
+
+    if _HAS_OPT:
+        try:
+            props = propose_intervals(fits, R_target=R_target)
+            for k, v in props.items():
+                out.append({"equipment_code": k, "t_star_h": float(v)})
+            return pd.DataFrame(out)
+        except Exception:
+            pass
+
+    if _HAS_R:
+        # Fallback: balayage grossier 0→ max(η*3, 1000) pour trouver t* ~ min t tel que R(t)<=R_target
+        import numpy as np
+        for eq, ft in fits.items():
+            try:
+                eta = float(getattr(ft, "eta", 1000.0) or 1000.0)
+                tmax = max(1000.0, 3.0 * eta)
+                t = np.linspace(0, tmax, 400)
+                r = R(t, ft)
+                # 1ère valeur où R(t) <= R_target
+                idx = np.where(r <= R_target)[0]
+                tstar = float(t[idx[0]]) if len(idx) else float(t[-1])
+                out.append({"equipment_code": eq, "t_star_h": tstar})
+            except Exception:
+                out.append({"equipment_code": eq, "t_star_h": None})
+        return pd.DataFrame(out)
+
+    # Rien de dispo
+    return pd.DataFrame(columns=["equipment_code", "t_star_h"])
+
+
+def export_full_report_pdf(
+    failures_ttf: pd.DataFrame | str | Path,
+    fits: Dict[str, Any] | None,
+    out_dir: str | Path = "reports",
+    title: str = "Rapport complet (Analyse + Optimisation)",
+    R_target: float = 0.80,
+) -> str:
+    """
+    Rapports 'Analyse + Optimisation' pour la page Indicateurs.
+    - failures_ttf : DataFrame OU chemin CSV (str/Path)
+    - fits : dict {equipment_code -> fit object (doit exposer beta/eta[/gamma])}
+    """
+    df = _as_dataframe_failures(failures_ttf)
+    Path(out_dir).mkdir(exist_ok=True, parents=True)
+    ts = datetime.datetime.now().strftime("%Y%m%d-%H%M")
+    out_path = Path(out_dir) / f"full_report_{ts}.pdf"
+
+    # ---- tables de données
+    df_metrics = _metrics_by_eq(df)
+    df_params  = _params_from_fits(fits or {})
+    df_optim   = _optim_intervals_from_fits(fits or {}, R_target=R_target)
+
+    # fusion finale
+    df_final = df_metrics.merge(df_params, on="equipment_code", how="left").merge(
+        df_optim, on="equipment_code", how="left"
+    )
+
+    # ===== PDF =====
+    styles = getSampleStyleSheet()
+    story = []
+
+    story.append(Paragraph(_SAN(title), styles["Title"]))
+    story.append(Spacer(1, 8))
+    story.append(Paragraph(_SAN(f"Généré le {datetime.datetime.now().strftime('%d/%m/%Y %H:%M')}"), styles["Normal"]))
+    story.append(Spacer(1, 10))
+
+    # Section: Rappel Dataset
+    story.append(Paragraph(_SAN("Jeu de données (rappel)"), styles["Heading2"]))
+    info = f"Lignes: {len(df)}"
+    if "ttf_h" in df.columns:
+        info += f" • TTF valides: {df['ttf_h'].notna().sum()}"
+    if "duree_rep_h" in df.columns:
+        info += f" • Réparations (h) valides: {df['duree_rep_h'].notna().sum()}"
+    story.append(Paragraph(_SAN(info), styles["BodyText"]))
+    story.append(Spacer(1, 6))
+
+    # Section: Metrics + Optim
+    story.append(Paragraph(_SAN("Synthèse par équipement (Analyse + Optimisation)"), styles["Heading2"]))
+    if df_final.empty:
+        story.append(Paragraph(_SAN("Aucune ligne exploitable par équipement."), styles["BodyText"]))
+    else:
+        cols = ["equipment_code", "n", "MTBF", "MTTR", "beta", "eta", "gamma", "t_star_h"]
+        header = ["Équipement", "n", "MTBF (h)", "MTTR (h)", "β", "η (h)", "γ (h)", f"t* (R≥{int(R_target*100)}%)"]
+        data = [header]
+        for _, r in df_final.sort_values("equipment_code").iterrows():
+            data.append([
+                _SAN(r.get("equipment_code", "")),
+                _SAN(int(r.get("n", 0))),
+                _SAN(f"{r.get('MTBF'):.1f}" if pd.notna(r.get("MTBF")) else "—"),
+                _SAN(f"{r.get('MTTR'):.1f}" if pd.notna(r.get("MTTR")) else "—"),
+                _SAN(f"{r.get('beta'):.2f}"  if pd.notna(r.get("beta"))  else "—"),
+                _SAN(f"{r.get('eta'):.1f}"   if pd.notna(r.get("eta"))   else "—"),
+                _SAN(f"{r.get('gamma'):.1f}" if pd.notna(r.get("gamma")) else "—"),
+                _SAN(f"{r.get('t_star_h'):.0f}" if pd.notna(r.get("t_star_h")) else "—"),
+            ])
+        tbl = Table(data, repeatRows=1)
+        tbl.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+            ("GRID", (0, 0), (-1, -1), 0.3, colors.grey),
+            ("FONTSIZE", (0, 0), (-1, -1), 8),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("ALIGN", (1, 1), (-1, -1), "RIGHT"),
+        ]))
+        story.append(tbl)
+
+    # Note bas de page
+    story.append(Spacer(1, 10))
+    story.append(Paragraph(
+        _SAN("t* ≈ premier temps où R(t) ≤ R*, si le module d’optimisation est disponible. "
+             "Sinon, une estimation par balayage est utilisée."),
+        styles["Italic"]
+    ))
+
+    # Build
+    doc = SimpleDocTemplate(
+        str(out_path), pagesize=A4,
+        topMargin=20*mm, bottomMargin=15*mm,
+        leftMargin=15*mm, rightMargin=15*mm
+    )
+    doc.build(story)
+
+    return str(out_path)

@@ -1,0 +1,60 @@
+# core/notify/rt_alerts.py
+from __future__ import annotations
+import time
+from typing import Dict, Any
+from .config import AlertsConfig, load_alerts_config
+from .senders import send_email_smtp, send_whatsapp_twilio
+
+# Anti-spam: (equip, code) -> last_sent_ts
+_LAST_SENT: dict[tuple[str,str], float] = {}
+MIN_PERIOD_S = 60.0  # délai min entre 2 alertes identiques
+
+_WHITELIST_CODES = {"TEMP_HIGH","OIL_LOW_VISC","OVERCURRENT","LOW_PF","OVERLOAD","FREQ_DRIFT"}
+
+def _fmt_subject(e: dict) -> str:
+    code  = e.get("code","")
+    lvl   = e.get("level","")
+    equip = e.get("equipment","")
+    site  = e.get("site","")
+    return f"{lvl} {code} @ {site}/{equip}"
+
+def _fmt_body(e: dict) -> str:
+    lines = []
+    for k in ["ts","site","equipment","level","code","msg","value","threshold"]:
+        if k in e:
+            lines.append(f"{k}: {e.get(k)}")
+    return "\n".join(lines)
+
+def _should_send(e: dict) -> tuple[bool, str | None]:
+    code  = str(e.get("code","")).upper()
+    lvl   = str(e.get("level","")).upper()
+    equip = str(e.get("equipment",""))
+    if code and code not in _WHITELIST_CODES:
+        return False, "code_not_whitelisted"
+    if lvl not in {"WARN","ALARM"}:
+        return False, "level_ignored"
+    key = (equip, code)
+    now = time.time()
+    last = _LAST_SENT.get(key, 0.0)
+    if (now - last) < MIN_PERIOD_S:
+        return False, "rate_limited"
+    _LAST_SENT[key] = now
+    return True, None
+
+def notify_event(e: Dict[str, Any], cfg: AlertsConfig | None = None) -> Dict[str, Any]:
+    ok, reason = _should_send(e)
+    if not ok:
+        return {"ok": False, "skipped": reason}
+
+    cfg = cfg or load_alerts_config()
+    subj = _fmt_subject(e)
+    body = _fmt_body(e)
+
+    results = {}
+    if cfg.enable_email:
+        results["email"] = send_email_smtp(subj, body, cfg)
+    if cfg.enable_whatsapp:
+        results["whatsapp"] = send_whatsapp_twilio(body, cfg)
+
+    any_ok = any(v.get("ok") for v in results.values()) if results else False
+    return {"ok": any_ok, "results": results}
