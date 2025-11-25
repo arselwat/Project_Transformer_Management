@@ -14,8 +14,6 @@ import streamlit as st
     # On arrête ici si pas loggé (seul le login est affiché)
     #st.stop()
 
-# ---- Suite de ton app (accueil, navigation, etc.) ----
-st.title("📊 Tableau de bord – Fiabilité des transformateurs")
 
 st.set_page_config(
     page_title="Fiabilité & Gestion de stock— Transformateurs",
