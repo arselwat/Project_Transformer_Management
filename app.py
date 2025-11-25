@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import pandas as pd
 import streamlit as st
-from utils.auth import check_password
+#from utils.auth import check_password
 
 # =========================
 # CONFIG GÉNÉRALE
