@@ -5,13 +5,32 @@ import datetime
 import math
 import unicodedata
 
-from reportlab.lib.pagesizes import A4
-from reportlab.lib import colors
-from reportlab.lib.units import mm, cm
-from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
-)
+# ============================================================
+# Imports PDF : ReportLab (préféré) + fallback FPDF
+# ============================================================
+try:
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors
+    from reportlab.lib.units import mm, cm
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.platypus import (
+        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+    )
+    HAVE_REPORTLAB = True
+except Exception:  # ModuleNotFoundError, etc. (ex: Streamlit Cloud)
+    HAVE_REPORTLAB = False
+    # Valeurs neutres pour éviter les NameError si fonctions non appelées
+    A4 = (595.27, 841.89)
+    colors = None
+    mm = 1.0
+    cm = 10.0
+
+try:
+    from fpdf import FPDF
+    HAVE_FPDF = True
+except Exception:
+    HAVE_FPDF = False
+
 
 # =========================
 # Helpers
@@ -1282,6 +1301,85 @@ def _add_tools_section(story, styles, tools_checklist: List[Dict[str, Any]] | No
     widths = [2.8*cm, 3.0*cm, 4.0*cm, 1.1*cm, 1.1*cm, 2.0*cm, 2.3*cm]
     story.append(_mk_table(data, widths=widths, font_size=8))
     story.append(Spacer(1, 6))
+def _export_pm_plan_with_kits_pdf_fallback(
+    tasks_due: List[Dict[str, Any]],
+    kits_by_eq: Dict[str, List[Dict[str, Any]]],
+    metrics_table: List[Dict[str, Any]],
+    out_dir: str | Path,
+    title: str,
+    tools_checklist: List[Dict[str, Any]] | None,
+) -> str:
+    """
+    Version simplifiée pour plateformes sans ReportLab (ex: Streamlit Cloud).
+    Utilise FPDF si disponible, sinon lève une erreur explicite.
+    """
+    if not HAVE_FPDF:
+        raise RuntimeError(
+            "Génération PDF non disponible (ReportLab et FPDF indisponibles). "
+            "Installez soit reportlab, soit fpdf2 dans l'environnement."
+        )
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(exist_ok=True, parents=True)
+    date_now = datetime.datetime.now().strftime("%Y%m%d-%H%M")
+    out_path = out_dir / f"pm_plan_kits_{date_now}.pdf"
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+    pdf.set_font("Arial", "B", 14)
+    pdf.multi_cell(0, 8, SAN(title))
+    pdf.ln(2)
+    pdf.set_font("Arial", "", 10)
+    pdf.cell(0, 6, SAN(datetime.datetime.now().strftime("%d/%m/%Y %H:%M")), ln=1)
+    pdf.ln(4)
+
+    pdf.set_font("Arial", "B", 12)
+    pdf.cell(0, 7, SAN("Résumé (mode simplifié – ReportLab indisponible)"), ln=1)
+    pdf.set_font("Arial", "", 10)
+    pdf.multi_cell(0, 5, SAN(
+        "Ce document a été généré dans un environnement où ReportLab n'est pas disponible "
+        "(par exemple Streamlit Cloud). Le contenu détaillé (tables mises en page) reste "
+        "disponible lorsque l'application est exécutée en local avec ReportLab installé."
+    ))
+    pdf.ln(4)
+
+    # Petite synthèse dynamique pour ne pas perdre l'info
+    if metrics_table:
+        pdf.set_font("Arial", "B", 11)
+        pdf.cell(0, 6, SAN("Synthèse paramètres par équipement:"), ln=1)
+        pdf.set_font("Arial", "", 9)
+        for r in metrics_table:
+            eq = SAN(str(r.get("equipment_code", "")))
+            beta = fnum(r.get("beta"), 2)
+            eta = fnum(r.get("eta"), 1)
+            itv = fnum(r.get("interval_opt_h"), 1)
+            pdf.multi_cell(0, 5, SAN(f"- {eq} | β={beta}, η={eta} h, intervalle opt ≈ {itv} h"))
+        pdf.ln(3)
+
+    if tasks_due:
+        pdf.set_font("Arial", "B", 11)
+        pdf.cell(0, 6, SAN("Tâches de maintenance dues (résumé):"), ln=1)
+        pdf.set_font("Arial", "", 9)
+        for t in tasks_due[:40]:  # limiter la taille
+            eq = SAN(str(t.get("equipment_code", "")))
+            title_t = SAN(str(t.get("title", "")))
+            due = SAN(str(t.get("next_due_date", "")))
+            pdf.multi_cell(0, 5, f"- [{eq}] {title_t} (échéance: {due})")
+        pdf.ln(3)
+
+    if tools_checklist:
+        pdf.set_font("Arial", "B", 11)
+        pdf.cell(0, 6, SAN("Matériels / Outils à prévoir (résumé):"), ln=1)
+        pdf.set_font("Arial", "", 9)
+        for it in tools_checklist[:40]:
+            cat = SAN(str(it.get("categorie", "")))
+            outil = SAN(str(it.get("outil", "")))
+            pdf.multi_cell(0, 5, f"- [{cat}] {outil}")
+        pdf.ln(3)
+
+    pdf.output(str(out_path))
+    return str(out_path)
 
 
 # ============================================================
@@ -1307,6 +1405,12 @@ def export_pm_plan_with_kits_pdf(
       3) Tâches de maintenance dues (tableau global)
       4) Matériels à prévoir (instruments, EPI…)
     """
+    # Fallback si ReportLab n'est pas disponible (Streamlit Cloud, etc.)
+    if not HAVE_REPORTLAB:
+        return _export_pm_plan_with_kits_pdf_fallback(
+            tasks_due, kits_by_eq, metrics_table, out_dir, title, tools_checklist
+        )
+
     out_dir = Path(out_dir)
     out_dir.mkdir(exist_ok=True, parents=True)
     date_now = datetime.datetime.now().strftime("%Y%m%d-%H%M")
@@ -1325,6 +1429,7 @@ def export_pm_plan_with_kits_pdf(
     story: List[Any] = []
     story.append(Paragraph(SAN(title), styles["Title"]))
     story.append(Paragraph(SAN(datetime.datetime.now().strftime("%d/%m/%Y %H:%M")), styles["BodyText"]))
+
     story.append(Spacer(1, 10))
 
     # 1) Cahier de maintenance (statique, reconstitué à la main)

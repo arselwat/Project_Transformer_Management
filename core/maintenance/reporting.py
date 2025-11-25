@@ -7,6 +7,21 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, Tabl
 from datetime import datetime
 import os
 from typing import List, Dict, Any
+
+# === Ajout: fallback ReportLab / FPDF =======================
+try:
+    from reportlab.lib.pagesizes import A4 as _A4_test  # juste pour être sûr
+    HAVE_REPORTLAB = True
+except Exception:
+    HAVE_REPORTLAB = False
+
+try:
+    from fpdf import FPDF
+    HAVE_FPDF = True
+except Exception:
+    HAVE_FPDF = False
+# ============================================================
+
 # --- Anti-caractères “exotiques” pour PDF basique ---
 def SAN(s):
     s = str(s)
@@ -74,6 +89,60 @@ def _modele_checklist_table_vierge() -> List[List[str]]:
         ["", "", "Dispositifs de protection", "Test fonctionnel", "Déclenchement correct", "", "", ""],
     ]
 
+
+# ---------------------------
+# Fallback FPDF
+# ---------------------------
+
+def _export_pm_plan_pdf_fallback(
+    tasks: List[Dict[str, Any]],
+    out_dir: str,
+    title: str,
+) -> str:
+    if not HAVE_FPDF:
+        raise RuntimeError(
+            "export_pm_plan_pdf: ni ReportLab ni FPDF disponibles. "
+            "Installez reportlab ou fpdf2."
+        )
+
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, f"plan_maintenance_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf")
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+    pdf.set_font("Arial", "B", 14)
+    pdf.multi_cell(0, 8, SAN(f"{title} – Transformateurs"))
+    pdf.ln(2)
+    pdf.set_font("Arial", "", 10)
+    pdf.cell(0, 6, SAN(f"Date de génération : {datetime.now().strftime('%d/%m/%Y %H:%M')}"), ln=1)
+    pdf.ln(4)
+
+    pdf.set_font("Arial", "", 10)
+    pdf.multi_cell(
+        0, 5,
+        SAN("Ce document simplifié est généré dans un environnement sans ReportLab "
+            "(par ex. Streamlit Cloud). Le modèle complet (tables mises en page) est "
+            "disponible en exécution locale avec ReportLab.")
+    )
+    pdf.ln(4)
+
+    if tasks:
+        pdf.set_font("Arial", "B", 11)
+        pdf.cell(0, 6, SAN("Synthèse – Tâches de maintenance dues:"), ln=1)
+        pdf.set_font("Arial", "", 9)
+        for t in tasks[:60]:
+            eq = SAN(str(t.get("equipment_code", "")))
+            title_t = SAN(str(t.get("title", "")))
+            due = SAN(str(t.get("next_due_date", "")))
+            prio = SAN(str(t.get("priority", "")))
+            pdf.multi_cell(0, 5, f"- [{eq}] {title_t} | Échéance: {due} | Priorité: {prio}")
+        pdf.ln(4)
+
+    pdf.output(out_path)
+    return out_path
+
+
 # ---------------------------
 # 2) Génération du PDF
 # ---------------------------
@@ -91,6 +160,10 @@ def export_pm_plan_pdf(
       - Tableau « Valeurs de référence » transformateur
       - Checklist de suivi « vierge » à imprimer
     """
+    # Fallback si ReportLab indisponible
+    if not HAVE_REPORTLAB:
+        return _export_pm_plan_pdf_fallback(tasks, out_dir, title)
+
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, f"plan_maintenance_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf")
 
@@ -184,6 +257,9 @@ def export_pm_plan_pdf(
         ("FONTSIZE", (0,0), (-1,-1), 9),
     ]))
     flow.append(ck_tbl)
+    ...
+    # ⬅️ le reste du fichier que tu avais, inchangé
+    ...
 
     doc.build(flow)
     return out_path

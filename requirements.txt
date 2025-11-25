@@ -22,3 +22,4 @@ pymannkendall>=1.4,<2.0 # (optionnel) test de Mann-Kendall si utilisé
 
 # ---- Build (machine de dev uniquement ; OK de laisser ici) ----
 pyinstaller>=6.0,<7.0
+fpdf2>=2.7,<3.0

@@ -15,13 +15,29 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from reportlab.lib.pagesizes import A4
-from reportlab.lib import colors
-from reportlab.lib.units import cm
-from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak, Image
-)
+try:
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors
+    from reportlab.lib.units import cm, mm  # selon ce qui était utilisé
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.platypus import (
+        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak, Image
+    )
+    HAVE_REPORTLAB = True
+except Exception:
+    HAVE_REPORTLAB = False
+    A4 = (595.27, 841.89)
+    colors = None
+    cm = mm = 1.0
+    def getSampleStyleSheet():
+        raise RuntimeError("ReportLab non disponible")
+
+try:
+    from fpdf import FPDF
+    HAVE_FPDF = True
+except Exception:
+    HAVE_FPDF = False
+
 
 # "Vérité unique" (bundle cohérent) + fonctions de courbes
 from core.reliability.unify import compute_bundle, UnifyOptions, UnifyBundle
