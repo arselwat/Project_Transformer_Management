@@ -141,3 +141,94 @@ with tab_list:
 
             st.success("Stock des pièces recommandées mis à jour.")
             st.rerun()
+
+# ============ 2) Mouvements ============
+
+with tab_move:
+    st.subheader("Mouvements rapides")
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        m_code = st.text_input("Code article*", key="mcode")
+    with c2:
+        action = st.selectbox("Type", ["IN", "OUT", "ADJUST"])
+    with c3:
+        m_qty = st.number_input("Quantité", min_value=1, value=1, step=1)
+    with c4:
+        who = st.text_input("Utilisateur", value="app")
+
+    reason = st.text_input("Motif", value="")
+    ref = st.text_input("Référence", value="")
+
+    if st.button("Valider mouvement", type="primary"):
+        ok = False
+        msg = ""
+        if action == "IN":
+            ok, msg = inv.move_in(m_code, m_qty, reason=reason or "IN", ref=ref, user=who)
+        elif action == "OUT":
+            ok, msg = inv.move_out(m_code, m_qty, reason=reason or "OUT", ref=ref, user=who)
+        else:
+            q = m_qty
+            if reason.strip().startswith("-"):
+                q = -abs(m_qty)
+            ok, msg = inv.adjust_stock(m_code, q, reason=reason or "ADJUST", ref=ref, user=who)
+
+        st.success(msg) if ok else st.error(msg)
+        st.rerun()
+
+    st.markdown("### Historique récent")
+    mv = load_movements(limit=400)
+    dmv = pd.DataFrame(mv) if mv else pd.DataFrame(columns=["ts", "type", "code", "qty", "reason", "ref", "user"])
+    if not dmv.empty:
+        dmv["date"] = pd.to_datetime(dmv["ts"], unit="s")
+        dmv = dmv.sort_values("ts", ascending=False)
+        st.dataframe(dmv[["date", "type", "code", "qty", "reason", "ref", "user"]],
+                     use_container_width=True, hide_index=True)
+    else:
+        st.caption("Aucun mouvement.")
+
+
+# ============ 3) Alertes seuil ============
+
+with tab_alert:
+    st.subheader("Alertes seuil stock")
+    auto = st.toggle(
+        "Activer alertes auto sur cette page",
+        value=st.session_state.get("stock_alert_enabled", False),
+        key="stock_alert_enabled",
+    )
+
+    low = inv.low_stock(threshold_factor=1.0) or []
+    if not low:
+        st.success("RAS — aucun article sous le seuil.")
+    else:
+        st.dataframe(pd.DataFrame(low), use_container_width=True, hide_index=True)
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("📤 Envoyer alerte maintenant", use_container_width=True):
+                try:
+                    if notify_stock_alerts:
+                        notify_stock_alerts(low)
+                        st.success("Alerte stock envoyée.")
+                    else:
+                        out = Path("data/low_stock_alert.csv")
+                        pd.DataFrame(low).to_csv(out, index=False)
+                        st.info(f"Module d’alerte dédié indisponible — CSV généré : {out}")
+                except Exception as e:
+                    st.error(f"Alerte : {e}")
+        with c2:
+            if st.button("⬇️ Export CSV", use_container_width=True):
+                out = Path("data/low_stock_alert.csv")
+                pd.DataFrame(low).to_csv(out, index=False)
+                st.success(f"Exporté → {out}")
+
+    # Auto (anti-spam : 10 min, partagé avec Maintenance)
+    if auto and low:
+        last = st.session_state.get("_last_stock_alert_ts", 0.0)
+        if _t.time() - last > 600:
+            try:
+                if notify_stock_alerts:
+                    notify_stock_alerts(low)
+                    st.session_state["_last_stock_alert_ts"] = _t.time()
+                    st.toast("Alerte stock auto envoyée.")
+            except Exception:
+                pass
