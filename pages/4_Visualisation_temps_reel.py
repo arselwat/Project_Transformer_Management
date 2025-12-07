@@ -1,10 +1,15 @@
-from __future__ import annotations
+from __future__ import annotations   # doit être la première ligne
+
 import time, threading, os, sys, csv
 from pathlib import Path
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+
+# Auth (optionnel si tu veux protéger cette page)
+from core.security.auth import require_login
+require_login()
 
 # ---------------- Bootstrapping import ----------------
 
@@ -21,15 +26,6 @@ try:
 except Exception:
     def notify_event(e: dict):  # fallback no-op
         return
-from __future__ import annotations
-import streamlit as st
-from core.security.auth import require_login
-
-st.set_page_config(page_title="Transformateurs", page_icon="🔌", layout="wide")
-
-require_login()  # tant que auth_ok n’est pas True, cette page est bloquée
-
-# ... le reste de ta page ...
 
 # ---------------- Layout / Paths ----------------
 
