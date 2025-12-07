@@ -5,26 +5,21 @@ import pandas as pd
 import streamlit as st
 # from utils.auth import check_password
 
-from core.security.auth import login_form  # même module que pour 1_Login.py
+from core.security.auth import login_form
 
-# =========================
-# CONFIG GÉNÉRALE
-# =========================
-
-st.set_page_config(  # un seul set_page_config
+st.set_page_config(
     page_title="Fiabilité & Gestion de stock— Transformateurs",
     page_icon="🛠️",
     layout="wide",
 )
 
-# ---- Authentification ----
 if "auth_ok" not in st.session_state:
     st.session_state["auth_ok"] = False
 
 if not st.session_state["auth_ok"]:
-    # On n'affiche que le formulaire de login
     login_form()
     st.stop()
+
 
 # =========================
 # THÈME + LOGO (sidebar)
