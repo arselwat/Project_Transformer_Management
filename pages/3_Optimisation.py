@@ -16,6 +16,15 @@ try:
     from core.reliability.optimize import propose_intervals
 except Exception:
     propose_intervals = None
+from __future__ import annotations
+import streamlit as st
+from core.security.auth import require_login
+
+st.set_page_config(page_title="Transformateurs", page_icon="🔌", layout="wide")
+
+require_login()  # tant que auth_ok n’est pas True, cette page est bloquée
+
+# ... le reste de ta page ...
 
 st.title("🧠 Optimisation — Intervalles, courbes & organigramme")
 

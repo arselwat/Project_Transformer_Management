@@ -21,6 +21,15 @@ try:
 except Exception:
     def notify_event(e: dict):  # fallback no-op
         return
+from __future__ import annotations
+import streamlit as st
+from core.security.auth import require_login
+
+st.set_page_config(page_title="Transformateurs", page_icon="🔌", layout="wide")
+
+require_login()  # tant que auth_ok n’est pas True, cette page est bloquée
+
+# ... le reste de ta page ...
 
 # ---------------- Layout / Paths ----------------
 

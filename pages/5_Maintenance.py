@@ -21,6 +21,15 @@ try:
     from core.notify.alerts_plus import notify_stock_alerts
 except Exception:
     notify_stock_alerts = None
+from __future__ import annotations
+import streamlit as st
+from core.security.auth import require_login
+
+st.set_page_config(page_title="Transformateurs", page_icon="🔌", layout="wide")
+
+require_login()  # tant que auth_ok n’est pas True, cette page est bloquée
+
+# ... le reste de ta page ...
 
 st.set_page_config(page_title="Maintenance — Simple", page_icon="🛠️", layout="wide")
 st.title("🛠️ Maintenance")
