@@ -2,10 +2,9 @@ from __future__ import annotations
 import streamlit as st
 import hashlib
 
-# À mettre plus tard dans st.secrets ou un fichier config. [web:51]
 VALID_USERS = {
     "admin": "5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8"
-    # hash SHA256("password")
+    
 }
 
 def _hash_password(pwd: str) -> str:
@@ -20,7 +19,7 @@ def login_form():
             st.session_state["auth_ok"] = True
             st.session_state["user"] = user
             st.success("Connecté. Utilisez le menu pour accéder aux pages.")
-            st.experimental_rerun()
+            st.rerun()  # au lieu de st.experimental_rerun
         else:
             st.error("Identifiants invalides.")
 
@@ -30,7 +29,7 @@ def require_login():
         if st.sidebar.button("Se déconnecter"):
             for k in ["auth_ok", "user"]:
                 st.session_state.pop(k, None)
-            st.experimental_rerun()
+            st.rerun()  # idem ici
         return
 
     st.error("Accès restreint. Veuillez d’abord vous connecter depuis la page de login.")

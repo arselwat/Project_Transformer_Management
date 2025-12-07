@@ -3,15 +3,16 @@ from __future__ import annotations
 from pathlib import Path
 import pandas as pd
 import streamlit as st
+# from utils.auth import check_password
 
-from core.security.auth import login_form  # login unique
+from core.security.auth import login_form  # même module que pour 1_Login.py
 
 # =========================
 # CONFIG GÉNÉRALE
 # =========================
 
-st.set_page_config(
-    page_title="Fiabilité & Gestion de stock — Transformateurs",
+st.set_page_config(  # un seul set_page_config
+    page_title="Fiabilité & Gestion de stock— Transformateurs",
     page_icon="🛠️",
     layout="wide",
 )
@@ -21,7 +22,7 @@ if "auth_ok" not in st.session_state:
     st.session_state["auth_ok"] = False
 
 if not st.session_state["auth_ok"]:
-    # On affiche uniquement le formulaire de login, rien d'autre
+    # On n'affiche que le formulaire de login
     login_form()
     st.stop()
 
@@ -88,6 +89,8 @@ h1{font-size:2.0rem} h2{font-size:1.55rem} h3{font-size:1.2rem}
 """
 st.markdown(f"<style>{(DARK if theme=='Sombre' else LIGHT)+BASE}</style>", unsafe_allow_html=True)
 
+# ... puis tout le reste de ton fichier exactement comme tu l'as donné ...
+
 # =========================
 # HÉRO
 # =========================
@@ -147,5 +150,67 @@ st.markdown("---")
 # =========================
 st.markdown("### 🧭 Navigation principale")
 
-# (tout le reste de ton app inchangé : lignes row1, row2, row3, footer…)
-# ...
+# Ligne 1 : Sources / Indicateurs / Optimisation
+row1 = st.columns(3)
+with row1[0]:
+    st.markdown('<div class="card-panel">', unsafe_allow_html=True)
+    st.markdown("#### 📥 Sources de données")
+    st.markdown(
+        "<p>Importer les historiques de pannes (CSV TTF) ou configurer la source MQTT pour le temps réel.</p>",
+        unsafe_allow_html=True,
+    )
+    st.page_link("pages/1_Sources_donnees.py", label="Ouvrir les sources", icon="📥")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+with row1[1]:
+    st.markdown('<div class="card-panel">', unsafe_allow_html=True)
+    st.markdown("#### 📊 Indicateurs")
+    st.markdown("<p>Courbes R/F/f/h, estimation Weibull, MTBF/MTTR détaillés.</p>", unsafe_allow_html=True)
+    st.page_link("pages/2_Indicateurs.py", label="Ouvrir les indicateurs", icon="📊")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+with row1[2]:
+    st.markdown('<div class="card-panel">', unsafe_allow_html=True)
+    st.markdown("#### 🧠 Optimisation")
+    st.markdown("<p>Calcul des intervalles optimaux et génération du rapport de fiabilité.</p>", unsafe_allow_html=True)
+    st.page_link("pages/3_Optimisation.py", label="Ouvrir l’optimisation", icon="🧠")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# Ligne 2 : Temps réel / Maintenance / Stock
+row2 = st.columns(3)
+with row2[0]:
+    st.markdown('<div class="card-panel">', unsafe_allow_html=True)
+    st.markdown("#### 📡 Temps réel")
+    st.markdown("<p>Simulation ou acquisition MQTT : tensions, courants, températures, alertes.</p>", unsafe_allow_html=True)
+    st.page_link("pages/4_Visualisation_temps_reel.py", label="Ouvrir le temps réel", icon="📡")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+with row2[1]:
+    st.markdown('<div class="card-panel">', unsafe_allow_html=True)
+    st.markdown("#### 🛠️ Maintenance")
+    st.markdown("<p>Tâches dues, plan PDF, envois par email/WhatsApp, lien avec le stock.</p>", unsafe_allow_html=True)
+    st.page_link("pages/5_Maintenance.py", label="Ouvrir la maintenance", icon="🛠️")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+with row2[2]:
+    st.markdown('<div class="card-panel">', unsafe_allow_html=True)
+    st.markdown("#### 📦 Stock & pièces")
+    st.markdown("<p>Pièces de rechange recommandées, mises à jour des quantités, alertes de seuil.</p>", unsafe_allow_html=True)
+    st.page_link("pages/6_Stock.py", label="Ouvrir le stock", icon="📦")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# =========================
+# Paramètres alertes
+# =========================
+row3 = st.columns(3)
+with row3[0]:
+    st.markdown('<div class="card-panel">', unsafe_allow_html=True)
+    st.markdown("#### 🚨 Paramètres d’alertes")
+    st.markdown("<p>Destinataires email/WhatsApp, seuils globaux et configuration des canaux.</p>", unsafe_allow_html=True)
+    st.page_link("pages/7_Parametres_Alertes.py", label="Configurer les alertes", icon="🚨")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# =========================
+# PIED DE PAGE
+# =========================
+st.markdown('<div class="footer">© 2025 mumputujeanbaptiste@gmail.com— Fiabilité et gestion de Stock • Interface</div>', unsafe_allow_html=True)
