@@ -4,7 +4,6 @@ from pathlib import Path
 from typing import Optional
 import pandas as pd
 import streamlit as st
-import streamlit as st
 from core.security.auth import require_login
 
 st.set_page_config(page_title="Transformateurs", page_icon="🔌", layout="wide")
