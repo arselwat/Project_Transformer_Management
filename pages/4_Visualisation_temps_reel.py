@@ -7,6 +7,7 @@ import plotly.express as px
 import streamlit as st
 
 # ---------------- Bootstrapping import ----------------
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
@@ -16,12 +17,13 @@ from core.transformer.store import list_transformers, get_transformer
 
 # Alerting centralisée (email/WhatsApp) — déjà gérée par ta page 7_Parametres_Alertes
 try:
-    from core.notify.rt_alerts import notify_event  # (evt: dict) -> None
+    from core.notify.rt_alerts import notify_event  # (evt: dict) -> dict
 except Exception:
     def notify_event(e: dict):  # fallback no-op
         return
 
 # ---------------- Layout / Paths ----------------
+
 st.set_page_config(page_title="Temps réel — Transfo", page_icon="📡", layout="wide")
 st.title("📡 Visualisation Temps Réel — Transformateur")
 
@@ -32,6 +34,7 @@ EVT_CSV  = DATA_DIR / "realtime_events.csv"
 MEAS_CSV = DATA_DIR / "realtime_log.csv"
 
 # ---------------- Etat session ----------------
+
 if "engines" not in st.session_state:
     st.session_state.engines = {}      # code -> TransformerEngine
 if "rt_data_map" not in st.session_state:
@@ -44,6 +47,7 @@ if "last_tick" not in st.session_state:
     st.session_state.last_tick = time.monotonic()
 
 # ---------------- Helpers généraux ----------------
+
 def _safe_epoch_to_datetime(series: pd.Series) -> pd.Series:
     s = pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan)
     out = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns]")
@@ -71,7 +75,8 @@ def _append_events_to_csv(events: list[dict]) -> None:
     if not events:
         return
     EVT_CSV.parent.mkdir(parents=True, exist_ok=True)
-    header = ["ts","level","code","msg","value","threshold"]
+    # ajout des colonnes site/equipment/equipment_code dans le CSV             # <<< MODIF
+    header = ["ts","level","code","msg","value","threshold","site","equipment","equipment_code"]  # <<< MODIF
     write_header = not EVT_CSV.exists() or EVT_CSV.stat().st_size == 0
     try:
         with open(EVT_CSV, "a", encoding="utf-8", newline="") as f:
@@ -79,12 +84,13 @@ def _append_events_to_csv(events: list[dict]) -> None:
             if write_header:
                 w.writeheader()
             for e in events:
-                row = {k: e.get(k, "") for k in header}
+                row = {k: e.get(k, "") for k in header}                        # <<< MODIF
                 w.writerow(row)
     except Exception as ex:
         st.warning(f"Journal d’événements non écrit: {ex}")
 
 # ---------------- Sélection équipements ----------------
+
 rows = list_transformers(include_retired=False)
 if not rows:
     st.warning("Aucun transformateur actif. Va d’abord dans la page **Transformateurs** pour en créer un (MVA/kV).")
@@ -103,6 +109,11 @@ mode_multi = st.toggle("Activer le mode multi-transformateurs (max 3)", value=Fa
 if not mode_multi:
     code = st.selectbox("Transformateur", options=codes, index=default_index, key="rt_sel_one")
     sel_rec = get_transformer(code) or {}
+
+    # métadonnées pour les alertes e-mail                                   # <<< MODIF
+    site_name    = sel_rec.get("site") or ""                                # <<< MODIF
+    equip_name   = sel_rec.get("name") or code                              # <<< MODIF
+    equip_code   = code                                                     # <<< MODIF
 
     # Engine unique par code
     eng = st.session_state.engines.get(code) or TransformerEngine(TransformerParams())
@@ -151,7 +162,6 @@ if not mode_multi:
 
     with right:
         st.subheader("Cadence & fenêtre")
-        # valeurs plus légères pour CPU
         hz = st.slider("Fréquence d’update (Hz)", 1, 10, 3, 1, key="rt_hz_one")
         max_pts = st.number_input("Points gardés", min_value=60, max_value=2000, value=300, step=60, key="rt_maxpts_one")
 
@@ -171,7 +181,6 @@ if not mode_multi:
         with colf2:
             fan2 = st.toggle("Stage 2", value=False, disabled=(fan_mode=="AUTO"), key=f"f2_{code}")
 
-        # Seuils & tests dans un expander pour alléger l’UI
         with st.expander("🔧 Seuils & tests avancés", expanded=False):
             p = eng.p
             c1s, c2s = st.columns(2)
@@ -194,23 +203,21 @@ if not mode_multi:
                 f_dip  = st.checkbox("Forcer DIP VOLT", value=False, key=f"fd_{code}")
 
     # -------- Tick mono --------
+
     def _tick_one():
         if not st.session_state.running_map[code]:
             return
 
-        # Variations douces permanentes (pour casser les courbes trop linéaires)
         base_load = float(load_pct)
         base_pf   = float(pf_prim)
         base_Tamb = float(Tamb)
         base_freq = float(freq_hz)
 
-        # petites variations gaussiennes
         base_load = np.clip(base_load * (1.0 + 0.03*np.random.randn()), 0.0, 200.0)
         base_pf   = np.clip(base_pf   + 0.01*np.random.randn(), 0.5, 1.0)
         base_Tamb = np.clip(base_Tamb + 1.0*np.random.randn(), 0.0, 60.0)
         base_freq = np.clip(base_freq + 0.02*np.random.randn(), 49.0, 51.0)
 
-        # Application continue des contrôles (plus besoin de bouton "Appliquer")
         eng.set_controls(
             load_pct=float(base_load),
             pf_set=float(base_pf),
@@ -228,32 +235,38 @@ if not mode_multi:
         target_dt = 1.0 / max(int(hz), 1)
         now_m = time.monotonic()
         if (now_m - st.session_state.last_tick) >= target_dt * 0.95:
-            # step
             m, E = eng.step(target_dt)
-            # buffer mesures
             buf = st.session_state.rt_data_map[code]
             buf.append(m)
             keep = int(max_pts)
             if len(buf) > keep:
                 st.session_state.rt_data_map[code] = buf[-keep:]
-            # événements
+
             if E:
                 evbuf = st.session_state.events_map[code]
-                evbuf.extend(E)
+                enriched = []                                                # <<< MODIF
+                for e in E:                                                  # <<< MODIF
+                    e2 = dict(e)                                             # <<< MODIF
+                    e2.setdefault("equipment", equip_name)                   # <<< MODIF
+                    e2.setdefault("equipment_code", equip_code)             # <<< MODIF
+                    e2.setdefault("site", site_name)                         # <<< MODIF
+                    enriched.append(e2)                                      # <<< MODIF
+                evbuf.extend(enriched)                                       # <<< MODIF
                 st.session_state.events_map[code] = evbuf[-1000:]
-                # journal + alerting
-                _append_events_to_csv(E)
-                for e in E:
+
+                _append_events_to_csv(enriched)                              # <<< MODIF
+                for e in enriched:                                           # <<< MODIF
                     try:
-                        notify_event(e)
+                        notify_event(e)                                      # <<< MODIF
                     except Exception:
                         pass
-                # Alertes visuelles
-                for e in E:
-                    if e["level"] == "ALARM":
-                        st.error(f"🔴 {e['code']}: {e['msg']}")
-                    elif e["level"] == "WARN":
-                        st.warning(f"🟡 {e['code']}: {e['msg']}")
+
+                for e in enriched:                                           # <<< MODIF
+                    if e.get("level") == "ALARM":                            # <<< MODIF
+                        st.error(f"🔴 {e.get('code')}: {e.get('msg')}")      # <<< MODIF
+                    elif e.get("level") == "WARN":                           # <<< MODIF
+                        st.warning(f"🟡 {e.get('code')}: {e.get('msg')}")    # <<< MODIF
+
             st.session_state.last_tick = now_m
 
     _tick_one()
@@ -351,7 +364,6 @@ if not mode_multi:
         st.plotly_chart(px.line(df_view, x="t", y=ycols, title="Facteur de puissance & Fréquence (Hz)"), use_container_width=True)
 
     with tabs[5]:
-        # -------- KPI PRO (allégé) --------
         p = eng.p
         S_rated_MVA = p.S_rated / 1e6
         dfA = df_view.copy()
@@ -359,18 +371,15 @@ if not mode_multi:
             if c in dfA:
                 dfA[c] = pd.to_numeric(dfA[c], errors="coerce")
 
-        # Energie cumulée
         e_out = float(dfA["e_out_MWh"].iloc[-1]) if "e_out_MWh" in dfA else np.nan
         e_loss = float(dfA["e_loss_MWh"].iloc[-1]) if "e_loss_MWh" in dfA else np.nan
 
-        # Charge estimée (%): S≈P/PF
         if "p_net" in dfA and "pf_prim" in dfA and S_rated_MVA > 0:
             dfA["p_net_MW"] = dfA["p_net"] / 1e6
             with np.errstate(divide="ignore", invalid="ignore"):
                 dfA["S_MVA_est"] = dfA["p_net_MW"] / dfA["pf_prim"].clip(lower=0.1)
                 dfA["load_pct"]  = (dfA["S_MVA_est"] / S_rated_MVA) * 100.0
 
-        # Rendement η
         if "p_net" in dfA and "p_loss" in dfA:
             num = dfA["p_net"].clip(lower=0.0)
             den = (dfA["p_net"] + dfA["p_loss"]).replace(0, np.nan)
@@ -382,7 +391,6 @@ if not mode_multi:
         eta_last = float(dfA["eta"].iloc[-1]) if len(dfA) else np.nan
         eta_mean = float(dfA["eta"].mean()) if len(dfA) else np.nan
 
-        # Durées au-dessus des seuils
         def _dur(cond: pd.Series) -> float:
             if cond is None or cond.empty:
                 return 0.0
@@ -393,10 +401,8 @@ if not mode_multi:
         dur_warn = _dur(dfA["t_core"] > TEMP_WARN) if "t_core" in dfA else 0.0
         dur_alarm = _dur(dfA["t_core"] > TEMP_ALARM) if "t_core" in dfA else 0.0
 
-        # Vieillissement cumulé
         life_h = float(dfA["life_h"].iloc[-1]) if "life_h" in dfA else np.nan
 
-        # PF compliance
         PF_WARN = p.PF_WARN
         if "pf_prim" in dfA:
             n = dfA["pf_prim"].notna().sum()
@@ -405,7 +411,6 @@ if not mode_multi:
         else:
             pf_low_pct = np.nan
 
-        # KPI affichage allégé
         c1,c2,c3,c4,c5,c6 = st.columns(6)
         with c1:
             st.metric("Charge pic (%)", _fmt(dfA.get("load_pct", pd.Series()).max(), "{:.1f}"))
@@ -429,7 +434,6 @@ if not mode_multi:
         st.caption(f"Temps sous PF < seuil : {_fmt(pf_low_pct, '{:.1f}')} % des pas de temps.")
         st.caption(f"Vieillissement cumulé (h équiv.) : {_fmt(life_h, '{:.2f}')}")
 
-        # Graphique principal : Courbe de charge + Rendement
         if "load_pct" in dfA.columns or "eta" in dfA.columns:
             ycols = []
             if "load_pct" in dfA.columns:
@@ -447,14 +451,15 @@ if not mode_multi:
         if not ev.empty:
             ev["t"] = pd.to_datetime(ev["ts"], unit="s", errors="coerce")
             ev = ev.sort_values("t").tail(500)
-            st.dataframe(ev[["t","level","code","msg","value","threshold"]], use_container_width=True, hide_index=True)
+            # afficher aussi site/equipment/equipment_code si présents             # <<< MODIF
+            cols = [c for c in ["t","level","code","msg","value","threshold","site","equipment","equipment_code"] if c in ev.columns]  # <<< MODIF
+            st.dataframe(ev[cols], use_container_width=True, hide_index=True)      # <<< MODIF
             if st.button("💾 Exporter journal (append)", key="evt_export_one"):
                 _append_events_to_csv(ev.to_dict("records"))
                 st.success(f"Journal ajouté → {EVT_CSV}")
         else:
             st.info("Aucun événement en mémoire.")
 
-    # Boucle d’animation
     time.sleep(1.0 / max(int(hz), 1))
     (getattr(st, "rerun", None) or getattr(st, "experimental_rerun", None))()
 
@@ -474,6 +479,7 @@ else:
         st.stop()
 
     # init engines + buffers
+    tfm_meta = {}  # code -> dict(site, equipment, equipment_code)          # <<< MODIF
     for code in sel_codes:
         if code not in st.session_state.engines:
             st.session_state.engines[code] = TransformerEngine(TransformerParams())
@@ -485,6 +491,11 @@ else:
             st.session_state.running_map[code] = False
         rec = get_transformer(code) or {}
         st.session_state.engines[code].set_params_from_record(rec)
+        tfm_meta[code] = {                                                  # <<< MODIF
+            "site": rec.get("site") or "",                                  # <<< MODIF
+            "equipment": rec.get("name") or code,                           # <<< MODIF
+            "equipment_code": code,                                         # <<< MODIF
+        }                                                                   # <<< MODIF
 
     cTop = st.columns(len(sel_codes))
     for i, code in enumerate(sel_codes):
@@ -499,7 +510,7 @@ else:
                 if st.button("⏹️", key=f"stop_{code}", disabled=not running):
                     st.session_state.running_map[code] = False
             with colb3:
-                if st.button("♻️", key=f"reset_{code}"): 
+                if st.button("♻️", key=f"reset_{code}"):
                     eng = st.session_state.engines[code]
                     eng.s.T_oil = eng.c.Tamb
                     eng.s.T_hotspot = eng.c.Tamb
@@ -515,7 +526,6 @@ else:
 
             eng = st.session_state.engines[code]
 
-            # Variations douces également en multi
             base_load = float(load)
             base_pf   = float(pf)
             base_Tamb = float(amb)
@@ -527,7 +537,6 @@ else:
             eng.set_controls(load_pct=float(base_load), pf_set=float(base_pf), Tamb=float(base_Tamb),
                              fan_mode=fan_mode, fan1_force=bool(f1), fan2_force=bool(f2))
 
-    # paramètres plus light pour multi
     hz = st.slider("Fréquence d’update (Hz)", 1, 10, 2, 1, key="rt_hz_multi")
     max_pts = st.number_input("Points gardés", 60, 2000, 300, 60, key="rt_maxpts_multi")
 
@@ -545,19 +554,26 @@ else:
                 st.session_state.rt_data_map[code] = buf[-int(max_pts):]
                 if E:
                     evbuf = st.session_state.events_map[code]
-                    evbuf.extend(E)
+                    enriched = []                                            # <<< MODIF
+                    meta = tfm_meta.get(code, {})                            # <<< MODIF
+                    for e in E:                                              # <<< MODIF
+                        e2 = dict(e)                                         # <<< MODIF
+                        e2.setdefault("equipment", meta.get("equipment", code))          # <<< MODIF
+                        e2.setdefault("equipment_code", meta.get("equipment_code", code))# <<< MODIF
+                        e2.setdefault("site", meta.get("site", ""))         # <<< MODIF
+                        enriched.append(e2)                                  # <<< MODIF
+                    evbuf.extend(enriched)                                   # <<< MODIF
                     st.session_state.events_map[code] = evbuf[-1000:]
-                    _append_events_to_csv(E)
-                    for e in E:
+                    _append_events_to_csv(enriched)                          # <<< MODIF
+                    for e in enriched:                                       # <<< MODIF
                         try:
-                            notify_event(e)
+                            notify_event(e)                                  # <<< MODIF
                         except Exception:
                             pass
             st.session_state.last_tick = now_m
 
     _tick_multi()
 
-    # affichage compact multi
     grid = st.columns(len(sel_codes))
     for i, code in enumerate(sel_codes):
         with grid[i]:

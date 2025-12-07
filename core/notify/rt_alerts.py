@@ -1,4 +1,3 @@
-# core/notify/rt_alerts.py
 from __future__ import annotations
 from pathlib import Path
 from typing import Dict, Any
@@ -23,6 +22,7 @@ def _save_state(state: Dict[str, Any]):
     try:
         STATE_PATH.write_text(json.dumps(state, indent=2), encoding="utf-8")
     except Exception:
+        # on évite de casser la notif si l’écriture échoue                      # <<< MODIF
         pass
 
 def _log(line: str):
@@ -32,23 +32,45 @@ def _log(line: str):
     except Exception:
         pass
 
-def _format_subject(prefix: str, equipment: str, level: str, code: str) -> str:
-    icon = "🔴" if level=="ALARM" else ("🟡" if level=="WARN" else "ℹ️")
-    return f"{prefix}{icon} [{level}] {equipment} — {code}"
+def _format_subject(prefix: str, equipment: str, site: str, level: str, code: str) -> str:  # <<< MODIF (site ajouté)
+    """
+    Objet d'email standardisé, incluant équipement et site.                      # <<< MODIF
+    Exemple: [SIMCO] 🔴 [ALARM] SITE-A / TRANSFO-01 — OV_VOLT                    # <<< MODIF
+    """
+    icon = "🔴" if level == "ALARM" else ("🟡" if level == "WARN" else "ℹ️")
+    site_part = site or "Site ?"                                                # <<< MODIF
+    eq_part = equipment or "Equipement ?"                                       # <<< MODIF
+    code_part = code or "Code ?"                                                # <<< MODIF
+    return f"{prefix}{icon} [{level}] {site_part} / {eq_part} — {code_part}"    # <<< MODIF
 
 def _format_body_text(e: Dict[str, Any]) -> str:
     ts = float(e.get("ts", time.time()))
     tstr = datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+
+    site = str(e.get("site", "") or "")                                         # <<< MODIF
+    equipment = str(                                                            # <<< MODIF
+        e.get("equipment", "")                                                  # <<< MODIF
+        or e.get("equipment_code", "")                                          # <<< MODIF
+        or ""                                                                   # <<< MODIF
+    )
+    level = str(e.get("level", "") or "")                                       # <<< MODIF
+    code  = str(e.get("code", "") or "")                                        # <<< MODIF
+    msg   = str(e.get("msg", "") or "")                                         # <<< MODIF
+
     lines = [
         f"Date/Heure : {tstr}",
-        f"Site       : {e.get('site','')}",
-        f"Equipement : {e.get('equipment','')}",
-        f"Niveau     : {e.get('level','')}",
-        f"Code       : {e.get('code','')}",
-        f"Message    : {e.get('msg','')}",
+        f"Site       : {site}",                                                 # <<< MODIF
+        f"Equipement : {equipment}",                                            # <<< MODIF
+        f"Niveau     : {level}",                                                # <<< MODIF
+        f"Code       : {code}",                                                 # <<< MODIF
+        f"Message    : {msg}",                                                  # <<< MODIF
     ]
-    if e.get("value") not in (None, ""):     lines.append(f"Valeur     : {e.get('value')}")
-    if e.get("threshold") not in (None, ""): lines.append(f"Seuil      : {e.get('threshold')}")
+
+    if e.get("value") not in (None, ""):
+        lines.append(f"Valeur     : {e.get('value')}")
+    if e.get("threshold") not in (None, ""):
+        lines.append(f"Seuil      : {e.get('threshold')}")
+
     lines.append("")
     lines.append("— Notification automatique —")
     return "\n".join(lines)
@@ -68,40 +90,52 @@ def notify_event(event: Dict[str, Any]) -> Dict[str, Any]:
       - level ∈ levels
       - (site_filter vide ou contient le site)
       - cooldown respecté
+
+    event doit contenir au minimum: level, code, equipment (ou equipment_code), site, msg.  # <<< MODIF
     """
     cfg = load_alerts_config()
     if not cfg.enable_email:
         return {"ok": False, "skipped": "email-disabled"}
 
-    level = str(event.get("level","")).upper()
+    level = str(event.get("level", "")).upper()                                  # <<< MODIF
     if cfg.levels and level not in [x.upper() for x in cfg.levels]:
         return {"ok": False, "skipped": "level-filter"}
 
     if cfg.site_filter:
-        if str(event.get("site","")) not in cfg.site_filter:
+        if str(event.get("site", "")) not in cfg.site_filter:                    # <<< MODIF
             return {"ok": False, "skipped": "site-filter"}
 
     recipients = cfg.smtp.to_addrs or []
     if not recipients:
         return {"ok": False, "error": "No recipients configured"}
 
-    equip = str(event.get("equipment",""))
-    code  = str(event.get("code",""))
-    key = f"{equip}|{code}|{level}"
+    site = str(event.get("site", "") or "")                                      # <<< MODIF
+    equip = str(                                                                 # <<< MODIF
+        event.get("equipment", "")                                               # <<< MODIF
+        or event.get("equipment_code", "")                                       # <<< MODIF
+        or ""                                                                    # <<< MODIF
+    )
+    code  = str(event.get("code", "") or "")                                     # <<< MODIF
+
+    # clé de cooldown plus fine: site + équipement + code + niveau               # <<< MODIF
+    key = f"{site}|{equip}|{code}|{level}"                                       # <<< MODIF
 
     state = _load_state()
-    minutes = int(cfg.cooldown_minutes or max(1, int(cfg.min_period_s/60.0)))
+    minutes = int(cfg.cooldown_minutes or max(1, int(cfg.min_period_s / 60.0)))
     if not _cooldown_ok(state, key, minutes):
         return {"ok": False, "skipped": "cooldown"}
 
     settings = SMTPSettings(
-        host=cfg.smtp.host, port=int(cfg.smtp.port),
-        username=cfg.smtp.user, password=cfg.smtp.password,
-        use_tls=bool(cfg.smtp.use_starttls), use_ssl=bool(cfg.smtp.use_ssl),
-        sender=cfg.smtp.from_addr or "SIMCO Monitoring <alerts@simco.cd>"
+        host=cfg.smtp.host,
+        port=int(cfg.smtp.port),
+        username=cfg.smtp.user,
+        password=cfg.smtp.password,
+        use_tls=bool(cfg.smtp.use_starttls),
+        use_ssl=bool(cfg.smtp.use_ssl),
+        sender=cfg.smtp.from_addr or "SIMCO Monitoring <alerts@simco.cd>",
     )
 
-    subj = _format_subject(cfg.subject_prefix or "", equip or "?", level, code or "?")
+    subj = _format_subject(cfg.subject_prefix or "", equip, site, level, code)   # <<< MODIF
     txt  = _format_body_text(event)
     res  = send_email_smtp(settings, recipients, subj, txt, None)
 
