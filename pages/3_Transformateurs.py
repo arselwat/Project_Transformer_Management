@@ -7,7 +7,6 @@ from core.transformer.store import (
     list_transformers, get_transformer, upsert_transformer,
     delete_transformer, set_status
 )
-from __future__ import annotations
 import streamlit as st
 from core.security.auth import require_login
 

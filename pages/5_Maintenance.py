@@ -21,7 +21,6 @@ try:
     from core.notify.alerts_plus import notify_stock_alerts
 except Exception:
     notify_stock_alerts = None
-from __future__ import annotations
 import streamlit as st
 from core.security.auth import require_login
 

@@ -16,7 +16,6 @@ try:
     from core.reliability.optimize import propose_intervals
 except Exception:
     propose_intervals = None
-from __future__ import annotations
 import streamlit as st
 from core.security.auth import require_login
 

@@ -9,7 +9,6 @@ from core.notify.config import (
 from core.notify.senders import send_email_alert, send_whatsapp_alert
 from core.notify.rt_alerts import notify_event  # test pipeline end-to-end
 import time
-from __future__ import annotations
 import streamlit as st
 from core.security.auth import require_login
 

@@ -4,7 +4,6 @@ from pathlib import Path
 from typing import Optional
 import pandas as pd
 import streamlit as st
-from __future__ import annotations
 import streamlit as st
 from core.security.auth import require_login
 

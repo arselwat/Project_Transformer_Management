@@ -24,7 +24,6 @@ except Exception:
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from __future__ import annotations
 import streamlit as st
 from core.security.auth import require_login
 
