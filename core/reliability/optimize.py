@@ -3,29 +3,75 @@ from __future__ import annotations
 from typing import Dict, Any
 import math
 
-"""
-Principe:
-- On cible une fiabilité R_target (ex: 0.8) entre deux maintenances.
-- Pour un fit Weibull (β, η, γ≈0), R(t) = exp(-((t-γ)/η)^β) → t* = γ + η * (-ln R_target)^(1/β)
-- On retourne un dictionnaire {equipment_code: interval_opt_h}
-"""
+def _interval_weibull(beta: float, eta: float, gamma: float, R_target: float) -> float | None:
+    if beta <= 0 or eta <= 0:
+        return None
+    if not (0.0 < R_target < 1.0):
+        R_target = 0.8
+    return gamma + eta * (-math.log(R_target)) ** (1.0 / beta)
 
-def propose_intervals(fits: Dict[str, Any], R_target: float = 0.80) -> Dict[str, float]:
-    out: Dict[str, float] = {}
+def _interval_exponential(lmbda: float, R_target: float) -> float | None:
+    # R(t) = exp(-λ t) → t* = -ln(R_target)/λ
+    if lmbda <= 0:
+        return None
+    if not (0.0 < R_target < 1.0):
+        R_target = 0.8
+    return -math.log(R_target) / lmbda
+
+def propose_intervals_from_models(
+    fits: Dict[str, Dict[str, Any]],
+    R_target: float = 0.80,
+) -> Dict[str, Dict[str, float | str]]:
+    """
+    fits[code] = sortie de select_best_model() pour un équipement.
+    Retourne pour chaque code:
+      - interval_h : intervalle suggéré en heures (si dispo)
+      - policy_hint : texte court sur la politique
+      - model_name  : loi retenue
+    """
+    out: Dict[str, Dict[str, float | str]] = {}
     if not fits:
         return out
 
-    if R_target <= 0 or R_target >= 1:
+    if not (0.0 < R_target < 1.0):
         R_target = 0.8
 
-    for eq, ft in fits.items():
-        try:
-            beta = float(getattr(ft, "beta"))
-            eta  = float(getattr(ft, "eta"))
-            gamma = float(getattr(ft, "gamma", 0.0))
-            if beta > 0 and eta > 0:
-                t = gamma + eta * ( -math.log(R_target) )**(1.0 / beta)
-                out[str(eq)] = float(t)
-        except Exception:
-            pass
+    for eq_code, res in fits.items():
+        if not res.get("ok"):
+            continue
+        name = res.get("best_name")
+        params = res.get("params", {}) or {}
+        interval = None
+        policy = "undefined"
+
+        if name == "weibull":
+            beta = float(params.get("beta", 0.0))
+            eta  = float(params.get("eta", 0.0))
+            gamma = float(params.get("gamma", 0.0)) if "gamma" in params else 0.0
+            interval = _interval_weibull(beta, eta, gamma, R_target)
+            # Ajuster le hint selon beta
+            if beta < 1.0:
+                policy = "surveillance/predictive (β<1, peu de sens de remplacer par âge)"
+            elif 0.95 <= beta <= 1.05:
+                policy = "corrective + inspections périodiques (β≈1)"
+            else:
+                policy = "préventive calée sur l'âge (β>1, usure)"
+        elif name == "exponential":
+            lmbda = float(params.get("lambda", 0.0))
+            interval = _interval_exponential(lmbda, R_target)
+            policy = "corrective + opportuniste (taux constant)"
+        elif name == "lognormal":
+            # pour la lognormale ou gamma, tu peux continuer à utiliser
+            # la formule Weibull en t'appuyant sur un équivalent ou rester sur un hint textuel
+            policy = "préventive conditionnelle (dégradation multiplicative)"
+        elif name == "gamma":
+            policy = "préventive liée à la charge/usage (fatigue cumulée)"
+
+        if interval is not None and interval > 0:
+            out[str(eq_code)] = {
+                "interval_h": float(interval),
+                "policy_hint": policy,
+                "model_name": str(name),
+            }
+
     return out
