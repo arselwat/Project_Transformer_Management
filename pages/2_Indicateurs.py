@@ -1,18 +1,34 @@
 from __future__ import annotations
+
 from pathlib import Path
 import math
 import io
+
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import streamlit as st
 
-# Toujours en tout premier
+from core.security.auth import require_login
+
+# === Config page (une seule fois, tout en haut) ===
 st.set_page_config(page_title="Indicateurs", page_icon="📊", layout="wide")
 st.title("📊 Indicateurs — Fiabilité ")
 
 # === Imports core (source de vérité) ===
-from core.reliability.unify import compute_bundle, UnifyOptions
-from core.reliability.weibull import R, F, pdf, hazard
+# Si un module manque, on arrête proprement avec un message clair.
+try:
+    from core.reliability.unify import compute_bundle, UnifyOptions
+    from core.reliability.weibull import R, F, pdf, hazard
+except ImportError as e:
+    st.error(
+        "Module de fiabilité introuvable (`core.reliability.*`). "
+        "Vérifie que le dossier `core/` est bien présent dans l'environnement Streamlit "
+        "et que les imports sont corrects."
+    )
+    st.stop()
 
 # Export PDF (optionnel)
 try:
@@ -20,19 +36,10 @@ try:
 except Exception:
     export_merged_report_pdf = None
 
-# Matplotlib (back-end non interactif)
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import streamlit as st
-from core.security.auth import require_login
-
-st.set_page_config(page_title="Transformateurs", page_icon="🔌", layout="wide")
-
+# --- Auth obligatoire ---
 require_login()  # tant que auth_ok n’est pas True, cette page est bloquée
 
-# ... le reste de ta page ...
-
+# === Constantes ===
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_FILE = BASE_DIR / "data" / "failures_saved.csv"
 
@@ -53,14 +60,18 @@ def _read_csv_flex(src):
     if df is None:
         # si file-like, reset le curseur
         if hasattr(src, "seek"):
-            try: src.seek(0)
-            except Exception: pass
+            try:
+                src.seek(0)
+            except Exception:
+                pass
         # 2) autodétection (python engine + on_bad_lines=skip)
         df = _try_read(src, engine="python", on_bad_lines="skip", sep=None)
     if df is None:
         if hasattr(src, "seek"):
-            try: src.seek(0)
-            except Exception: pass
+            try:
+                src.seek(0)
+            except Exception:
+                pass
         # 3) sep=';'
         df = _try_read(src, sep=";", engine="python", on_bad_lines="skip")
     if df is None:
@@ -68,6 +79,7 @@ def _read_csv_flex(src):
     # nettoyage entêtes
     df.columns = [str(c).strip() for c in df.columns]
     return df
+
 
 def fnum(x, nd=2, default="—"):
     try:
@@ -79,14 +91,17 @@ def fnum(x, nd=2, default="—"):
     except Exception:
         return default
 
+
 def _fmt(x, fmt="{:.2f}"):
     try:
         return fmt.format(float(x))
     except Exception:
         return "—"
 
+
 def _safe_dict(x):
     return x if isinstance(x, dict) else {}
+
 
 def _safe_get(d, path, default=None):
     cur = d
@@ -96,18 +111,24 @@ def _safe_get(d, path, default=None):
         cur = cur.get(k)
     return default if cur is None else cur
 
+
 def _as_dist_dict(d):
     return d if isinstance(d, dict) else ({} if d is None else {"name": str(d)})
 
+
 def _pipeline_path_str(pipe: dict) -> str:
     pipe = _safe_dict(pipe)
-    mk  = _safe_dict(pipe.get("trend")) or _safe_dict(pipe.get("trend_mk"))
+    mk = _safe_dict(pipe.get("trend")) or _safe_dict(pipe.get("trend_mk"))
     model = pipe.get("model") or "RP"
     dist = _as_dist_dict(pipe.get("distribution")).get("name", "Weibull2P")
     ks_p = _safe_get(pipe, ["goodness", "ks_p"])
     chi2 = _safe_get(pipe, ["goodness", "chi2_p"])
     pval = mk.get("p_value", mk.get("p"))
-    return f"TTF>0 → MK(p={fnum(pval,3)}) → {model} ; Dist={dist}, KS p={fnum(ks_p,3)}, Chi2 p={fnum(chi2,3)}"
+    return (
+        f"TTF>0 → MK(p={fnum(pval,3)}) → {model} ; "
+        f"Dist={dist}, KS p={fnum(ks_p,3)}, Chi2 p={fnum(chi2,3)}"
+    )
+
 
 def _get_interval_opt(optim_map: dict, eq: str):
     v = (optim_map or {}).get(eq)
@@ -124,12 +145,16 @@ def _get_interval_opt(optim_map: dict, eq: str):
     except Exception:
         return None
 
+
 # ---------- Chargement des TTF via session / fichier ----------
 if isinstance(st.session_state.get("failures_df"), pd.DataFrame):
     df_src = st.session_state["failures_df"].copy()
 else:
     if not DATA_FILE.exists():
-        st.error("Aucun fichier consolidé. Va d’abord sur « Sources de données » et enregistre.")
+        st.error(
+            "Aucun fichier consolidé. "
+            "Va d’abord sur « Sources de données » et enregistre."
+        )
         st.stop()
     df_src = _read_csv_flex(DATA_FILE)
 
@@ -141,11 +166,11 @@ if "equipment_code" not in df_src.columns or "ttf_h" not in df_src.columns:
 
 # ---------- Bundle unifié ----------
 bundle = compute_bundle(session_df=df_src, options=UnifyOptions(force_weibull_2p=True))
-df_ttf   = bundle.ttf
-fits_df  = bundle.fits_df
-metrics  = bundle.metrics_df
-pipe_by  = bundle.pipeline_by_eq
-optim    = bundle.optim
+df_ttf = bundle.ttf
+fits_df = bundle.fits_df
+metrics = bundle.metrics_df
+pipe_by = bundle.pipeline_by_eq
+optim = bundle.optim
 
 if df_ttf.empty or fits_df.empty:
     st.error("Pas assez de données (≥ 3 TTF par équipement).")
@@ -153,7 +178,11 @@ if df_ttf.empty or fits_df.empty:
 
 # Sélection équipements
 eqs_all = sorted(fits_df["equipment_code"].astype(str).unique().tolist())
-sel = st.multiselect("Équipements", options=eqs_all, default=eqs_all[: min(5, len(eqs_all))])
+sel = st.multiselect(
+    "Équipements",
+    options=eqs_all,
+    default=eqs_all[: min(5, len(eqs_all))]
+)
 if not sel:
     st.info("Sélectionne au moins un équipement.")
     st.stop()
@@ -162,8 +191,9 @@ if not sel:
 class _WB:
     def __init__(self, beta, eta, gamma=0.0):
         self.beta = float(beta)
-        self.eta  = float(eta)
+        self.eta = float(eta)
         self.gamma = float(gamma)
+
 
 fits = {
     str(r["equipment_code"]): _WB(r["beta"], r["eta"], r.get("gamma", 0.0))
@@ -183,6 +213,7 @@ except Exception:
 
 t = np.linspace(0, tmax, 300)
 
+
 def multi_plot(ax, fun, title, ylabel):
     for eq, ft in fits.items():
         try:
@@ -191,11 +222,17 @@ def multi_plot(ax, fun, title, ylabel):
             ax.plot(t, y, label=label, linewidth=2)
         except Exception:
             continue
-    ax.set_title(title); ax.set_xlabel("Temps (h)"); ax.set_ylabel(ylabel)
-    ax.grid(True, alpha=.3); ax.legend()
+    ax.set_title(title)
+    ax.set_xlabel("Temps (h)")
+    ax.set_ylabel(ylabel)
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+
 
 # ---------- Graphiques ----------
-tabR, tabF, tabf, tabh, tabG = st.tabs(["R(t)", "F(t)", "f(t)", "h(t)", "🧭 Organigramme"])
+tabR, tabF, tabf, tabh, tabG = st.tabs(
+    ["R(t)", "F(t)", "f(t)", "h(t)", "🧭 Organigramme"]
+)
 
 with tabR:
     fig, ax = plt.subplots()
@@ -232,16 +269,30 @@ with tabG:
                 else:
                     dist = "Weibull2P"
 
-                ks_p  = _safe_get(pipe, ["goodness", "ks_p"])
-                chi2  = _safe_get(pipe, ["goodness", "chi2_p"])
-                trend = _safe_get(pipe, ["trend", "name"]) or _safe_get(pipe, ["trend_mk", "name"]) or "MK"
-                trend_p = _safe_get(pipe, ["trend", "p_value"]) or _safe_get(pipe, ["trend_mk", "p_value"])
+                ks_p = _safe_get(pipe, ["goodness", "ks_p"])
+                chi2 = _safe_get(pipe, ["goodness", "chi2_p"])
+                trend = (
+                    _safe_get(pipe, ["trend", "name"])
+                    or _safe_get(pipe, ["trend_mk", "name"])
+                    or "MK"
+                )
+                trend_p = (
+                    _safe_get(pipe, ["trend", "p_value"])
+                    or _safe_get(pipe, ["trend_mk", "p_value"])
+                )
 
                 itv = _get_interval_opt(optim, eq)
 
-                st.write(f"- Distribution: **{dist}** • KS p={fnum(ks_p,3)} • Chi2 p={fnum(chi2,3)}")
-                st.write(f"- Test de tendance: **{trend}** • p={fnum(trend_p,3)}")
-                st.write(f"- **Intervalle optimisé**: {fnum(itv,1)} h")
+                st.write(
+                    f"- Distribution: **{dist}** • KS p={fnum(ks_p,3)} "
+                    f"• Chi2 p={fnum(chi2,3)}"
+                )
+                st.write(
+                    f"- Test de tendance: **{trend}** • p={fnum(trend_p,3)}"
+                )
+                st.write(
+                    f"- **Intervalle optimisé**: {fnum(itv,1)} h"
+                )
 
                 st.code(_pipeline_path_str(pipe), language="text")
 
@@ -258,7 +309,8 @@ dfm = dfm[dfm["equipment_code"].isin(sel)]
 if "n_ttf" not in dfm.columns:
     counts = (
         df_ttf[df_ttf["equipment_code"].isin(sel)]
-        .groupby("equipment_code")["ttf_h"].count()
+        .groupby("equipment_code")["ttf_h"]
+        .count()
         .rename("n_ttf")
         .reset_index()
     )
@@ -266,15 +318,36 @@ if "n_ttf" not in dfm.columns:
 
 # Fallback MTBF_opt sur interval_opt_h si absent
 if "MTBF_opt" in dfm.columns and "interval_opt_h" in dfm.columns:
-    dfm["MTBF_opt"] = dfm["MTBF_opt"].where(~dfm["MTBF_opt"].isna(), dfm["interval_opt_h"])
+    dfm["MTBF_opt"] = dfm["MTBF_opt"].where(
+        ~dfm["MTBF_opt"].isna(), dfm["interval_opt_h"]
+    )
 
-wanted = ["equipment_code","n_ttf","MTBF","MTTR","MTBF_opt","MTTR_opt","beta","eta","gamma","interval_opt_h"]
-cols = [c for c in wanted if c in dfm.columns] + [c for c in dfm.columns if c not in wanted]
-st.dataframe(dfm[cols].sort_values("equipment_code"), use_container_width=True, hide_index=True)
+wanted = [
+    "equipment_code",
+    "n_ttf",
+    "MTBF",
+    "MTTR",
+    "MTBF_opt",
+    "MTTR_opt",
+    "beta",
+    "eta",
+    "gamma",
+    "interval_opt_h",
+]
+cols = [c for c in wanted if c in dfm.columns] + [
+    c for c in dfm.columns if c not in wanted
+]
+st.dataframe(
+    dfm[cols].sort_values("equipment_code"),
+    use_container_width=True,
+    hide_index=True,
+)
 
 # ---------- Export rapport complet ----------
 st.divider()
-st.subheader("📄 Rapport complet (analyse + optimisation + organigramme + courbes)")
+st.subheader(
+    "📄 Rapport complet (analyse + optimisation + organigramme + courbes)"
+)
 if export_merged_report_pdf is None:
     st.info("Module `core.reliability.reporting_merged` non détecté.")
 else:
