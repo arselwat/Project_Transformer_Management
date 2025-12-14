@@ -17,16 +17,15 @@ from core.security.auth import require_login
 st.set_page_config(page_title="Indicateurs", page_icon="📊", layout="wide")
 st.title("📊 Indicateurs — Fiabilité ")
 
-# === Imports core (source de vérité) ===
-# Si un module manque, on arrête proprement avec un message clair.
+# === Imports fiabilité (sans unify) ===
 try:
-    from core.reliability.unify import compute_bundle, UnifyOptions
     from core.reliability.weibull import R, F, pdf, hazard
-except ImportError as e:
+    from core.reliability.organigram import analyze_ttf_pipeline
+except ImportError:
     st.error(
-        "Module de fiabilité introuvable (`core.reliability.*`). "
-        "Vérifie que le dossier `core/` est bien présent dans l'environnement Streamlit "
-        "et que les imports sont corrects."
+        "Modules de fiabilité introuvables (`core.reliability.weibull` ou `organigram`). "
+        "Vérifie que le dossier `core/` et `core/reliability/` sont bien présents "
+        "dans l'environnement Streamlit."
     )
     st.stop()
 
@@ -37,7 +36,7 @@ except Exception:
     export_merged_report_pdf = None
 
 # --- Auth obligatoire ---
-require_login()  # tant que auth_ok n’est pas True, cette page est bloquée
+require_login()
 
 # === Constantes ===
 BASE_DIR = Path(__file__).resolve().parents[1]
@@ -45,26 +44,19 @@ DATA_FILE = BASE_DIR / "data" / "failures_saved.csv"
 
 # ---------- Helpers robustes ----------
 def _read_csv_flex(src):
-    """
-    Lecture CSV robuste: essaie pandas par défaut, puis engine=python avec sep=None,
-    puis point-virgule. Retourne DataFrame (évent. vide).
-    """
     def _try_read(s, **kw):
         try:
             return pd.read_csv(s, **kw)
         except Exception:
             return None
 
-    # 1) essai standard
     df = _try_read(src)
     if df is None:
-        # si file-like, reset le curseur
         if hasattr(src, "seek"):
             try:
                 src.seek(0)
             except Exception:
                 pass
-        # 2) autodétection (python engine + on_bad_lines=skip)
         df = _try_read(src, engine="python", on_bad_lines="skip", sep=None)
     if df is None:
         if hasattr(src, "seek"):
@@ -72,14 +64,11 @@ def _read_csv_flex(src):
                 src.seek(0)
             except Exception:
                 pass
-        # 3) sep=';'
         df = _try_read(src, sep=";", engine="python", on_bad_lines="skip")
     if df is None:
         return pd.DataFrame()
-    # nettoyage entêtes
     df.columns = [str(c).strip() for c in df.columns]
     return df
-
 
 def fnum(x, nd=2, default="—"):
     try:
@@ -91,17 +80,14 @@ def fnum(x, nd=2, default="—"):
     except Exception:
         return default
 
-
 def _fmt(x, fmt="{:.2f}"):
     try:
         return fmt.format(float(x))
     except Exception:
         return "—"
 
-
 def _safe_dict(x):
     return x if isinstance(x, dict) else {}
-
 
 def _safe_get(d, path, default=None):
     cur = d
@@ -111,10 +97,8 @@ def _safe_get(d, path, default=None):
         cur = cur.get(k)
     return default if cur is None else cur
 
-
 def _as_dist_dict(d):
     return d if isinstance(d, dict) else ({} if d is None else {"name": str(d)})
-
 
 def _pipeline_path_str(pipe: dict) -> str:
     pipe = _safe_dict(pipe)
@@ -129,23 +113,6 @@ def _pipeline_path_str(pipe: dict) -> str:
         f"Dist={dist}, KS p={fnum(ks_p,3)}, Chi2 p={fnum(chi2,3)}"
     )
 
-
-def _get_interval_opt(optim_map: dict, eq: str):
-    v = (optim_map or {}).get(eq)
-    if isinstance(v, dict):
-        for k in ("interval_opt_h", "interval", "t_opt_h", "MTBF_opt"):
-            if v.get(k) is not None:
-                try:
-                    return float(v[k])
-                except Exception:
-                    pass
-        return None
-    try:
-        return float(v)
-    except Exception:
-        return None
-
-
 # ---------- Chargement des TTF via session / fichier ----------
 if isinstance(st.session_state.get("failures_df"), pd.DataFrame):
     df_src = st.session_state["failures_df"].copy()
@@ -158,26 +125,22 @@ else:
         st.stop()
     df_src = _read_csv_flex(DATA_FILE)
 
-# normalisation colonnes
 df_src.columns = [c.strip() for c in df_src.columns]
 if "equipment_code" not in df_src.columns or "ttf_h" not in df_src.columns:
     st.error("Le jeu doit contenir: equipment_code, ttf_h.")
     st.stop()
 
-# ---------- Bundle unifié ----------
-bundle = compute_bundle(session_df=df_src, options=UnifyOptions(force_weibull_2p=True))
-df_ttf = bundle.ttf
-fits_df = bundle.fits_df
-metrics = bundle.metrics_df
-pipe_by = bundle.pipeline_by_eq
-optim = bundle.optim
+df_src["equipment_code"] = df_src["equipment_code"].astype(str)
+df_src["ttf_h"] = pd.to_numeric(df_src["ttf_h"], errors="coerce")
+df_src = df_src.dropna(subset=["ttf_h"])
+df_src = df_src[df_src["ttf_h"] > 0]
 
-if df_ttf.empty or fits_df.empty:
-    st.error("Pas assez de données (≥ 3 TTF par équipement).")
+if df_src.empty:
+    st.error("Pas de TTF valides (>0).")
     st.stop()
 
-# Sélection équipements
-eqs_all = sorted(fits_df["equipment_code"].astype(str).unique().tolist())
+# ---------- Liste équipements & sélection ----------
+eqs_all = sorted(df_src["equipment_code"].unique().tolist())
 sel = st.multiselect(
     "Équipements",
     options=eqs_all,
@@ -187,22 +150,52 @@ if not sel:
     st.info("Sélectionne au moins un équipement.")
     st.stop()
 
-# ---------- Objets “ft” pour R/F/pdf/hazard ----------
+# ---------- Fit Weibull simple pour indicateurs ----------
 class _WB:
     def __init__(self, beta, eta, gamma=0.0):
         self.beta = float(beta)
         self.eta = float(eta)
         self.gamma = float(gamma)
 
+from core.reliability.weibull import fit_weibull
 
-fits = {
-    str(r["equipment_code"]): _WB(r["beta"], r["eta"], r.get("gamma", 0.0))
-    for r in fits_df[fits_df["equipment_code"].isin(sel)].to_dict("records")
-}
+fits: dict[str, _WB] = {}
+pipe_by: dict[str, dict] = {}
+metrics_rows: list[dict] = []
 
-# Domaine temporel (bornes sûres)
+for eq in sel:
+    ttfs = df_src.loc[df_src["equipment_code"] == eq, "ttf_h"].values
+    if len(ttfs) < 3:
+        continue
+    try:
+        wb = fit_weibull(ttfs)
+        ft = _WB(wb.beta, wb.eta, getattr(wb, "gamma", 0.0))
+        fits[eq] = ft
+
+        # Organigramme complet (pipeline)
+        pipe = analyze_ttf_pipeline(ttfs.tolist())
+        pipe_by[eq] = pipe
+
+        # Quelques métriques de base
+        mtbf = float(np.mean(ttfs))
+        metrics_rows.append({
+            "equipment_code": eq,
+            "n_ttf": len(ttfs),
+            "MTBF": mtbf,
+            "beta": float(ft.beta),
+            "eta": float(ft.eta),
+            "gamma": float(ft.gamma),
+        })
+    except Exception:
+        continue
+
+if not fits:
+    st.error("Pas assez de TTF (≥3) pour les équipements sélectionnés.")
+    st.stop()
+
+# ---------- Domaine temporel ----------
 try:
-    tmax_src = df_ttf[df_ttf["equipment_code"].isin(sel)]["ttf_h"].max()
+    tmax_src = df_src[df_src["equipment_code"].isin(sel)]["ttf_h"].max()
     tmax = float(tmax_src)
     if math.isnan(tmax) or tmax <= 0:
         tmax = 1000.0
@@ -212,7 +205,6 @@ except Exception:
     tmax = 1000.0
 
 t = np.linspace(0, tmax, 300)
-
 
 def multi_plot(ax, fun, title, ylabel):
     for eq, ft in fits.items():
@@ -227,7 +219,6 @@ def multi_plot(ax, fun, title, ylabel):
     ax.set_ylabel(ylabel)
     ax.grid(True, alpha=0.3)
     ax.legend()
-
 
 # ---------- Graphiques ----------
 tabR, tabF, tabf, tabh, tabG = st.tabs(
@@ -269,19 +260,13 @@ with tabG:
                 else:
                     dist = "Weibull2P"
 
-                ks_p = _safe_get(pipe, ["goodness", "ks_p"])
-                chi2 = _safe_get(pipe, ["goodness", "chi2_p"])
+                ks_p = _safe_get(pipe, ["distribution_full", "ks_p"])
+                chi2 = _safe_get(pipe, ["distribution_full", "chi2_p"])
                 trend = (
-                    _safe_get(pipe, ["trend", "name"])
-                    or _safe_get(pipe, ["trend_mk", "name"])
+                    _safe_get(pipe, ["trend_mk", "name"])
                     or "MK"
                 )
-                trend_p = (
-                    _safe_get(pipe, ["trend", "p_value"])
-                    or _safe_get(pipe, ["trend_mk", "p_value"])
-                )
-
-                itv = _get_interval_opt(optim, eq)
+                trend_p = _safe_get(pipe, ["trend_mk", "p"])
 
                 st.write(
                     f"- Distribution: **{dist}** • KS p={fnum(ks_p,3)} "
@@ -290,9 +275,6 @@ with tabG:
                 st.write(
                     f"- Test de tendance: **{trend}** • p={fnum(trend_p,3)}"
                 )
-                st.write(
-                    f"- **Intervalle optimisé**: {fnum(itv,1)} h"
-                )
 
                 st.code(_pipeline_path_str(pipe), language="text")
 
@@ -300,53 +282,23 @@ with tabG:
                     st.json(pipe)
 
 st.divider()
-st.subheader("📋 Tableau cohérent — MTBF/MTTR + β/η/γ + interval_opt")
+st.subheader("📋 Tableau synthèse MTBF + β/η/γ")
 
-dfm = bundle.metrics_df.copy()
-dfm = dfm[dfm["equipment_code"].isin(sel)]
-
-# Ajout n_ttf si absent
-if "n_ttf" not in dfm.columns:
-    counts = (
-        df_ttf[df_ttf["equipment_code"].isin(sel)]
-        .groupby("equipment_code")["ttf_h"]
-        .count()
-        .rename("n_ttf")
-        .reset_index()
+dfm = pd.DataFrame(metrics_rows)
+if not dfm.empty:
+    dfm = dfm.sort_values("equipment_code").reset_index(drop=True)
+    st.dataframe(
+        dfm,
+        use_container_width=True,
+        hide_index=True,
     )
-    dfm = dfm.merge(counts, on="equipment_code", how="left")
-
-# Fallback MTBF_opt sur interval_opt_h si absent
-if "MTBF_opt" in dfm.columns and "interval_opt_h" in dfm.columns:
-    dfm["MTBF_opt"] = dfm["MTBF_opt"].where(
-        ~dfm["MTBF_opt"].isna(), dfm["interval_opt_h"]
-    )
-
-wanted = [
-    "equipment_code",
-    "n_ttf",
-    "MTBF",
-    "MTTR",
-    "MTBF_opt",
-    "MTTR_opt",
-    "beta",
-    "eta",
-    "gamma",
-    "interval_opt_h",
-]
-cols = [c for c in wanted if c in dfm.columns] + [
-    c for c in dfm.columns if c not in wanted
-]
-st.dataframe(
-    dfm[cols].sort_values("equipment_code"),
-    use_container_width=True,
-    hide_index=True,
-)
+else:
+    st.info("Aucune métrique calculable pour les équipements sélectionnés.")
 
 # ---------- Export rapport complet ----------
 st.divider()
 st.subheader(
-    "📄 Rapport complet (analyse + optimisation + organigramme + courbes)"
+    "📄 Rapport complet (analyse + indicateurs + courbes)"
 )
 if export_merged_report_pdf is None:
     st.info("Module `core.reliability.reporting_merged` non détecté.")
@@ -357,8 +309,7 @@ else:
             path = export_merged_report_pdf(
                 df=df_sel,
                 out_dir=str(BASE_DIR / "reports"),
-                title="Rapport complet — Analyse & Optimisation",
-                options=UnifyOptions(force_weibull_2p=True, R_target=0.80),
+                title="Rapport complet — Analyse & Indicateurs",
             )
             st.success(f"PDF généré : {path}")
         except Exception as e:
