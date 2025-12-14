@@ -1,3 +1,4 @@
+# pages/6_Stock.py
 from __future__ import annotations
 from pathlib import Path
 import time as _t
@@ -6,7 +7,7 @@ import streamlit as st
 
 from core.inventory import services as inv
 from core.inventory.storage import load_movements
-from core.maintenance.reporting_plus import SPARE_PARTS
+from core.maintenance.reporting_plus import SPARE_PARTS  # même liste que le PDF
 
 try:
     from core.notify.alerts_plus import notify_stock_alerts
@@ -24,17 +25,23 @@ tab_list, tab_move, tab_alert = st.tabs(
 with tab_list:
     st.subheader("Pièces de rechange recommandées")
 
+    # 1) on charge les pièces existantes
     parts = inv.list_parts_as_dicts() or []
     by_code = {str(p.get("code")): p for p in parts if p.get("code")}
 
+    # 2) on s'assure que TOUTES les pièces SPARE_PARTS existent dans le fichier d'inventaire
     upserts_init = []
     for sp in SPARE_PARTS:
-        code = sp["code"]
+        if not isinstance(sp, dict):
+            continue
+        code = str(sp.get("code") or "").strip()
+        if not code:
+            continue
         if code not in by_code:
             upserts_init.append({
                 "code": code,
-                "nom": sp["piece"],
-                "famille": sp["categorie"],
+                "nom": sp.get("piece", ""),
+                "famille": sp.get("categorie", ""),
                 "quantite_dispo": 0,
                 "seuil_min": 0,
                 "localisation": "",
@@ -46,16 +53,21 @@ with tab_list:
         parts = inv.list_parts_as_dicts() or []
         by_code = {str(p.get("code")): p for p in parts if p.get("code")}
 
+    # 3) tableau de synthèse (lecture seule)
     rows_disp = []
     for sp in SPARE_PARTS:
-        code = sp["code"]
+        if not isinstance(sp, dict):
+            continue
+        code = str(sp.get("code") or "").strip()
+        if not code:
+            continue
         base = by_code.get(code, {})
         rows_disp.append({
             "Code": code,
-            "Catégorie": sp["categorie"],
-            "Pièce de rechange": sp["piece"],
-            "Quantité recommandée": sp["qte_reco"],
-            "Criticité": sp["criticite"],
+            "Catégorie": sp.get("categorie", ""),
+            "Pièce de rechange": sp.get("piece", ""),
+            "Quantité recommandée": sp.get("qte_reco", 0),
+            "Criticité": sp.get("criticite", ""),
             "Qté disponible": base.get("quantite_dispo", 0),
             "Seuil min": base.get("seuil_min", 0),
             "Remarques": sp.get("remarques", ""),
@@ -71,11 +83,15 @@ with tab_list:
         qty_inputs = {}
         seuil_inputs = {}
         for sp in SPARE_PARTS:
-            code = sp["code"]
+            if not isinstance(sp, dict):
+                continue
+            code = str(sp.get("code") or "").strip()
+            if not code:
+                continue
             base = by_code.get(code, {})
             col1, col2, col3 = st.columns([3, 1, 1])
             with col1:
-                st.write(f"**{code}** — {sp['piece']}")
+                st.write(f"**{code}** — {sp.get('piece','')}")
             with col2:
                 qty_inputs[code] = st.number_input(
                     f"Qté à ajouter [{code}]",
@@ -97,10 +113,14 @@ with tab_list:
         if submitted:
             upserts = []
             for sp in SPARE_PARTS:
-                code = sp["code"]
+                if not isinstance(sp, dict):
+                    continue
+                code = str(sp.get("code") or "").strip()
+                if not code:
+                    continue
                 base = by_code.get(code, {})
-                add = int(qty_inputs[code] or 0)
-                seuil = int(seuil_inputs[code] or 0)
+                add = int(qty_inputs.get(code, 0) or 0)
+                seuil = int(seuil_inputs.get(code, 0) or 0)
 
                 if add > 0:
                     ok, msg = inv.move_in(
@@ -117,8 +137,8 @@ with tab_list:
                     rec = {"code": code, "seuil_min": seuil}
                     if not base:
                         rec.update({
-                            "nom": sp["piece"],
-                            "famille": sp["categorie"],
+                            "nom": sp.get("piece", ""),
+                            "famille": sp.get("categorie", ""),
                         })
                     upserts.append(rec)
 
@@ -210,7 +230,6 @@ with tab_move:
         st.caption("Aucun mouvement.")
 
 # ============ 3) Alertes seuil ============
-
 with tab_alert:
     st.subheader("Alertes seuil stock")
 
@@ -220,7 +239,6 @@ with tab_alert:
         key="stock_alert_enabled",
     )
 
-    # Liste des articles sous le seuil (threshold_factor=1.0 => seuil_min)
     low = inv.low_stock(threshold_factor=1.0) or []
     if not low:
         st.success("RAS — aucun article sous le seuil.")
@@ -240,7 +258,7 @@ with tab_alert:
                     try:
                         res = notify_stock_alerts(low)
                         if res.get("ok"):
-                            st.success("Alerte stock envoyée (voir ta boîte mail / spam).")
+                            st.success("Alerte stock envoyée (vérifie ta boîte et le spam).")
                         else:
                             err_txt = res.get("email", {}).get("error", "erreur inconnue")
                             st.error(
@@ -250,14 +268,13 @@ with tab_alert:
                             )
                     except Exception as e:
                         st.error(f"Alerte : {e}")
-
         with c2:
             if st.button("⬇️ Export CSV", use_container_width=True):
                 out = Path("data/low_stock_alert.csv")
                 pd.DataFrame(low).to_csv(out, index=False)
                 st.success(f"Exporté → {out}")
 
-    # -------- Alerte automatique (anti-spam 10 min) --------
+    # Auto (anti-spam 10 min)
     if auto and low and notify_stock_alerts:
         last = st.session_state.get("_last_stock_alert_ts", 0.0)
         if _t.time() - last > 600:
@@ -269,5 +286,4 @@ with tab_alert:
                 else:
                     st.toast("Échec envoi alerte auto (voir config SMTP / MAIL_TO).")
             except Exception:
-                # on ne bloque pas l'UI si l'auto-alert échoue
                 pass
