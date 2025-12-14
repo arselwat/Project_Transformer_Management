@@ -1,3 +1,4 @@
+# core/notify/alerts_plus.py
 from __future__ import annotations
 import os, smtplib, ssl, socket, time
 from email.message import EmailMessage
@@ -7,8 +8,15 @@ from typing import List, Dict, Any, Optional
 import tempfile
 import pandas as pd
 
+from core.notify.config import load_alerts_config
+
+
 # ---------- SMTP Settings ----------
 def _smtp_settings() -> Dict[str, Any]:
+    """
+    Paramètres SMTP par défaut (variables d'env).
+    Utilisé comme fallback si aucun destinataire n'est trouvé dans alerts_config.
+    """
     return {
         "host": os.environ.get("SMTP_HOST", "smtp.gmail.com"),
         "port": int(os.environ.get("SMTP_PORT", "587")),
@@ -20,6 +28,7 @@ def _smtp_settings() -> Dict[str, Any]:
         "timeout": int(os.environ.get("SMTP_TIMEOUT", "30")),
         "debug": os.environ.get("MAIL_DEBUG", "0") == "1",
     }
+
 
 # ---------- Low-level sender ----------
 def send_email(
@@ -89,14 +98,17 @@ def send_email(
     except Exception as ex:
         return {"ok": False, "error": f"Unknown error: {ex}"}
 
+
 # ---------- STOCK ALERTS ----------
 def notify_stock_alerts(
     low_items: List[Dict[str, Any]],
     extra_recipients: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
-    Envoie un email avec un CSV en PJ listant les articles sous le seuil.
-    Retourne toujours un dict {ok: bool, email: {...}, csv: path}.
+    Envoie un email avec un CSV listant les articles sous le seuil.
+    Utilise la même config d'adresses (alerts_config.json → smtp.to_addrs)
+    que les alertes temps réel. Si aucune adresse dans la config, on retombe
+    sur MAIL_TO (variables d'env).
     """
     if not low_items:
         return {"ok": True, "email": {"ok": True, "note": "No low items"}, "csv": ""}
@@ -111,8 +123,16 @@ def notify_stock_alerts(
         "Veuillez trouver en pièce jointe la liste des articles sous le seuil.\n"
         "— Généré automatiquement par l'application Fiabilité & Stock.\n"
     )
-    res = send_email(subject, body, to=extra_recipients, attachments=[tmp])
+
+    # Récupère les destinataires depuis alerts_config.json si rien n'est passé
+    if not extra_recipients:
+        cfg = load_alerts_config()
+        extra_recipients = list(cfg.smtp.to_addrs or [])
+
+    # Si la config ne contient rien, on laissera send_email basculer sur MAIL_TO
+    res = send_email(subject, body, to=extra_recipients or None, attachments=[tmp])
     return {"ok": bool(res.get("ok")), "email": res, "csv": str(tmp)}
+
 
 # ---------- MAINTENANCE PLAN ----------
 def notify_pm_with_kits(
@@ -122,6 +142,10 @@ def notify_pm_with_kits(
     pdf_path: Optional[str] = None,
     extra_recipients: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
+    """
+    Envoie le plan de maintenance par email avec PDF (optionnel) et un CSV minimal.
+    Utilise également alerts_config.smtp.to_addrs si extra_recipients n'est pas fourni.
+    """
     attachments: List[Path] = []
 
     if pdf_path:
@@ -143,7 +167,11 @@ def notify_pm_with_kits(
         "— Généré automatiquement par l'application Fiabilité & Stock.\n"
     )
 
-    res = send_email(subject, body, to=extra_recipients, attachments=attachments)
+    if not extra_recipients:
+        cfg = load_alerts_config()
+        extra_recipients = list(cfg.smtp.to_addrs or [])
+
+    res = send_email(subject, body, to=extra_recipients or None, attachments=attachments)
     return {
         "ok": bool(res.get("ok")),
         "email": res,
