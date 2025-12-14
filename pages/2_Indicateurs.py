@@ -1,33 +1,18 @@
 from __future__ import annotations
-
 from pathlib import Path
 import math
 import io
-
 import numpy as np
 import pandas as pd
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import streamlit as st
 
-from core.security.auth import require_login
-
-# === Config page (une seule fois, tout en haut) ===
+# Toujours en tout premier
 st.set_page_config(page_title="Indicateurs", page_icon="📊", layout="wide")
 st.title("📊 Indicateurs — Fiabilité ")
 
-# === Imports fiabilité (sans unify) ===
-try:
-    from core.reliability.weibull import R, F, pdf, hazard
-    from core.reliability.organigram import analyze_ttf_pipeline
-except ImportError:
-    st.error(
-        "Modules de fiabilité introuvables (`core.reliability.weibull` ou `organigram`). "
-        "Vérifie que le dossier `core/` et `core/reliability/` sont bien présents "
-        "dans l'environnement Streamlit."
-    )
-    st.stop()
+# === Imports core (source de vérité) ===
+from core.reliability.unify import compute_bundle, UnifyOptions
+from core.reliability.weibull import R, F, pdf, hazard
 
 # Export PDF (optionnel)
 try:
@@ -35,10 +20,11 @@ try:
 except Exception:
     export_merged_report_pdf = None
 
-# --- Auth obligatoire ---
-require_login()
+# Matplotlib (back-end non interactif)
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
-# === Constantes ===
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_FILE = BASE_DIR / "data" / "failures_saved.csv"
 
