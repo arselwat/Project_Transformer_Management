@@ -1,11 +1,9 @@
-# core/notify/alerts_plus.py
 from __future__ import annotations
 import os, smtplib, ssl, socket, time
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
 from pathlib import Path
 from typing import List, Dict, Any, Optional
-import csv
 import tempfile
 import pandas as pd
 
@@ -23,13 +21,15 @@ def _smtp_settings() -> Dict[str, Any]:
         "debug": os.environ.get("MAIL_DEBUG", "0") == "1",
     }
 
-# ---------- Low-level sender (returns detailed status) ----------
-def send_email(subject: str,
-               body_text: str,
-               to: Optional[List[str]] = None,
-               cc: Optional[List[str]] = None,
-               bcc: Optional[List[str]] = None,
-               attachments: Optional[List[Path]] = None) -> Dict[str, Any]:
+# ---------- Low-level sender ----------
+def send_email(
+    subject: str,
+    body_text: str,
+    to: Optional[List[str]] = None,
+    cc: Optional[List[str]] = None,
+    bcc: Optional[List[str]] = None,
+    attachments: Optional[List[Path]] = None,
+) -> Dict[str, Any]:
     cfg = _smtp_settings()
     to = to or cfg["to_default"]
     cc = cc or []
@@ -43,12 +43,12 @@ def send_email(subject: str,
     msg["Subject"] = subject
     msg["From"] = cfg["from_addr"]
     msg["To"] = ", ".join(to)
-    if cc: msg["Cc"] = ", ".join(cc)
+    if cc:
+        msg["Cc"] = ", ".join(cc)
     msg["Date"] = formatdate(localtime=True)
     msg["Message-ID"] = make_msgid(domain=cfg["from_addr"].split("@")[-1])
     msg.set_content(body_text or "")
 
-    # Attach files (skip missing)
     for p in attachments:
         try:
             p = Path(p)
@@ -59,7 +59,7 @@ def send_email(subject: str,
                 data,
                 maintype="application",
                 subtype="octet-stream",
-                filename=p.name
+                filename=p.name,
             )
         except Exception as ex:
             return {"ok": False, "error": f"Attachment error for {p}: {ex}"}
@@ -68,7 +68,9 @@ def send_email(subject: str,
 
     try:
         if cfg["secure"].lower() == "ssl":
-            server = smtplib.SMTP_SSL(cfg["host"], cfg["port"], timeout=cfg["timeout"], context=ssl.create_default_context())
+            server = smtplib.SMTP_SSL(
+                cfg["host"], cfg["port"], timeout=cfg["timeout"], context=ssl.create_default_context()
+            )
         else:
             server = smtplib.SMTP(cfg["host"], cfg["port"], timeout=cfg["timeout"])
         with server:
@@ -78,7 +80,6 @@ def send_email(subject: str,
             if cfg["secure"].lower() == "starttls":
                 server.starttls(context=ssl.create_default_context())
                 server.ehlo()
-            # Login only if username provided
             if cfg["user"]:
                 server.login(cfg["user"], cfg["password"])
             server.send_message(msg, from_addr=cfg["from_addr"], to_addrs=all_rcpts)
@@ -89,11 +90,16 @@ def send_email(subject: str,
         return {"ok": False, "error": f"Unknown error: {ex}"}
 
 # ---------- STOCK ALERTS ----------
-def notify_stock_alerts(low_items: List[Dict[str, Any]],
-                        extra_recipients: Optional[List[str]] = None) -> Dict[str, Any]:
-    # Build lightweight CSV to attach
+def notify_stock_alerts(
+    low_items: List[Dict[str, Any]],
+    extra_recipients: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """
+    Envoie un email avec un CSV en PJ listant les articles sous le seuil.
+    Retourne toujours un dict {ok: bool, email: {...}, csv: path}.
+    """
     if not low_items:
-        return {"ok": True, "email": {"ok": True, "note": "No low items"}}
+        return {"ok": True, "email": {"ok": True, "note": "No low items"}, "csv": ""}
 
     df = pd.DataFrame(low_items)
     tmp = Path(tempfile.gettempdir()) / f"low_stock_{int(time.time())}.csv"
@@ -109,24 +115,20 @@ def notify_stock_alerts(low_items: List[Dict[str, Any]],
     return {"ok": bool(res.get("ok")), "email": res, "csv": str(tmp)}
 
 # ---------- MAINTENANCE PLAN ----------
-def notify_pm_with_kits(tasks_due: List[Dict[str, Any]],
-                        kits_by_eq: Dict[str, Any],
-                        metrics_table: List[Dict[str, Any]],
-                        pdf_path: Optional[str] = None,
-                        extra_recipients: Optional[List[str]] = None) -> Dict[str, Any]:
-    """
-    Envoie le plan de maintenance par email avec PDF (généré au préalable et passé via pdf_path si possible)
-    et un CSV récapitulatif minimal des tâches.
-    """
+def notify_pm_with_kits(
+    tasks_due: List[Dict[str, Any]],
+    kits_by_eq: Dict[str, Any],
+    metrics_table: List[Dict[str, Any]],
+    pdf_path: Optional[str] = None,
+    extra_recipients: Optional[List[str]] = None,
+) -> Dict[str, Any]:
     attachments: List[Path] = []
 
-    # Attach provided PDF if exists
     if pdf_path:
         p = Path(pdf_path)
         if p.exists():
             attachments.append(p)
 
-    # Build small CSV of due tasks (for convenience)
     tmp_csv = Path(tempfile.gettempdir()) / f"pm_due_{int(time.time())}.csv"
     try:
         pd.DataFrame(tasks_due or []).to_csv(tmp_csv, index=False, encoding="utf-8")
@@ -146,5 +148,5 @@ def notify_pm_with_kits(tasks_due: List[Dict[str, Any]],
         "ok": bool(res.get("ok")),
         "email": res,
         "pdf": str(pdf_path or ""),
-        "csv": str(tmp_csv)
+        "csv": str(tmp_csv),
     }

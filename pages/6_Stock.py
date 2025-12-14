@@ -1,4 +1,3 @@
-# pages/6_Stock.py
 from __future__ import annotations
 from pathlib import Path
 import time as _t
@@ -7,20 +6,12 @@ import streamlit as st
 
 from core.inventory import services as inv
 from core.inventory.storage import load_movements
-from core.maintenance.reporting_plus import SPARE_PARTS  # même liste que le PDF
+from core.maintenance.reporting_plus import SPARE_PARTS
 
 try:
     from core.notify.alerts_plus import notify_stock_alerts
 except Exception:
     notify_stock_alerts = None
-import streamlit as st
-from core.security.auth import require_login
-
-st.set_page_config(page_title="Transformateurs", page_icon="🔌", layout="wide")
-
-require_login()  # tant que auth_ok n’est pas True, cette page est bloquée
-
-# ... le reste de ta page ...
 
 st.set_page_config(page_title="Stock — Simple", page_icon="📦", layout="wide")
 st.title("📦 Gestion de Stock")
@@ -29,39 +20,21 @@ tab_list, tab_move, tab_alert = st.tabs(
     ["🗂️ Articles (pièces recommandées)", "↕️ Mouvements", "🔔 Alertes seuil"]
 )
 
-
-# ========= Helper pour code pièce =========
-
-def _sp_code(sp: dict, idx: int) -> str:
-    """
-    Retourne un code stable pour une pièce SPARE_PARTS.
-    - Si sp["code"] existe : on l'utilise.
-    - Sinon : on génère SP-001, SP-002, ... en fonction de l'index.
-      (La liste SPARE_PARTS étant statique, l'ordre reste stable.)
-    """
-    if isinstance(sp, dict) and sp.get("code"):
-        return str(sp["code"])
-    return f"SP-{idx+1:03d}"
-
-
 # ============ 1) Articles ============
-
 with tab_list:
     st.subheader("Pièces de rechange recommandées")
 
-    # 1) on charge les pièces existantes
     parts = inv.list_parts_as_dicts() or []
     by_code = {str(p.get("code")): p for p in parts if p.get("code")}
 
-    # 2) on s'assure que TOUTES les pièces SPARE_PARTS existent dans le fichier d'inventaire
     upserts_init = []
-    for idx, sp in enumerate(SPARE_PARTS):
-        code = _sp_code(sp, idx)
+    for sp in SPARE_PARTS:
+        code = sp["code"]
         if code not in by_code:
             upserts_init.append({
                 "code": code,
-                "nom": sp.get("piece", ""),
-                "famille": sp.get("categorie", ""),
+                "nom": sp["piece"],
+                "famille": sp["categorie"],
                 "quantite_dispo": 0,
                 "seuil_min": 0,
                 "localisation": "",
@@ -73,17 +46,16 @@ with tab_list:
         parts = inv.list_parts_as_dicts() or []
         by_code = {str(p.get("code")): p for p in parts if p.get("code")}
 
-    # 3) tableau de synthèse (lecture seule)
     rows_disp = []
-    for idx, sp in enumerate(SPARE_PARTS):
-        code = _sp_code(sp, idx)
+    for sp in SPARE_PARTS:
+        code = sp["code"]
         base = by_code.get(code, {})
         rows_disp.append({
             "Code": code,
-            "Catégorie": sp.get("categorie", ""),
-            "Pièce de rechange": sp.get("piece", ""),
-            "Quantité recommandée": sp.get("qte_reco", ""),
-            "Criticité": sp.get("criticite", ""),
+            "Catégorie": sp["categorie"],
+            "Pièce de rechange": sp["piece"],
+            "Quantité recommandée": sp["qte_reco"],
+            "Criticité": sp["criticite"],
             "Qté disponible": base.get("quantite_dispo", 0),
             "Seuil min": base.get("seuil_min", 0),
             "Remarques": sp.get("remarques", ""),
@@ -93,17 +65,17 @@ with tab_list:
     st.dataframe(df_disp, use_container_width=True, hide_index=True)
 
     st.markdown("### ➕ Mettre à jour le stock des pièces recommandées")
-    st.caption("Saisis uniquement les **quantités à ajouter** et ajuste les **seuils minimums** si nécessaire.")
+    st.caption("Saisis uniquement les quantités à ajouter et ajuste les seuils minimums si nécessaire.")
 
     with st.form("maj_spares"):
         qty_inputs = {}
         seuil_inputs = {}
-        for idx, sp in enumerate(SPARE_PARTS):
-            code = _sp_code(sp, idx)
+        for sp in SPARE_PARTS:
+            code = sp["code"]
             base = by_code.get(code, {})
             col1, col2, col3 = st.columns([3, 1, 1])
             with col1:
-                st.write(f"**{code}** — {sp.get('piece', '')}")
+                st.write(f"**{code}** — {sp['piece']}")
             with col2:
                 qty_inputs[code] = st.number_input(
                     f"Qté à ajouter [{code}]",
@@ -123,10 +95,9 @@ with tab_list:
 
         submitted = st.form_submit_button("✅ Enregistrer les mises à jour")
         if submitted:
-            # mouvements IN + mise à jour des seuils
             upserts = []
-            for idx, sp in enumerate(SPARE_PARTS):
-                code = _sp_code(sp, idx)
+            for sp in SPARE_PARTS:
+                code = sp["code"]
                 base = by_code.get(code, {})
                 add = int(qty_inputs[code] or 0)
                 seuil = int(seuil_inputs[code] or 0)
@@ -144,11 +115,10 @@ with tab_list:
 
                 if (not base) or int(base.get("seuil_min", 0) or 0) != seuil:
                     rec = {"code": code, "seuil_min": seuil}
-                    # garde aussi nom/famille la première fois
                     if not base:
                         rec.update({
-                            "nom": sp.get("piece", ""),
-                            "famille": sp.get("categorie", ""),
+                            "nom": sp["piece"],
+                            "famille": sp["categorie"],
                         })
                     upserts.append(rec)
 
@@ -158,7 +128,6 @@ with tab_list:
             st.success("Stock des pièces recommandées mis à jour.")
             st.rerun()
 
-    # section optionnelle pour d'autres articles
     st.markdown("---")
     st.markdown("#### Articles supplémentaires (optionnel)")
     st.caption("Pour ajouter d’autres références hors liste recommandée, utilise ce formulaire.")
@@ -194,9 +163,7 @@ with tab_list:
     with colB:
         st.caption("Purge / suppression définitive à gérer directement dans le CSV si besoin.")
 
-
 # ============ 2) Mouvements ============
-
 with tab_move:
     st.subheader("Mouvements rapides")
     c1, c2, c3, c4 = st.columns(4)
@@ -230,9 +197,7 @@ with tab_move:
 
     st.markdown("### Historique récent")
     mv = load_movements(limit=400)
-    dmv = pd.DataFrame(mv) if mv else pd.DataFrame(
-        columns=["ts", "type", "code", "qty", "reason", "ref", "user"]
-    )
+    dmv = pd.DataFrame(mv) if mv else pd.DataFrame(columns=["ts", "type", "code", "qty", "reason", "ref", "user"])
     if not dmv.empty:
         dmv["date"] = pd.to_datetime(dmv["ts"], unit="s")
         dmv = dmv.sort_values("ts", ascending=False)
@@ -244,49 +209,65 @@ with tab_move:
     else:
         st.caption("Aucun mouvement.")
 
-
 # ============ 3) Alertes seuil ============
 
 with tab_alert:
     st.subheader("Alertes seuil stock")
+
     auto = st.toggle(
         "Activer alertes auto sur cette page",
         value=st.session_state.get("stock_alert_enabled", False),
         key="stock_alert_enabled",
     )
 
+    # Liste des articles sous le seuil (threshold_factor=1.0 => seuil_min)
     low = inv.low_stock(threshold_factor=1.0) or []
     if not low:
         st.success("RAS — aucun article sous le seuil.")
     else:
         st.dataframe(pd.DataFrame(low), use_container_width=True, hide_index=True)
+
+        st.markdown("### Envoi manuel / export")
+
         c1, c2 = st.columns(2)
         with c1:
             if st.button("📤 Envoyer alerte maintenant", use_container_width=True):
-                try:
-                    if notify_stock_alerts:
-                        notify_stock_alerts(low)
-                        st.success("Alerte stock envoyée.")
-                    else:
-                        out = Path("data/low_stock_alert.csv")
-                        pd.DataFrame(low).to_csv(out, index=False)
-                        st.info(f"Module d’alerte dédié indisponible — CSV généré : {out}")
-                except Exception as e:
-                    st.error(f"Alerte : {e}")
+                if not notify_stock_alerts:
+                    out = Path("data/low_stock_alert.csv")
+                    pd.DataFrame(low).to_csv(out, index=False)
+                    st.info(f"Module d’alerte indisponible — CSV généré : {out}")
+                else:
+                    try:
+                        res = notify_stock_alerts(low)
+                        if res.get("ok"):
+                            st.success("Alerte stock envoyée (voir ta boîte mail / spam).")
+                        else:
+                            err_txt = res.get("email", {}).get("error", "erreur inconnue")
+                            st.error(
+                                f"Alerte non envoyée : {err_txt}.\n\n"
+                                "Vérifie SMTP_HOST / SMTP_PORT / SMTP_USER / SMTP_PASS / MAIL_TO "
+                                "dans les secrets Streamlit."
+                            )
+                    except Exception as e:
+                        st.error(f"Alerte : {e}")
+
         with c2:
             if st.button("⬇️ Export CSV", use_container_width=True):
                 out = Path("data/low_stock_alert.csv")
                 pd.DataFrame(low).to_csv(out, index=False)
                 st.success(f"Exporté → {out}")
 
-    # Auto (anti-spam : 10 min, partagé avec Maintenance)
-    if auto and low:
+    # -------- Alerte automatique (anti-spam 10 min) --------
+    if auto and low and notify_stock_alerts:
         last = st.session_state.get("_last_stock_alert_ts", 0.0)
         if _t.time() - last > 600:
             try:
-                if notify_stock_alerts:
-                    notify_stock_alerts(low)
+                res = notify_stock_alerts(low)
+                if res.get("ok"):
                     st.session_state["_last_stock_alert_ts"] = _t.time()
                     st.toast("Alerte stock auto envoyée.")
+                else:
+                    st.toast("Échec envoi alerte auto (voir config SMTP / MAIL_TO).")
             except Exception:
+                # on ne bloque pas l'UI si l'auto-alert échoue
                 pass
