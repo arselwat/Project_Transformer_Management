@@ -1,77 +1,139 @@
-# core/reliability/optimize.py
 from __future__ import annotations
 from typing import Dict, Any
 import math
+import numpy as np
 
-def _interval_weibull(beta: float, eta: float, gamma: float, R_target: float) -> float | None:
+
+# =========================
+# 1. Intervalle par fiabilité cible (Weibull 3p)
+# =========================
+
+def interval_weibull_target(beta: float, eta: float, gamma: float, R_target: float) -> float | None:
+    """
+    Intervalle T_R tel que R(T_R) = R_target pour une Weibull (β, η, γ).
+    R(t) = exp(-((t-γ)/η)^β) pour t >= γ.
+    """
     if beta <= 0 or eta <= 0:
         return None
     if not (0.0 < R_target < 1.0):
         R_target = 0.8
-    return gamma + eta * (-math.log(R_target)) ** (1.0 / beta)
+    return float(gamma + eta * (-math.log(R_target)) ** (1.0 / beta))
 
-def _interval_exponential(lmbda: float, R_target: float) -> float | None:
-    # R(t) = exp(-λ t) → t* = -ln(R_target)/λ
-    if lmbda <= 0:
-        return None
-    if not (0.0 < R_target < 1.0):
-        R_target = 0.8
-    return -math.log(R_target) / lmbda
 
-def propose_intervals_from_models(
-    fits: Dict[str, Dict[str, Any]],
+# =========================
+# 2. Intervalle coût minimal (Weibull)
+# =========================
+
+def optimize_interval_cost_weibull(
+    beta: float,
+    eta: float,
+    gamma: float,
+    C_prev: float,
+    C_corr: float,
+    R_min: float = 0.0,
+    t_max_mult: float = 3.0,
+    steps: int = 200,
+) -> dict[str, float | None]:
+    """
+    Cherche T qui minimise le coût moyen par heure pour une politique d'âge:
+        C(T) ≈ (C_prev + C_corr * (1 - R(T))) / T
+    avec R(t) Weibull (β, η, γ).
+
+    Si R_min > 0, on ne garde que les T tels que R(T) >= R_min.
+
+    Retourne:
+      {
+        "T_cost": T* (h),
+        "C_min": C(T*) (coût moyen / h),
+        "R_at_T": R(T*),
+      }
+    """
+    if beta <= 0 or eta <= 0 or C_prev <= 0 or C_corr <= 0:
+        return {"T_cost": None, "C_min": None, "R_at_T": None}
+
+    def R(t: float) -> float:
+        if t <= gamma:
+            return 1.0
+        return math.exp(-(((t - gamma) / eta) ** beta))
+
+    t_grid = np.linspace(eta * 0.1, eta * t_max_mult, steps)
+    best_T, best_C = None, float("inf")
+    best_R = None
+
+    for T in t_grid:
+        R_T = R(T)
+        if R_min > 0.0 and R_T < R_min:
+            # ne respecte pas la fiabilité minimale
+            continue
+        p_fail = 1.0 - R_T
+        C_T = (C_prev + C_corr * p_fail) / T
+        if C_T < best_C:
+            best_C = C_T
+            best_T = T
+            best_R = R_T
+
+    if best_T is None:
+        return {"T_cost": None, "C_min": None, "R_at_T": None}
+
+    return {
+        "T_cost": float(best_T),
+        "C_min": float(best_C),
+        "R_at_T": float(best_R) if best_R is not None else None,
+    }
+
+
+# =========================
+# 3. Intégration: coût + fiabilité
+# =========================
+
+def propose_intervals_cost_and_reliability(
+    fits: Dict[str, Any],
+    C_prev: float,
+    C_corr: float,
     R_target: float = 0.80,
-) -> Dict[str, Dict[str, float | str]]:
+    R_min_cost: float = 0.0,
+) -> Dict[str, dict]:
     """
-    fits[code] = sortie de select_best_model() pour un équipement.
-    Retourne pour chaque code:
-      - interval_h : intervalle suggéré en heures (si dispo)
-      - policy_hint : texte court sur la politique
-      - model_name  : loi retenue
+    fits[code] = objet avec .beta, .eta, éventuellement .gamma.
+
+    Retourne, pour chaque équipement, un dict:
+      {
+        "T_R":      intervalle par fiabilité cible (h),
+        "T_cost":   intervalle coût minimal (h),
+        "R_at_T":   fiabilité à T_cost,
+        "C_min":    coût moyen minimal (/h),
+      }
     """
-    out: Dict[str, Dict[str, float | str]] = {}
-    if not fits:
+    out: Dict[str, dict] = {}
+    if not fits or C_prev <= 0 or C_corr <= 0:
         return out
 
     if not (0.0 < R_target < 1.0):
         R_target = 0.8
 
-    for eq_code, res in fits.items():
-        if not res.get("ok"):
-            continue
-        name = res.get("best_name")
-        params = res.get("params", {}) or {}
-        interval = None
-        policy = "undefined"
+    for eq, ft in fits.items():
+        try:
+            beta = float(getattr(ft, "beta"))
+            eta = float(getattr(ft, "eta"))
+            gamma = float(getattr(ft, "gamma", 0.0))
 
-        if name == "weibull":
-            beta = float(params.get("beta", 0.0))
-            eta  = float(params.get("eta", 0.0))
-            gamma = float(params.get("gamma", 0.0)) if "gamma" in params else 0.0
-            interval = _interval_weibull(beta, eta, gamma, R_target)
-            # Ajuster le hint selon beta
-            if beta < 1.0:
-                policy = "surveillance/predictive (β<1, peu de sens de remplacer par âge)"
-            elif 0.95 <= beta <= 1.05:
-                policy = "corrective + inspections périodiques (β≈1)"
-            else:
-                policy = "préventive calée sur l'âge (β>1, usure)"
-        elif name == "exponential":
-            lmbda = float(params.get("lambda", 0.0))
-            interval = _interval_exponential(lmbda, R_target)
-            policy = "corrective + opportuniste (taux constant)"
-        elif name == "lognormal":
-            # pour la lognormale ou gamma, tu peux continuer à utiliser
-            # la formule Weibull en t'appuyant sur un équivalent ou rester sur un hint textuel
-            policy = "préventive conditionnelle (dégradation multiplicative)"
-        elif name == "gamma":
-            policy = "préventive liée à la charge/usage (fatigue cumulée)"
+            T_R = interval_weibull_target(beta, eta, gamma, R_target)
+            cost_res = optimize_interval_cost_weibull(
+                beta=beta,
+                eta=eta,
+                gamma=gamma,
+                C_prev=C_prev,
+                C_corr=C_corr,
+                R_min=R_min_cost,
+            )
 
-        if interval is not None and interval > 0:
-            out[str(eq_code)] = {
-                "interval_h": float(interval),
-                "policy_hint": policy,
-                "model_name": str(name),
+            out[str(eq)] = {
+                "T_R": T_R,
+                "T_cost": cost_res.get("T_cost"),
+                "R_at_T": cost_res.get("R_at_T"),
+                "C_min": cost_res.get("C_min"),
             }
+        except Exception:
+            continue
 
     return out

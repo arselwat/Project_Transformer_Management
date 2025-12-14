@@ -13,22 +13,16 @@ from core.reliability.policy import suggested_actions
 from core.reliability.organigram import analyze_ttf_pipeline
 from core.reliability.reporting_optimize import export_optimization_report_pdf
 
-# nouvelles fonctions que tu ajoutes dans core/reliability/optimize.py
-try:
-    from core.reliability.optimize import (
-        propose_intervals_from_models,   # multi-modèles (Weibull, expo, …)
-        optimize_interval_cost_weibull,  # option coût minimal
-    )
-except Exception:
-    propose_intervals_from_models = None
-    optimize_interval_cost_weibull = None
+from core.reliability.optimize import (
+    propose_intervals_cost_and_reliability,
+)
 
 from core.security.auth import require_login
 
 st.set_page_config(page_title="Optimisation maintenance", page_icon="🧠", layout="wide")
 require_login()
 
-st.title("🧠 Optimisation — Intervalles, courbes & organigramme")
+st.title("🧠 Optimisation — Intervalles, coût & fiabilité")
 
 DATA_FILE = Path("data/failures_saved.csv")
 
@@ -102,32 +96,21 @@ if not fits:
     st.error("Pas assez de TTF (≥3) pour estimer Weibull.")
     st.stop()
 
-# -------- Utilitaires d’intervalle --------
-def analytic_interval(beta: float, eta: float, R_target: float) -> float:
-    if not (beta > 0 and eta > 0 and 0.0 < R_target < 1.0):
-        return float("nan")
-    return float(eta * ((-math.log(R_target)) ** (1.0 / beta)))
-
-def normalize_intervals_weibull_only(fits: dict, R_target: float) -> dict[str, float]:
-    out: dict[str, float] = {}
-    for eq, ft in fits.items():
-        out[eq] = analytic_interval(float(ft.beta), float(ft.eta), R_target)
-    return out
-
 # -------- Paramètres utilisateur --------
 st.markdown("### Paramètres de fiabilité et de coût")
 
-colR, colC1, colC2 = st.columns(3)
+colR, colC1, colC2, colRmin = st.columns(4)
 with colR:
     R_target = st.slider("Fiabilité cible R(t)", 0.50, 0.99, 0.80, 0.01)
-
 with colC1:
     C_prev = st.number_input("Coût maintenance préventive", min_value=0.0, value=1.0, step=0.1)
-
 with colC2:
     C_corr = st.number_input("Coût panne (corrective)", min_value=0.0, value=5.0, step=0.5)
+with colRmin:
+    R_min_cost = st.slider("Fiabilité min. pour l’optimum coût", 0.0, 0.99, 0.70, 0.01)
 
-use_cost = st.checkbox("Calculer aussi l’intervalle à coût moyen minimal (Weibull)", value=False)
+if C_prev <= 0 or C_corr <= 0:
+    st.warning("Renseigne des coûts préventif/correctif > 0 pour l’optimisation économique.")
 
 # -------- Organigramme + modèle global --------
 org_results: dict[str, dict] = {}
@@ -135,46 +118,21 @@ for eq in fits.keys():
     ttf = df.loc[df["equipment_code"] == eq, "ttf_h"].tolist()
     org_results[eq] = analyze_ttf_pipeline(ttf)
 
-# Construire un dictionnaire “best_fits” utilisable par propose_intervals_from_models
-best_fits: dict[str, dict] = {}
-for eq, org in org_results.items():
-    if "distribution" in org and org.get("distribution") is not None:
-        best_fits[eq] = {
-            "ok": True,
-            "best_name": org.get("distribution"),
-            "params": {},  # à remplir si tu exposes les params par loi dans ton pipeline
-        }
+# -------- Calcul des intervalles coût + fiabilité --------
+res_all = {}
+if C_prev > 0 and C_corr > 0:
+    res_all = propose_intervals_cost_and_reliability(
+        fits=fits,
+        C_prev=C_prev,
+        C_corr=C_corr,
+        R_target=R_target,
+        R_min_cost=R_min_cost,
+    )
 
-# -------- Intervalles par fiabilité cible --------
-intervals_R: dict[str, float] = {}
-
-if callable(propose_intervals_from_models) and best_fits:
-    try:
-        raw = propose_intervals_from_models(best_fits, R_target=R_target)
-        for eq, v in raw.items():
-            val = v.get("interval_h")
-            if isinstance(val, (int, float)) and val > 0:
-                intervals_R[eq] = float(val)
-    except Exception:
-        intervals_R = {}
-
-# fallback : si on n’a pas réussi, on revient à la formule Weibull seule
-if not intervals_R:
-    intervals_R = normalize_intervals_weibull_only(fits, R_target)
-
-# -------- Intervalles à coût minimal (optionnel, Weibull) --------
-intervals_cost: dict[str, float] = {}
-if use_cost and callable(optimize_interval_cost_weibull) and C_prev > 0 and C_corr > 0:
-    for eq, ft in fits.items():
-        T_cost = optimize_interval_cost_weibull(
-            beta=float(ft.beta),
-            eta=float(ft.eta),
-            gamma=0.0,
-            C_prev=C_prev,
-            C_corr=C_corr,
-        )
-        if isinstance(T_cost, (int, float)) and T_cost > 0:
-            intervals_cost[eq] = float(T_cost)
+intervals_R = {eq: d.get("T_R") for eq, d in res_all.items()}
+intervals_cost = {eq: d.get("T_cost") for eq, d in res_all.items()}
+R_at_cost = {eq: d.get("R_at_T") for eq, d in res_all.items()}
+C_min_map = {eq: d.get("C_min") for eq, d in res_all.items()}
 
 # -------- Tableau synthèse + CSV --------
 rows = []
@@ -182,24 +140,27 @@ for eq, ft in fits.items():
     org = org_results.get(eq, {})
     beta = float(ft.beta)
     eta = float(ft.eta)
+
     itv_R = intervals_R.get(eq)
     itv_C = intervals_cost.get(eq)
+    R_cost = R_at_cost.get(eq)
+    C_min = C_min_map.get(eq)
 
     rows.append({
         "equipment_code": eq,
         "beta": round(beta, 3),
         "eta_h": round(eta, 1),
-        "interval_R_h": round(float(itv_R), 1) if isinstance(itv_R, (int, float)) else None,
-        "interval_cost_h": round(float(itv_C), 1) if isinstance(itv_C, (int, float)) else None,
+        "T_cost_h": round(float(itv_C), 1) if isinstance(itv_C, (int, float)) else None,
+        "R(T_cost)": round(float(R_cost), 3) if isinstance(R_cost, (int, float)) else None,
+        "C_min/heure": round(float(C_min), 4) if isinstance(C_min, (int, float)) else None,
+        "T_R_h": round(float(itv_R), 1) if isinstance(itv_R, (int, float)) else None,
         "model": org.get("model", "?"),
         "distribution": org.get("distribution", "?"),
-        "trend": bool(org.get("trend_mk", {}).get("has_trend", False)),
-        "dep": bool(org.get("dependence", {}).get("has_dep", False)),
     })
 
 df_out = pd.DataFrame(rows).sort_values("equipment_code").reset_index(drop=True)
 
-st.subheader("📋 Synthèse optimisation")
+st.subheader("📋 Synthèse optimisation (coût puis fiabilité)")
 st.dataframe(df_out, use_container_width=True, hide_index=True)
 
 csv_bytes = df_out.to_csv(index=False).encode("utf-8")
@@ -236,11 +197,14 @@ beta = float(ft.beta)
 eta = float(ft.eta)
 itv_R = intervals_R.get(sel)
 itv_C = intervals_cost.get(sel)
+R_cost = R_at_cost.get(sel)
+C_min = C_min_map.get(sel)
 
-st.write(
-    f"β = {beta:.3f} • η = {eta:.1f} h • "
-    f"Intervalle fiabilité: {itv_R:.1f} h"
-    + (f" • Intervalle coût: {itv_C:.1f} h" if isinstance(itv_C, (int, float)) else "")
+st.markdown(
+    f"- β = **{beta:.3f}** • η = **{eta:.1f} h**\n"
+    f"- Intervalle **coût minimal** T_cost : **{itv_C:.1f} h** "
+    f"(R(T_cost) ≈ {R_cost:.3f}, coût moyen ≈ {C_min:.4f} / h)\n"
+    f"- Intervalle **fiabilité cible** T_R : **{itv_R:.1f} h** (R_target = {R_target:.2f})"
 )
 
 org = org_results.get(sel, {})
@@ -256,7 +220,6 @@ for a in suggested_actions(beta):
 st.divider()
 if st.button("📄 Générer rapport optimisation (PDF)"):
     try:
-        # tu peux faire évoluer la signature pour passer aussi intervals_cost, org_results, etc.
         path = export_optimization_report_pdf(df, fits, intervals_R, org_results, out_dir="reports")
         st.success(f"PDF généré : {path}")
     except Exception as e:
