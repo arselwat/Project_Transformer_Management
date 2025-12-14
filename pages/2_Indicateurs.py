@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 import math
-import io
 
 import numpy as np
 import pandas as pd
@@ -13,26 +12,26 @@ import streamlit as st
 
 from core.security.auth import require_login
 
-# === Config page (une seule fois, tout en haut) ===
+# === Config page ===
 st.set_page_config(page_title="Indicateurs", page_icon="📊", layout="wide")
 st.title("📊 Indicateurs — Fiabilité ")
 
 # === Imports fiabilité (sans unify) ===
 try:
-    from core.reliability.weibull import R, F, pdf, hazard
+    from core.reliability.weibull import R, F, pdf, hazard, fit_weibull
     from core.reliability.organigram import analyze_ttf_pipeline
-except ImportError:
+except ImportError as e:
     st.error(
-        "Modules de fiabilité introuvables (`core.reliability.weibull` ou `organigram`). "
-        "Vérifie que le dossier `core/` et `core/reliability/` sont bien présents "
-        "dans l'environnement Streamlit."
+        f"Modules de fiabilité introuvables (`core.reliability.weibull` ou `organigram`) : {e}.\n"
+        "Vérifie que le dossier `core/reliability/` est bien présent et que les imports internes sont corrects."
     )
     st.stop()
 
-# Export PDF (optionnel)
+# Export PDF (message d'erreur explicite si problème)
 try:
     from core.reliability.reporting_merged import export_merged_report_pdf
-except Exception:
+except Exception as e:
+    st.error(f"Erreur d'import `core.reliability.reporting_merged` : {e}")
     export_merged_report_pdf = None
 
 # --- Auth obligatoire ---
@@ -42,7 +41,7 @@ require_login()
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_FILE = BASE_DIR / "data" / "failures_saved.csv"
 
-# ---------- Helpers robustes ----------
+# ---------- Helpers CSV ----------
 def _read_csv_flex(src):
     def _try_read(s, **kw):
         try:
@@ -105,15 +104,15 @@ def _pipeline_path_str(pipe: dict) -> str:
     mk = _safe_dict(pipe.get("trend")) or _safe_dict(pipe.get("trend_mk"))
     model = pipe.get("model") or "RP"
     dist = _as_dist_dict(pipe.get("distribution")).get("name", "Weibull2P")
-    ks_p = _safe_get(pipe, ["goodness", "ks_p"])
-    chi2 = _safe_get(pipe, ["goodness", "chi2_p"])
+    ks_p = _safe_get(pipe, ["distribution_full", "ks_p"])
+    chi2 = _safe_get(pipe, ["distribution_full", "chi2_p"])
     pval = mk.get("p_value", mk.get("p"))
     return (
         f"TTF>0 → MK(p={fnum(pval,3)}) → {model} ; "
         f"Dist={dist}, KS p={fnum(ks_p,3)}, Chi2 p={fnum(chi2,3)}"
     )
 
-# ---------- Chargement des TTF via session / fichier ----------
+# ---------- Chargement des TTF ----------
 if isinstance(st.session_state.get("failures_df"), pd.DataFrame):
     df_src = st.session_state["failures_df"].copy()
 else:
@@ -139,7 +138,7 @@ if df_src.empty:
     st.error("Pas de TTF valides (>0).")
     st.stop()
 
-# ---------- Liste équipements & sélection ----------
+# ---------- Sélection équipements ----------
 eqs_all = sorted(df_src["equipment_code"].unique().tolist())
 sel = st.multiselect(
     "Équipements",
@@ -150,14 +149,12 @@ if not sel:
     st.info("Sélectionne au moins un équipement.")
     st.stop()
 
-# ---------- Fit Weibull simple pour indicateurs ----------
+# ---------- Fit Weibull + organigramme ----------
 class _WB:
     def __init__(self, beta, eta, gamma=0.0):
         self.beta = float(beta)
         self.eta = float(eta)
         self.gamma = float(gamma)
-
-from core.reliability.weibull import fit_weibull
 
 fits: dict[str, _WB] = {}
 pipe_by: dict[str, dict] = {}
@@ -172,11 +169,9 @@ for eq in sel:
         ft = _WB(wb.beta, wb.eta, getattr(wb, "gamma", 0.0))
         fits[eq] = ft
 
-        # Organigramme complet (pipeline)
         pipe = analyze_ttf_pipeline(ttfs.tolist())
         pipe_by[eq] = pipe
 
-        # Quelques métriques de base
         mtbf = float(np.mean(ttfs))
         metrics_rows.append({
             "equipment_code": eq,
@@ -186,8 +181,8 @@ for eq in sel:
             "eta": float(ft.eta),
             "gamma": float(ft.gamma),
         })
-    except Exception:
-        continue
+    except Exception as e:
+        st.warning(f"Équipement {eq} ignoré (fit/analyses impossible) : {e}")
 
 if not fits:
     st.error("Pas assez de TTF (≥3) pour les équipements sélectionnés.")
@@ -281,6 +276,7 @@ with tabG:
                 with st.expander("Détails bruts (JSON)", expanded=False):
                     st.json(pipe)
 
+# ---------- Tableau synthèse ----------
 st.divider()
 st.subheader("📋 Tableau synthèse MTBF + β/η/γ")
 
@@ -297,11 +293,12 @@ else:
 
 # ---------- Export rapport complet ----------
 st.divider()
-st.subheader(
-    "📄 Rapport complet (analyse + indicateurs + courbes)"
-)
+st.subheader("📄 Rapport complet (analyse + indicateurs + courbes)")
 if export_merged_report_pdf is None:
-    st.info("Module `core.reliability.reporting_merged` non détecté.")
+    st.info(
+        "Module `core.reliability.reporting_merged` indisponible ou en erreur d'import.\n"
+        "Vérifie `core/reliability/reporting_merged.py` et ses imports internes."
+    )
 else:
     df_sel = df_src[df_src["equipment_code"].isin(sel)].copy()
     if st.button("📄 Générer rapport complet"):
@@ -313,4 +310,4 @@ else:
             )
             st.success(f"PDF généré : {path}")
         except Exception as e:
-            st.error(f"PDF : {e}")
+            st.error(f"Erreur génération PDF : {e}")
