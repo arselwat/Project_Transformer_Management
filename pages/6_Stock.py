@@ -262,9 +262,10 @@ with tab_alert:
                         else:
                             err_txt = res.get("email", {}).get("error", "erreur inconnue")
                             st.error(
-                                f"Alerte non envoyée : {err_txt}.\n\n"
-                                "Vérifie SMTP_HOST / SMTP_PORT / SMTP_USER / SMTP_PASS / MAIL_TO "
-                                "dans les secrets Streamlit."
+                                "Alerte non envoyée : "
+                                f"{err_txt}.\n\n"
+                                "Vérifie la configuration des alertes (alerts_config.json → smtp.host, "
+                                "smtp.port, smtp.user, smtp.password, smtp.to_addrs)."
                             )
                     except Exception as e:
                         st.error(f"Alerte : {e}")
@@ -284,6 +285,8 @@ with tab_alert:
                     st.session_state["_last_stock_alert_ts"] = _t.time()
                     st.toast("Alerte stock auto envoyée.")
                 else:
-                    st.toast("Échec envoi alerte auto (voir config SMTP / MAIL_TO).")
+                    st.toast(
+                        "Échec envoi alerte auto (voir alerts_config.json / section smtp.to_addrs et paramètres SMTP)."
+                    )
             except Exception:
                 pass
