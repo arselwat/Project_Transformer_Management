@@ -1,16 +1,16 @@
 # core/reliability/reporting_merged.py
 from __future__ import annotations
+
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 from io import BytesIO
-
 import math
+
 import numpy as np
 import pandas as pd
 
-# Matplotlib headless pour générer les figures
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -18,100 +18,69 @@ import matplotlib.pyplot as plt
 try:
     from reportlab.lib.pagesizes import A4
     from reportlab.lib import colors
-    from reportlab.lib.units import cm, mm  # selon ce qui était utilisé
+    from reportlab.lib.units import cm, mm
     from reportlab.lib.styles import getSampleStyleSheet
-    from reportlab.platypus import (
-        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak, Image
-    )
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak, Image
     HAVE_REPORTLAB = True
 except Exception:
     HAVE_REPORTLAB = False
-    A4 = (595.27, 841.89)
-    colors = None
-    cm = mm = 1.0
-    def getSampleStyleSheet():
-        raise RuntimeError("ReportLab non disponible")
 
-try:
-    from fpdf import FPDF
-    HAVE_FPDF = True
-except Exception:
-    HAVE_FPDF = False
-
-
-# "Vérité unique" (bundle cohérent) + fonctions de courbes
 from core.reliability.unify import compute_bundle, UnifyOptions, UnifyBundle
 from core.reliability.weibull import R, F, pdf, hazard
 
-# --- Helpers robustes pour optim ---
-def _opt_interval(optim: dict | None, eq: str) -> float | None:
-    v = (optim or {}).get(eq)
-    if isinstance(v, dict):
-        return v.get("interval_opt_h")
-    try:
-        return float(v)
-    except Exception:
-        return None
 
-def _opt_R_target(optim: dict | None, eq: str, default: float = 0.80) -> float:
-    v = (optim or {}).get(eq)
-    if isinstance(v, dict):
-        return float(v.get("R_target", default))
-    return float(default)
-
-# ------------------------- UTILITAIRES -------------------------
 def _fmt(x, nd=2, dash="—"):
     try:
         if x is None:
             return dash
-        if isinstance(x, float):
-            if math.isnan(x) or math.isinf(x):
-                return dash
-            return f"{x:.{nd}f}"
-        return str(x)
+        if isinstance(x, float) and (math.isnan(x) or math.isinf(x)):
+            return dash
+        return f"{float(x):.{nd}f}"
     except Exception:
         return dash
+
 
 def _mk_table(data: List[List[Any]], col_widths=None):
     t = Table(data, colWidths=col_widths)
     t.setStyle(TableStyle([
-        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
-        ("BACKGROUND", (0,0), (-1,0), colors.whitesmoke),
-        ("ALIGN", (0,0), (-1,-1), "LEFT"),
-        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
-        ("GRID", (0,0), (-1,-1), 0.3, colors.grey),
-        ("BOTTOMPADDING", (0,0), (-1,0), 6),
-        ("TOPPADDING", (0,0), (-1,0), 6),
-        ("LEFTPADDING", (0,0), (-1,-1), 6),
-        ("RIGHTPADDING", (0,0), (-1,-1), 6),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#111827")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+
+        ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#D1D5DB")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F9FAFB")]),
+
+        ("LEFTPADDING", (0, 0), (-1, -1), 5),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
     ]))
     return t
 
+
 class _WB:
-    """Petit conteneur pour compatibilité R/F/pdf/hazard (attrs beta, eta, gamma)."""
     def __init__(self, beta: float, eta: float, gamma: float = 0.0):
         self.beta = float(beta)
         self.eta = float(eta)
         self.gamma = float(gamma or 0.0)
 
-def _dist_name(d) -> str:
-    if isinstance(d, dict):
-        return d.get("name", "Weibull2P")
-    if isinstance(d, str):
-        return d
-    return "Weibull2P"
 
-def _pipe_field(pipe: dict, path: List[str], default=None):
-    """Accès sûr aux champs dans les traces organigramme."""
-    cur = pipe or {}
-    for k in path:
-        cur = cur.get(k) if isinstance(cur, dict) else None
-        if cur is None:
-            return default
-    return cur
+def _fig_to_rl_image(fig, width_mm=170):
+    bio = BytesIO()
+    fig.savefig(bio, format="png", dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    bio.seek(0)
+    img = Image(bio)
+    w = width_mm * mm
+    ratio = img.imageHeight / max(img.imageWidth, 1)
+    img.drawWidth = w
+    img.drawHeight = w * ratio
+    return img
+
 
 def _equip_time_grid(eq: str, bundle: UnifyBundle, fit: _WB) -> np.ndarray:
-    """Grille temporelle : couvre au moins les TTF réels et ~1.5*eta."""
     try:
         ttf_eq = bundle.ttf.loc[bundle.ttf["equipment_code"] == eq, "ttf_h"]
         tmax_data = float(ttf_eq.max()) if not ttf_eq.empty else 0.0
@@ -120,238 +89,222 @@ def _equip_time_grid(eq: str, bundle: UnifyBundle, fit: _WB) -> np.ndarray:
     tmax = max(100.0, tmax_data * 1.2, fit.eta * 1.5)
     return np.linspace(0.0, tmax, 400)
 
-def _fig_to_rl_image(fig, width_cm=16.0) -> Image:
-    """Sauve une figure matplotlib en PNG mémoire puis retourne un Flowable Image."""
-    bio = BytesIO()
-    fig.savefig(bio, format="png", dpi=160, bbox_inches="tight")
-    plt.close(fig)
-    bio.seek(0)
-    img = Image(bio)
-    # Ajuste largeur, conserve le ratio
-    w = width_cm * cm
-    ratio = img.imageHeight / max(img.imageWidth, 1)
-    img.drawWidth = w
-    img.drawHeight = w * ratio
-    return img
 
-def _plot_panel_for_eq(eq: str, fit: _WB, t: np.ndarray) -> Optional[Image]:
-    """Figure 2x2 : R(t), F(t), f(t), h(t). Retourne une Image reportlab (ou None)."""
-    try:
-        yR = R(t, fit)
-        yF = F(t, fit)
-        yf = pdf(t, fit)
-        yh = hazard(t, fit)
+def _plot_panel(eq: str, fit: _WB, t: np.ndarray):
+    yR = R(t, fit)
+    yF = F(t, fit)
+    yf = pdf(t, fit)
+    yh = hazard(t, fit)
 
-        fig, axes = plt.subplots(2, 2, figsize=(10, 6))
-        axes = axes.ravel()
+    fig, axes = plt.subplots(2, 2, figsize=(10, 6))
+    axes = axes.ravel()
 
-        axes[0].plot(t, yR, linewidth=2)
-        axes[0].set_title("Fiabilité R(t)"); axes[0].set_xlabel("Temps (h)"); axes[0].set_ylabel("R(t)")
-        axes[0].grid(True, alpha=.3)
+    axes[0].plot(t, yR, linewidth=2)
+    axes[0].set_title("Fiabilité R(t)")
+    axes[0].set_xlabel("Temps (h)")
+    axes[0].set_ylabel("R(t)")
+    axes[0].grid(True, alpha=.3)
 
-        axes[1].plot(t, yF, linewidth=2)
-        axes[1].set_title("Répartition F(t)"); axes[1].set_xlabel("Temps (h)"); axes[1].set_ylabel("F(t)")
-        axes[1].grid(True, alpha=.3)
+    axes[1].plot(t, yF, linewidth=2)
+    axes[1].set_title("Répartition F(t)")
+    axes[1].set_xlabel("Temps (h)")
+    axes[1].set_ylabel("F(t)")
+    axes[1].grid(True, alpha=.3)
 
-        axes[2].plot(t, yf, linewidth=2)
-        axes[2].set_title("Densité f(t)"); axes[2].set_xlabel("Temps (h)"); axes[2].set_ylabel("f(t)")
-        axes[2].grid(True, alpha=.3)
+    axes[2].plot(t, yf, linewidth=2)
+    axes[2].set_title("Densité f(t)")
+    axes[2].set_xlabel("Temps (h)")
+    axes[2].set_ylabel("f(t)")
+    axes[2].grid(True, alpha=.3)
 
-        axes[3].plot(t, yh, linewidth=2)
-        axes[3].set_title("Taux de défaillance h(t)"); axes[3].set_xlabel("Temps (h)"); axes[3].set_ylabel("h(t)")
-        axes[3].grid(True, alpha=.3)
+    axes[3].plot(t, yh, linewidth=2)
+    axes[3].set_title("Taux de défaillance h(t)")
+    axes[3].set_xlabel("Temps (h)")
+    axes[3].set_ylabel("h(t)")
+    axes[3].grid(True, alpha=.3)
 
-        fig.tight_layout()
-        return _fig_to_rl_image(fig, width_cm=16.0)
-    except Exception:
-        try:
-            plt.close("all")
-        except Exception:
-            pass
-        return None
+    fig.tight_layout()
+    return _fig_to_rl_image(fig, width_mm=170)
 
 
-# ------------------------- SECTIONS PAR ÉQUIPEMENT -------------------------
-def _per_eq_section(eq: str, metrics_df: pd.DataFrame, bundle: UnifyBundle) -> List[Any]:
-    """
-    Construit les blocs pour 1 équipement :
-      - trace organigramme (résumé)
-      - tableaux d'analyse (avant / après)
-      - panneau 4 graphiques (R, F, f, h)
-    """
-    elems: List[Any] = []
+def _maintenance_type(beta: float) -> str:
+    if beta < 0.9:
+        return "Corrective + fiabilisation (jeunesse)"
+    if beta <= 1.1:
+        return "Conditionnelle / inspection (aléatoire)"
+    return "Préventive planifiée (âge) (usure)"
+
+
+def _pipe_line(pipe: dict) -> str:
+    if not isinstance(pipe, dict) or not pipe:
+        return "Trace indisponible."
+    model = pipe.get("model", "RP")
+    dist = pipe.get("distribution", "weibull_2p")
+    good = pipe.get("goodness", {}) or {}
+    tests = pipe.get("tests", {}) or {}
+    mk = tests.get("trend_mk", {}) or {}
+    dep = tests.get("dependence", {}) or {}
+    return (
+        f"TTF>0 → MK(p={_fmt(mk.get('p'),3)}, dir={mk.get('direction','none')}) "
+        f"→ Dep(r={_fmt(dep.get('r'),3)}, p={_fmt(dep.get('p'),3)}) "
+        f"→ Model={model} ; Dist={dist} ; KS p={_fmt(good.get('ks_p'),3)} ; Chi2 p={_fmt(good.get('chi2_p'),3)}"
+    )
+
+
+def _per_eq_section(eq: str, mdf: pd.DataFrame, bundle: UnifyBundle) -> List[Any]:
     styles = getSampleStyleSheet()
+    elems: List[Any] = []
 
-    elems.append(Paragraph(f"Équipement : <b>{eq}</b>", styles["Heading3"]))
-
-    row = metrics_df.loc[metrics_df["equipment_code"] == eq]
+    row = mdf.loc[mdf["equipment_code"] == eq]
     if row.empty:
-        elems.append(Paragraph("Aucune donnée exploitable pour cet équipement.", styles["Normal"]))
-        elems.append(Spacer(1, 0.3*cm))
+        elems.append(Paragraph(f"Équipement : <b>{eq}</b>", styles["Heading3"]))
+        elems.append(Paragraph("Aucune donnée exploitable.", styles["Normal"]))
         return elems
+
     r = row.iloc[0].to_dict()
+    beta = float(r.get("beta")) if r.get("beta") is not None else float("nan")
+    eta = float(r.get("eta")) if r.get("eta") is not None else float("nan")
+    gamma = float(r.get("gamma") or 0.0)
 
-    # Résumé organigramme/pipeline (si dispo)
     pipe = (bundle.pipeline_by_eq or {}).get(eq, {}) or {}
-    dist = _dist_name(pipe.get("distribution")) if pipe else "Weibull2P"
-    ks_p = _pipe_field(pipe, ["goodness", "ks_p"])
-    chi2_p = _pipe_field(pipe, ["goodness", "chi2_p"])
-    trend_name = _pipe_field(pipe, ["trend", "name"], "MK")
-    trend_p = _pipe_field(pipe, ["trend", "p_value"])
 
-    trace_line = f"TTF>0 → {trend_name}(p={_fmt(trend_p,3)}) → RP/NHPP/BPP ; Dist={dist}"
-    if ks_p is not None or chi2_p is not None:
-        trace_line += f" ; KS p={_fmt(ks_p,3)}, Chi2 p={_fmt(chi2_p,3)}"
+    # ---- Header
+    elems.append(Paragraph(f"Équipement : <b>{eq}</b>", styles["Heading2"]))
+    elems.append(Paragraph(_pipe_line(pipe), styles["Normal"]))
+    elems.append(Spacer(1, 6))
 
-    elems.append(Paragraph(f"Chaîne d'exécution — Organigramme<br/>{trace_line}", styles["Normal"]))
-    elems.append(Spacer(1, 0.2*cm))
-
-    # Tableaux AVANT / APRES
-    n_ttf = 0
+    # ---- AVANT (analyse)
     try:
         n_ttf = int(bundle.ttf.loc[bundle.ttf["equipment_code"] == eq, "ttf_h"].size)
     except Exception:
-        pass
+        n_ttf = 0
+
+    # MTTF théorique Weibull (γ + η Γ(1+1/β))
+    mttf_th = None
+    try:
+        if np.isfinite(beta) and beta > 0 and np.isfinite(eta) and eta > 0:
+            mttf_th = gamma + eta * math.gamma(1.0 + 1.0 / beta)
+    except Exception:
+        mttf_th = None
 
     avant = [
-        ["Mesure", "Valeur"],
+        ["Mesure (avant optimisation)", "Valeur"],
         ["n TTF", _fmt(n_ttf, 0)],
         ["MTBF empirique (h)", _fmt(r.get("MTBF"), 1)],
-        ["MTTF théorique (h)", _fmt(r.get("MTTF_th"), 1)],
-        ["β", _fmt(r.get("beta"), 2)],
-        ["η (h)", _fmt(r.get("eta"), 1)],
-        ["γ (h)", _fmt(r.get("gamma"), 1)],
+        ["MTTR (h)", _fmt(r.get("MTTR"), 1)],
+        ["β", _fmt(beta, 3)],
+        ["η (h)", _fmt(eta, 1)],
+        ["γ (h)", _fmt(gamma, 1)],
+        ["MTTF théorique (h)", _fmt(mttf_th, 1)],
+        ["Type maintenance (β)", _maintenance_type(beta)],
     ]
-    elems.append(_mk_table(avant, [8*cm, 8*cm]))
-    elems.append(Spacer(1, 0.2*cm))
+    elems.append(_mk_table(avant, [8.5 * cm, 8.5 * cm]))
+    elems.append(Spacer(1, 8))
 
-    # ...
-    rstar = _opt_R_target(bundle.optim, eq, 0.80)
-    mtbf_opt = r.get("MTBF_opt")
-    if (mtbf_opt is None or (isinstance(mtbf_opt, float) and math.isnan(mtbf_opt))):
-        # fallback possible : intervalle optimisé
-        mtbf_opt = r.get("interval_opt_h", _opt_interval(bundle.optim, eq))
-    
+    # ---- APRÈS (optimisation)
+    interval_opt = r.get("interval_opt_h")
+    if interval_opt is None or (isinstance(interval_opt, float) and math.isnan(interval_opt)):
+        # fallback propose_intervals
+        try:
+            interval_opt = (bundle.optim or {}).get(eq, {}).get("interval_opt_h")
+        except Exception:
+            interval_opt = None
+
     apres = [
-        ["Paramètre", "Valeur"],
-        ["Intervalle optimisé (h)", _fmt(r.get("interval_opt_h", _opt_interval(bundle.optim, eq)), 1)],
-        ["Fiabilité cible R*", _fmt(rstar, 2)],
-        ["MTBF optimisé (h)", _fmt(mtbf_opt, 1)],
+        ["Mesure (après optimisation)", "Valeur"],
+        ["Intervalle optimisé (h)", _fmt(interval_opt, 1)],
+        ["R* (fiabilité cible)", _fmt(getattr(bundle, "R_target", None) or "", 2)],  # affichage tolérant
+        ["MTBF optimisé (h)", _fmt(r.get("MTBF_opt"), 1)],
         ["MTTR optimisé (h)", _fmt(r.get("MTTR_opt"), 1)],
     ]
-    # ...
-    
-    elems.append(_mk_table(apres, [8*cm, 8*cm]))
-    elems.append(Spacer(1, 0.25*cm))
+    elems.append(_mk_table(apres, [8.5 * cm, 8.5 * cm]))
+    elems.append(Spacer(1, 10))
 
-    # Graphiques (2x2)
+    # ---- Courbes (R,F,f,h)
     try:
-        # fit = _WB depuis les β/η/γ du bundle (cohérence totale)
-        beta = float(r.get("beta"))
-        eta  = float(r.get("eta"))
-        gamma = float(r.get("gamma") or 0.0)
-        fit = _WB(beta, eta, gamma)
+        fit = _WB(beta=float(beta), eta=float(eta), gamma=float(gamma))
         t = _equip_time_grid(eq, bundle, fit)
-        panel_img = _plot_panel_for_eq(eq, fit, t)
-        if panel_img is not None:
-            elems.append(panel_img)
-            elems.append(Spacer(1, 0.35*cm))
+        elems.append(_plot_panel(eq, fit, t))
     except Exception:
         pass
 
+    elems.append(Spacer(1, 10))
     return elems
 
 
-# ------------------------- EXPORT PDF PRINCIPAL -------------------------
 def export_merged_report_pdf(
     df: Optional[pd.DataFrame] = None,
-    fits: Optional[Dict[str, Any]] = None,              # ignorés si df fourni
-    pipeline_by_eq: Optional[Dict[str, Dict[str, Any]]] = None,  # idem
-    optim_intervals: Optional[Dict[str, Dict[str, Any]]] = None, # idem
-    metrics_table: Optional[List[Dict[str, Any]]] = None,        # idem
     out_dir: str = "reports",
     title: str = "Rapport complet — Analyse & Optimisation",
     options: Optional[UnifyOptions] = None,
 ) -> str:
-    """
-    Génére un PDF consolidé à partir de la vérité unique (compute_bundle):
-      - β/η/γ + KPI (MTBF, MTTF_th) + interval_opt + MTBF_opt (fallback sur intervalle)
-      - Organigramme résumé
-      - Panneau 4 graphes (R, F, f, h) par équipement
-      - Récap global
-    Les arguments fits/pipeline/optim/metrics sont ignorés si 'df' est fourni :
-    on reconstruit tout depuis compute_bundle pour la cohérence.
-    """
+    if not HAVE_REPORTLAB:
+        raise RuntimeError("ReportLab non disponible. Installe: pip install reportlab")
+
     opt = options or UnifyOptions(force_weibull_2p=True, R_target=0.80)
     bundle = compute_bundle(session_df=df, options=opt)
 
     if bundle.metrics_df.empty:
         raise RuntimeError("Aucune métrique exploitable pour générer le rapport.")
 
-    # Compléter MTTF_th si absent, et normaliser MTBF_opt
-    mdf = bundle.metrics_df.copy()
-    if "MTTF_th" not in mdf.columns:
-        mdf["MTTF_th"] = None
-    for i, row in mdf.iterrows():
-        b = row.get("beta"); e = row.get("eta"); g = row.get("gamma", 0.0)
-        try:
-            mdf.at[i, "MTTF_th"] = float(g) + float(e) * math.gamma(1.0 + 1.0/float(b))
-        except Exception:
-            mdf.at[i, "MTTF_th"] = None
-        if pd.isna(row.get("MTBF_opt")) and not pd.isna(row.get("interval_opt_h")):
-            mdf.at[i, "MTBF_opt"] = row.get("interval_opt_h")
-
-    # Création PDF
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    fname = f"report_analyse_optim_{datetime.now().strftime('%Y%m%d-%H%M')}.pdf"
-    fpath = out / fname
+    fpath = out / f"report_analyse_optim_{datetime.now().strftime('%Y%m%d-%H%M')}.pdf"
 
-    doc = SimpleDocTemplate(str(fpath), pagesize=A4,
-                            rightMargin=1.5*cm, leftMargin=1.5*cm,
-                            topMargin=1.5*cm, bottomMargin=1.5*cm)
+    doc = SimpleDocTemplate(
+        str(fpath),
+        pagesize=A4,
+        rightMargin=14 * mm,
+        leftMargin=14 * mm,
+        topMargin=16 * mm,
+        bottomMargin=14 * mm,
+    )
     styles = getSampleStyleSheet()
     story: List[Any] = []
 
-    # En-tête
+    # ---- Couverture
     story.append(Paragraph(title, styles["Title"]))
     story.append(Paragraph(datetime.now().strftime("%d/%m/%Y %H:%M"), styles["Normal"]))
-    story.append(Spacer(1, 0.5*cm))
+    story.append(Spacer(1, 10))
 
-    # Sections par équipement
+    # ---- Récap synthèse global
+    mdf = bundle.metrics_df.copy()
     eqs = sorted(mdf["equipment_code"].dropna().astype(str).unique().tolist())
-    for k, eq in enumerate(eqs):
-        story.extend(_per_eq_section(eq, mdf, bundle))
-        if k < len(eqs) - 1:
-            story.append(PageBreak())
 
-    # Récap global
-    story.append(Paragraph("Récapitulatif global", styles["Heading2"]))
-    head = ["Équipement", "β", "η (h)", "γ (h)", "Intervalle opt (h)",
-            "n TTF", "MTBF mesuré (h)", "MTTF théorique (h)", "MTBF optimisé (h)"]
+    story.append(Paragraph("Synthèse globale", styles["Heading2"]))
+    story.append(Paragraph(f"Nombre d’équipements : {len(eqs)}", styles["Normal"]))
+    story.append(Paragraph(f"Nombre d’observations TTF : {int(bundle.ttf.shape[0])}", styles["Normal"]))
+    story.append(Spacer(1, 8))
+
+    head = ["Équipement", "n TTF", "β", "η(h)", "γ(h)", "MTBF(h)", "Intervalle opt(h)", "Type maintenance", "Modèle", "Loi"]
     rows = [head]
-    for _, r in mdf.sort_values("equipment_code").iterrows():
+    for eq in eqs:
+        r = mdf.loc[mdf["equipment_code"] == eq].iloc[0].to_dict()
         try:
-            n_ttf = bundle.ttf.loc[bundle.ttf["equipment_code"] == r["equipment_code"], "ttf_h"].size
+            n_ttf = int(bundle.ttf.loc[bundle.ttf["equipment_code"] == eq, "ttf_h"].size)
         except Exception:
             n_ttf = 0
+        pipe = (bundle.pipeline_by_eq or {}).get(eq, {}) or {}
         rows.append([
-            str(r.get("equipment_code")),
-            _fmt(r.get("beta"), 2),
+            eq,
+            _fmt(n_ttf, 0),
+            _fmt(r.get("beta"), 3),
             _fmt(r.get("eta"), 1),
             _fmt(r.get("gamma"), 1),
-            _fmt(r.get("interval_opt_h"), 1),
-            _fmt(n_ttf, 0),
             _fmt(r.get("MTBF"), 1),
-            _fmt(r.get("MTTF_th"), 1),
-            _fmt(r.get("MTBF_opt"), 1),
+            _fmt(r.get("interval_opt_h"), 1),
+            _maintenance_type(float(r.get("beta")) if r.get("beta") is not None else float("nan")),
+            str(pipe.get("model", "RP")),
+            str(pipe.get("distribution", "weibull_2p")),
         ])
-    story.append(_mk_table(rows, [3.0*cm, 2.0*cm, 2.0*cm, 2.0*cm, 3.0*cm, 1.7*cm, 3.2*cm, 3.0*cm, 3.2*cm]))
-    story.append(Spacer(1, 0.3*cm))
-    story.append(Paragraph(
-        "Rapport généré automatiquement (bundle unifié : β/η/γ et KPI identiques partout).",
-        styles["Italic"])
-    )
+    story.append(_mk_table(rows, [2.7*cm, 1.4*cm, 1.3*cm, 1.5*cm, 1.5*cm, 1.8*cm, 2.2*cm, 3.0*cm, 1.6*cm, 2.0*cm]))
+    story.append(PageBreak())
+
+    # ---- Pages par équipement
+    for i, eq in enumerate(eqs):
+        story.extend(_per_eq_section(eq, mdf, bundle))
+        if i < len(eqs) - 1:
+            story.append(PageBreak())
 
     doc.build(story)
     return str(fpath)

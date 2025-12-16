@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 import math
-import io
-
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -12,22 +10,8 @@ import matplotlib.pyplot as plt
 import streamlit as st
 
 from core.security.auth import require_login
-
-# === Config page (une seule fois, tout en haut) ===
-st.set_page_config(page_title="Indicateurs", page_icon="📊", layout="wide")
-st.title("📊 Indicateurs — Fiabilité ")
-
-# === Imports fiabilité (sans unify) ===
-try:
-    from core.reliability.weibull import R, F, pdf, hazard
-    from core.reliability.organigram import analyze_ttf_pipeline
-except ImportError:
-    st.error(
-        "Modules de fiabilité introuvables (`core.reliability.weibull` ou `organigram`). "
-        "Vérifie que le dossier `core/` et `core/reliability/` sont bien présents "
-        "dans l'environnement Streamlit."
-    )
-    st.stop()
+from core.reliability.weibull import R, F, pdf, hazard, fit_weibull
+from core.reliability.organigram import analyze_ttf_pipeline
 
 # Export PDF (optionnel)
 try:
@@ -35,14 +19,17 @@ try:
 except Exception:
     export_merged_report_pdf = None
 
-# --- Auth obligatoire ---
+st.set_page_config(page_title="Indicateurs", page_icon="📊", layout="wide")
 require_login()
 
-# === Constantes ===
+st.title("📊 Indicateurs — Fiabilité")
+
+
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_FILE = BASE_DIR / "data" / "failures_saved.csv"
 
-# ---------- Helpers robustes ----------
+
+# ---------- Helpers ----------
 def _read_csv_flex(src):
     def _try_read(s, **kw):
         try:
@@ -74,54 +61,33 @@ def fnum(x, nd=2, default="—"):
     try:
         if x is None:
             return default
-        if isinstance(x, float) and (math.isnan(x) or math.isinf(x)):
+        x = float(x)
+        if math.isnan(x) or math.isinf(x):
             return default
-        return f"{float(x):.{nd}f}"
+        return f"{x:.{nd}f}"
     except Exception:
         return default
 
-def _fmt(x, fmt="{:.2f}"):
-    try:
-        return fmt.format(float(x))
-    except Exception:
-        return "—"
+def _pipeline_str(pipe: dict) -> str:
+    model = pipe.get("model", "RP")
+    dist = pipe.get("distribution", "weibull_2p")
+    mk = (pipe.get("tests", {}) or {}).get("trend_mk", {})
+    dep = (pipe.get("tests", {}) or {}).get("dependence", {})
+    good = pipe.get("goodness", {}) or {}
 
-def _safe_dict(x):
-    return x if isinstance(x, dict) else {}
-
-def _safe_get(d, path, default=None):
-    cur = d
-    for k in path:
-        if not isinstance(cur, dict):
-            return default
-        cur = cur.get(k)
-    return default if cur is None else cur
-
-def _as_dist_dict(d):
-    return d if isinstance(d, dict) else ({} if d is None else {"name": str(d)})
-
-def _pipeline_path_str(pipe: dict) -> str:
-    pipe = _safe_dict(pipe)
-    mk = _safe_dict(pipe.get("trend")) or _safe_dict(pipe.get("trend_mk"))
-    model = pipe.get("model") or "RP"
-    dist = _as_dist_dict(pipe.get("distribution")).get("name", "Weibull2P")
-    ks_p = _safe_get(pipe, ["goodness", "ks_p"])
-    chi2 = _safe_get(pipe, ["goodness", "chi2_p"])
-    pval = mk.get("p_value", mk.get("p"))
     return (
-        f"TTF>0 → MK(p={fnum(pval,3)}) → {model} ; "
-        f"Dist={dist}, KS p={fnum(ks_p,3)}, Chi2 p={fnum(chi2,3)}"
+        f"TTF>0 → MK(p={fnum(mk.get('p'),3)}, dir={mk.get('direction','none')}) "
+        f"→ Dep(r={fnum(dep.get('r'),3)}, p={fnum(dep.get('p'),3)}) "
+        f"→ Model={model} ; Dist={dist} ; KS p={fnum(good.get('ks_p'),3)} ; Chi2 p={fnum(good.get('chi2_p'),3)}"
     )
 
-# ---------- Chargement des TTF via session / fichier ----------
+
+# ---------- Chargement ----------
 if isinstance(st.session_state.get("failures_df"), pd.DataFrame):
     df_src = st.session_state["failures_df"].copy()
 else:
     if not DATA_FILE.exists():
-        st.error(
-            "Aucun fichier consolidé. "
-            "Va d’abord sur « Sources de données » et enregistre."
-        )
+        st.error("Aucun fichier consolidé. Va d’abord sur « Sources de données » et enregistre.")
         st.stop()
     df_src = _read_csv_flex(DATA_FILE)
 
@@ -139,25 +105,19 @@ if df_src.empty:
     st.error("Pas de TTF valides (>0).")
     st.stop()
 
-# ---------- Liste équipements & sélection ----------
 eqs_all = sorted(df_src["equipment_code"].unique().tolist())
-sel = st.multiselect(
-    "Équipements",
-    options=eqs_all,
-    default=eqs_all[: min(5, len(eqs_all))]
-)
+sel = st.multiselect("Équipements", options=eqs_all, default=eqs_all[: min(5, len(eqs_all))])
 if not sel:
     st.info("Sélectionne au moins un équipement.")
     st.stop()
 
-# ---------- Fit Weibull simple pour indicateurs ----------
+
+# ---------- Fit + Pipeline ----------
 class _WB:
     def __init__(self, beta, eta, gamma=0.0):
         self.beta = float(beta)
         self.eta = float(eta)
-        self.gamma = float(gamma)
-
-from core.reliability.weibull import fit_weibull
+        self.gamma = float(gamma or 0.0)
 
 fits: dict[str, _WB] = {}
 pipe_by: dict[str, dict] = {}
@@ -169,22 +129,23 @@ for eq in sel:
         continue
     try:
         wb = fit_weibull(ttfs)
-        ft = _WB(wb.beta, wb.eta, getattr(wb, "gamma", 0.0))
-        fits[eq] = ft
+        fits[eq] = _WB(wb.beta, wb.eta, getattr(wb, "gamma", 0.0))
 
-        # Organigramme complet (pipeline)
         pipe = analyze_ttf_pipeline(ttfs.tolist())
         pipe_by[eq] = pipe
 
-        # Quelques métriques de base
         mtbf = float(np.mean(ttfs))
         metrics_rows.append({
             "equipment_code": eq,
-            "n_ttf": len(ttfs),
+            "n_ttf": int(len(ttfs)),
             "MTBF": mtbf,
-            "beta": float(ft.beta),
-            "eta": float(ft.eta),
-            "gamma": float(ft.gamma),
+            "beta": float(fits[eq].beta),
+            "eta": float(fits[eq].eta),
+            "gamma": float(fits[eq].gamma),
+            "model": pipe.get("model", "?"),
+            "distribution": pipe.get("distribution", "?"),
+            "ks_p": (pipe.get("goodness", {}) or {}).get("ks_p"),
+            "chi2_p": (pipe.get("goodness", {}) or {}).get("chi2_p"),
         })
     except Exception:
         continue
@@ -193,37 +154,31 @@ if not fits:
     st.error("Pas assez de TTF (≥3) pour les équipements sélectionnés.")
     st.stop()
 
-# ---------- Domaine temporel ----------
-try:
-    tmax_src = df_src[df_src["equipment_code"].isin(sel)]["ttf_h"].max()
-    tmax = float(tmax_src)
-    if math.isnan(tmax) or tmax <= 0:
-        tmax = 1000.0
-    else:
-        tmax = max(1000.0, tmax)
-except Exception:
-    tmax = 1000.0
 
+# ---------- Domaine temps ----------
+tmax = float(df_src[df_src["equipment_code"].isin(sel)]["ttf_h"].max())
+if not np.isfinite(tmax) or tmax <= 0:
+    tmax = 1000.0
+tmax = max(1000.0, tmax)
 t = np.linspace(0, tmax, 300)
+
 
 def multi_plot(ax, fun, title, ylabel):
     for eq, ft in fits.items():
         try:
             y = fun(t, ft)
-            label = f"{eq} (β={_fmt(ft.beta,'{:.2f}')}, η={_fmt(ft.eta,'{:.1f}')} h)"
-            ax.plot(t, y, label=label, linewidth=2)
+            ax.plot(t, y, label=f"{eq} (β={ft.beta:.2f}, η={ft.eta:.1f}h)", linewidth=2)
         except Exception:
             continue
     ax.set_title(title)
     ax.set_xlabel("Temps (h)")
     ax.set_ylabel(ylabel)
     ax.grid(True, alpha=0.3)
-    ax.legend()
+    ax.legend(fontsize=8)
+
 
 # ---------- Graphiques ----------
-tabR, tabF, tabf, tabh, tabG = st.tabs(
-    ["R(t)", "F(t)", "f(t)", "h(t)", "🧭 Organigramme"]
-)
+tabR, tabF, tabf, tabh, tabG = st.tabs(["R(t)", "F(t)", "f(t)", "h(t)", "🧭 Organigramme"])
 
 with tabR:
     fig, ax = plt.subplots()
@@ -248,58 +203,44 @@ with tabh:
 with tabG:
     for eq in sel:
         with st.expander(f"Trace organigramme — {eq}", expanded=False):
-            pipe = _safe_dict(pipe_by.get(eq, {}))
+            pipe = pipe_by.get(eq, {})
             if not pipe:
                 st.info("Pas de trace disponible pour cet équipement.")
-            else:
-                dist_val = pipe.get("distribution")
-                if isinstance(dist_val, dict):
-                    dist = dist_val.get("name", "Weibull2P")
-                elif isinstance(dist_val, str):
-                    dist = dist_val
-                else:
-                    dist = "Weibull2P"
+                continue
 
-                ks_p = _safe_get(pipe, ["distribution_full", "ks_p"])
-                chi2 = _safe_get(pipe, ["distribution_full", "chi2_p"])
-                trend = (
-                    _safe_get(pipe, ["trend_mk", "name"])
-                    or "MK"
-                )
-                trend_p = _safe_get(pipe, ["trend_mk", "p"])
+            st.write(f"- Modèle: **{pipe.get('model','?')}**")
+            st.write(f"- Distribution: **{pipe.get('distribution','?')}**")
 
-                st.write(
-                    f"- Distribution: **{dist}** • KS p={fnum(ks_p,3)} "
-                    f"• Chi2 p={fnum(chi2,3)}"
-                )
-                st.write(
-                    f"- Test de tendance: **{trend}** • p={fnum(trend_p,3)}"
-                )
+            mk = (pipe.get("tests", {}) or {}).get("trend_mk", {})
+            dep = (pipe.get("tests", {}) or {}).get("dependence", {})
+            good = pipe.get("goodness", {}) or {}
+            prm = pipe.get("params", {}) or {}
 
-                st.code(_pipeline_path_str(pipe), language="text")
+            st.write(f"- MK: p={fnum(mk.get('p'),3)} • direction={mk.get('direction','none')}")
+            st.write(f"- Dépendance: r={fnum(dep.get('r'),3)} • p={fnum(dep.get('p'),3)} • méthode={dep.get('method','?')}")
+            st.write(f"- Goodness: KS p={fnum(good.get('ks_p'),3)} • Chi2 p={fnum(good.get('chi2_p'),3)} • AIC={fnum(good.get('aic'),2)}")
 
-                with st.expander("Détails bruts (JSON)", expanded=False):
-                    st.json(pipe)
+            if prm.get("beta") is not None:
+                st.write(f"- Weibull: β={fnum(prm.get('beta'),3)} • η={fnum(prm.get('eta'),1)} h • γ={fnum(prm.get('gamma'),1)}")
 
+            st.code(_pipeline_str(pipe), language="text")
+
+            with st.expander("Détails bruts (JSON)", expanded=False):
+                st.json(pipe)
+
+
+# ---------- Tableau synthèse ----------
 st.divider()
-st.subheader("📋 Tableau synthèse MTBF + β/η/γ")
+st.subheader("📋 Tableau synthèse MTBF + β/η/γ (+ modèle/loi)")
 
-dfm = pd.DataFrame(metrics_rows)
-if not dfm.empty:
-    dfm = dfm.sort_values("equipment_code").reset_index(drop=True)
-    st.dataframe(
-        dfm,
-        use_container_width=True,
-        hide_index=True,
-    )
-else:
-    st.info("Aucune métrique calculable pour les équipements sélectionnés.")
+dfm = pd.DataFrame(metrics_rows).sort_values("equipment_code").reset_index(drop=True)
+st.dataframe(dfm, use_container_width=True, hide_index=True)
 
-# ---------- Export rapport complet ----------
+
+# ---------- Export ----------
 st.divider()
-st.subheader(
-    "📄 Rapport complet (analyse + indicateurs + courbes)"
-)
+st.subheader("📄 Rapport complet (analyse + indicateurs + courbes)")
+
 if export_merged_report_pdf is None:
     st.info("Module `core.reliability.reporting_merged` non détecté.")
 else:
