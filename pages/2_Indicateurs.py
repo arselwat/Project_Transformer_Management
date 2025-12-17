@@ -16,8 +16,9 @@ from core.reliability.organigram import analyze_ttf_pipeline
 # Export PDF (optionnel)
 try:
     from core.reliability.reporting_merged import export_merged_report_pdf
-except Exception:
+except Exception as e:
     export_merged_report_pdf = None
+    st.warning(f"Import reporting_merged échoué: {e}")
 
 st.set_page_config(page_title="Indicateurs", page_icon="📊", layout="wide")
 require_login()
