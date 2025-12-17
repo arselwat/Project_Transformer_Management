@@ -256,3 +256,12 @@ else:
             st.success(f"PDF généré : {path}")
         except Exception as e:
             st.error(f"PDF : {e}")
+pdf_path = export_merged_report_pdf(df=session_df)
+
+with open(pdf_path, "rb") as f:
+    st.download_button(
+        "📥 Télécharger le rapport PDF",
+        data=f,
+        file_name=Path(pdf_path).name,
+        mime="application/pdf",
+    )
