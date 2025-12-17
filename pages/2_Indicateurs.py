@@ -18,13 +18,14 @@ try:
     from core.reliability.reporting_merged import export_merged_report_pdf
 except Exception as e:
     export_merged_report_pdf = None
-    st.warning(f"Import reporting_merged échoué: {e}")
+    _REPORT_ERR = str(e)
+else:
+    _REPORT_ERR = None
 
 st.set_page_config(page_title="Indicateurs", page_icon="📊", layout="wide")
 require_login()
 
 st.title("📊 Indicateurs — Fiabilité")
-
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_FILE = BASE_DIR / "data" / "failures_saved.csv"
@@ -58,6 +59,7 @@ def _read_csv_flex(src):
     df.columns = [str(c).strip() for c in df.columns]
     return df
 
+
 def fnum(x, nd=2, default="—"):
     try:
         if x is None:
@@ -68,6 +70,7 @@ def fnum(x, nd=2, default="—"):
         return f"{x:.{nd}f}"
     except Exception:
         return default
+
 
 def _pipeline_str(pipe: dict) -> str:
     model = pipe.get("model", "RP")
@@ -120,6 +123,7 @@ class _WB:
         self.eta = float(eta)
         self.gamma = float(gamma or 0.0)
 
+
 fits: dict[str, _WB] = {}
 pipe_by: dict[str, dict] = {}
 metrics_rows: list[dict] = []
@@ -128,6 +132,7 @@ for eq in sel:
     ttfs = df_src.loc[df_src["equipment_code"] == eq, "ttf_h"].values
     if len(ttfs) < 3:
         continue
+
     try:
         wb = fit_weibull(ttfs)
         fits[eq] = _WB(wb.beta, wb.eta, getattr(wb, "gamma", 0.0))
@@ -244,8 +249,11 @@ st.subheader("📄 Rapport complet (analyse + indicateurs + courbes)")
 
 if export_merged_report_pdf is None:
     st.info("Module `core.reliability.reporting_merged` non détecté.")
+    if _REPORT_ERR:
+        st.caption(f"Détail import: {_REPORT_ERR}")
 else:
     df_sel = df_src[df_src["equipment_code"].isin(sel)].copy()
+
     if st.button("📄 Générer rapport complet"):
         try:
             path = export_merged_report_pdf(
@@ -253,15 +261,20 @@ else:
                 out_dir=str(BASE_DIR / "reports"),
                 title="Rapport complet — Analyse & Indicateurs",
             )
+            st.session_state["last_report_path"] = path
             st.success(f"PDF généré : {path}")
         except Exception as e:
             st.error(f"PDF : {e}")
-pdf_path = export_merged_report_pdf(df=session_df)
 
-with open(pdf_path, "rb") as f:
-    st.download_button(
-        "📥 Télécharger le rapport PDF",
-        data=f,
-        file_name=Path(pdf_path).name,
-        mime="application/pdf",
-    )
+    # Download uniquement si un rapport existe déjà
+    pdf_path = st.session_state.get("last_report_path")
+    if pdf_path and Path(pdf_path).exists():
+        with open(pdf_path, "rb") as f:
+            st.download_button(
+                "📥 Télécharger le rapport PDF",
+                data=f,
+                file_name=Path(pdf_path).name,
+                mime="application/pdf",
+            )
+    else:
+        st.info("Clique sur « Générer rapport complet » pour activer le téléchargement.")
