@@ -179,7 +179,6 @@ def _per_eq_section(eq: str, mdf: pd.DataFrame, bundle: UnifyBundle) -> List[Any
     except Exception:
         n_ttf = 0
 
-    # MTTF théorique Weibull (γ + η Γ(1+1/β))
     mttf_th = None
     try:
         if np.isfinite(beta) and beta > 0 and np.isfinite(eta) and eta > 0:
@@ -204,7 +203,6 @@ def _per_eq_section(eq: str, mdf: pd.DataFrame, bundle: UnifyBundle) -> List[Any
     # ---- APRÈS (optimisation)
     interval_opt = r.get("interval_opt_h")
     if interval_opt is None or (isinstance(interval_opt, float) and math.isnan(interval_opt)):
-        # fallback propose_intervals
         try:
             interval_opt = (bundle.optim or {}).get(eq, {}).get("interval_opt_h")
         except Exception:
@@ -213,7 +211,7 @@ def _per_eq_section(eq: str, mdf: pd.DataFrame, bundle: UnifyBundle) -> List[Any
     apres = [
         ["Mesure (après optimisation)", "Valeur"],
         ["Intervalle optimisé (h)", _fmt(interval_opt, 1)],
-        ["R* (fiabilité cible)", _fmt(getattr(bundle, "R_target", None) or "", 2)],  # affichage tolérant
+        ["R* (fiabilité cible)", _fmt(getattr(bundle, "R_target", None) or "", 2)],
         ["MTBF optimisé (h)", _fmt(r.get("MTBF_opt"), 1)],
         ["MTTR optimisé (h)", _fmt(r.get("MTTR_opt"), 1)],
     ]
