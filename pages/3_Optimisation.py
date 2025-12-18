@@ -388,45 +388,38 @@ with right:
     )
 
 
-# ---------------------------
-# 10) Export PDF (robuste)
-# ---------------------------
+# ---------- Export ----------
 st.divider()
-st.subheader("📄 Rapport PDF")
+st.subheader("📄 Rapport complet (analyse + indicateurs + courbes)")
 
-st.caption(
-    "Recommandation : générer le PDF en mémoire et le proposer en téléchargement. "
-    "Si ReportLab n’est pas installé, ajoute `reportlab` dans requirements.txt."
-)
+if export_merged_report_pdf is None:
+    st.info("Module `core.reliability.reporting_merged` non détecté.")
+else:
+    df_sel = df_src[df_src["equipment_code"].isin(sel)].copy()
 
-if st.button("Générer le rapport optimisation (PDF)"):
-    try:
-        # ✅ 1) Tentative : export bytes (plus fiable sur Streamlit)
+    colA, colB = st.columns([1, 2])
+    with colA:
+        gen = st.button("📄 Générer rapport complet", use_container_width=True)
+
+    if gen:
         try:
-            from core.reliability.reporting_optimize import export_optimization_report_pdf_bytes  # à ajouter
-            pdf_bytes = export_optimization_report_pdf_bytes(df=df, df_out=df_out)
-            st.success("PDF généré avec succès ✅")
-            st.download_button(
-                "⬇️ Télécharger le PDF",
-                data=pdf_bytes,
-                file_name=f"rapport_optimisation_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
-                mime="application/pdf",
+            path = export_merged_report_pdf(
+                df=df_sel,
+                out_dir=str(BASE_DIR / "reports"),
+                title="Rapport complet — Analyse & Indicateurs",
             )
-        except Exception:
-            # ✅ 2) Fallback : ton export existant qui retourne un path
-            path = export_optimization_report_pdf(df, fits, intervals_R, org_results, out_dir="reports")
+            st.session_state["last_pdf_path"] = path
             st.success(f"PDF généré : {path}")
-            # lecture binaire pour download
-            p = Path(path)
-            if p.exists():
-                st.download_button(
-                    "⬇️ Télécharger le PDF",
-                    data=p.read_bytes(),
-                    file_name=p.name,
-                    mime="application/pdf",
-                )
-            else:
-                st.warning("Le fichier PDF n’a pas été trouvé sur disque (chemin invalide).")
-    except Exception as e:
-        st.error(f"Impossible de générer le PDF : {e}")
-        st.info("Vérifie : (1) `reportlab` installé, (2) pas de fichier local nommé reportlab.py, (3) requirements.txt à jour.")
+        except Exception as e:
+            st.error(f"PDF : {e}")
+
+    pdf_path = st.session_state.get("last_pdf_path")
+    if pdf_path and Path(pdf_path).exists():
+        with open(pdf_path, "rb") as f:
+            st.download_button(
+                "📥 Télécharger le rapport PDF",
+                data=f,
+                file_name=Path(pdf_path).name,
+                mime="application/pdf",
+                use_container_width=True,
+            )

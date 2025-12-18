@@ -20,7 +20,15 @@ try:
     from reportlab.lib import colors
     from reportlab.lib.units import cm, mm
     from reportlab.lib.styles import getSampleStyleSheet
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak, Image
+    from reportlab.platypus import (
+        SimpleDocTemplate,
+        Paragraph,
+        Spacer,
+        Table,
+        TableStyle,
+        PageBreak,
+        Image,
+    )
     HAVE_REPORTLAB = True
 except Exception:
     HAVE_REPORTLAB = False
@@ -40,23 +48,70 @@ def _fmt(x, nd=2, dash="—"):
         return dash
 
 
-def _mk_table(data: List[List[Any]], col_widths=None):
-    t = Table(data, colWidths=col_widths)
-    t.setStyle(TableStyle([
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#111827")),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+def _mk_table(data: List[List[Any]], col_widths=None, font_size=8, avail_width=None):
+    """
+    Table ReportLab robuste:
+    - wrap automatique via Paragraph
+    - scale automatique si col_widths dépasse la largeur dispo (A4)
+    - repeatRows=1 pour répéter l’en-tête si la table déborde sur plusieurs pages
+    """
+    styles = getSampleStyleSheet()
+    cell_style = styles["BodyText"]
+    cell_style.fontName = "Helvetica"
+    cell_style.fontSize = font_size
+    cell_style.leading = font_size + 2
 
-        ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#D1D5DB")),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("FONTSIZE", (0, 0), (-1, -1), 8),
-        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F9FAFB")]),
+    # wrap cellules (sauf si déjà Flowable)
+    wrapped: List[List[Any]] = []
+    for row in data:
+        new_row = []
+        for c in row:
+            if HAVE_REPORTLAB and not hasattr(c, "wrapOn"):
+                txt = "" if c is None else str(c)
+                new_row.append(Paragraph(txt, cell_style))
+            else:
+                new_row.append(c)
+        wrapped.append(new_row)
 
-        ("LEFTPADDING", (0, 0), (-1, -1), 5),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
-        ("TOPPADDING", (0, 0), (-1, -1), 4),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-    ]))
+    # largeur dispo (A4 - marges) si non fournie
+    if avail_width is None:
+        try:
+            avail_width = A4[0] - (14 * mm + 14 * mm)  # mêmes marges que le doc
+        except Exception:
+            avail_width = None
+
+    # colWidths
+    if col_widths is None and avail_width:
+        ncol = len(wrapped[0]) if wrapped else 1
+        col_widths = [avail_width / max(ncol, 1)] * ncol
+
+    # scale si trop large
+    if avail_width and col_widths:
+        total = float(sum(col_widths))
+        if total > avail_width and total > 0:
+            k = avail_width / total
+            col_widths = [w * k for w in col_widths]
+
+    t = Table(wrapped, colWidths=col_widths, repeatRows=1)
+    t.setStyle(
+        TableStyle(
+            [
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#111827")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+
+                ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#D1D5DB")),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("FONTSIZE", (0, 0), (-1, -1), font_size),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F9FAFB")]),
+
+                ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                ("TOPPADDING", (0, 0), (-1, -1), 3),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+            ]
+        )
+    )
     return t
 
 
@@ -179,6 +234,7 @@ def _per_eq_section(eq: str, mdf: pd.DataFrame, bundle: UnifyBundle) -> List[Any
     except Exception:
         n_ttf = 0
 
+    # MTTF théorique Weibull (γ + η Γ(1+1/β))
     mttf_th = None
     try:
         if np.isfinite(beta) and beta > 0 and np.isfinite(eta) and eta > 0:
@@ -211,7 +267,7 @@ def _per_eq_section(eq: str, mdf: pd.DataFrame, bundle: UnifyBundle) -> List[Any
     apres = [
         ["Mesure (après optimisation)", "Valeur"],
         ["Intervalle optimisé (h)", _fmt(interval_opt, 1)],
-        ["R* (fiabilité cible)", _fmt(getattr(bundle, "R_target", None) or "", 2)],
+        ["R* (fiabilité cible)", _fmt(getattr(bundle, "R_target", None), 2)],
         ["MTBF optimisé (h)", _fmt(r.get("MTBF_opt"), 1)],
         ["MTTR optimisé (h)", _fmt(r.get("MTTR_opt"), 1)],
     ]
@@ -239,6 +295,7 @@ def export_merged_report_pdf(
     if not HAVE_REPORTLAB:
         raise RuntimeError("ReportLab non disponible. Installe: pip install reportlab")
 
+    # options par défaut
     opt = options or UnifyOptions(force_weibull_2p=True, R_target=0.80)
     bundle = compute_bundle(session_df=df, options=opt)
 
@@ -274,6 +331,27 @@ def export_merged_report_pdf(
     story.append(Paragraph(f"Nombre d’observations TTF : {int(bundle.ttf.shape[0])}", styles["Normal"]))
     story.append(Spacer(1, 8))
 
+    # ---- Ajout : Bloc optimisation (hypothèses & paramètres)
+    story.append(Paragraph("Optimisation — Hypothèses & paramètres", styles["Heading2"]))
+
+    # On lit des attributs possibles (si tu les ajoutes dans UnifyOptions plus tard, ils s’afficheront automatiquement)
+    R_target = getattr(opt, "R_target", None)
+    C_prev = getattr(opt, "C_prev", None) or getattr(opt, "Cp", None) or getattr(opt, "cost_prev", None)
+    C_corr = getattr(opt, "C_corr", None) or getattr(opt, "Cf", None) or getattr(opt, "cost_corr", None)
+    R_min_cost = getattr(opt, "R_min_cost", None) or getattr(opt, "Rmin", None)
+
+    opt_rows = [
+        ["Paramètre", "Valeur"],
+        ["Fiabilité cible R*", _fmt(R_target, 2)],
+        ["Coût préventif Cp", _fmt(C_prev, 2)],
+        ["Coût correctif Cf", _fmt(C_corr, 2)],
+        ["Seuil R_min (optionnel)", _fmt(R_min_cost, 2)],
+        ["Modèle économique", "C(T) = (Cp·R(T) + Cf·(1−R(T))) / ∫0..T R(t) dt"],
+    ]
+    story.append(_mk_table(opt_rows, [8.5 * cm, 8.5 * cm], font_size=8))
+    story.append(Spacer(1, 10))
+
+    # ---- Table synthèse globale (protégée A4 grâce à _mk_table)
     head = ["Équipement", "n TTF", "β", "η(h)", "γ(h)", "MTBF(h)", "Intervalle opt(h)", "Type maintenance", "Modèle", "Loi"]
     rows = [head]
     for eq in eqs:
@@ -295,7 +373,15 @@ def export_merged_report_pdf(
             str(pipe.get("model", "RP")),
             str(pipe.get("distribution", "weibull_2p")),
         ])
-    story.append(_mk_table(rows, [2.7*cm, 1.4*cm, 1.3*cm, 1.5*cm, 1.5*cm, 1.8*cm, 2.2*cm, 3.0*cm, 1.6*cm, 2.0*cm]))
+
+    story.append(
+        _mk_table(
+            rows,
+            # large table → _mk_table va auto-scale si besoin
+            [2.7 * cm, 1.4 * cm, 1.3 * cm, 1.5 * cm, 1.5 * cm, 1.8 * cm, 2.2 * cm, 3.0 * cm, 1.6 * cm, 2.0 * cm],
+            font_size=7,  # un peu plus petit pour une synthèse large
+        )
+    )
     story.append(PageBreak())
 
     # ---- Pages par équipement
