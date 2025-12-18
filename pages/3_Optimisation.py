@@ -372,13 +372,31 @@ else:
     if st.button("📄 Générer rapport optimisation (PDF)"):
         try:
             out_dir = str(BASE_DIR / "reports")
+            # intervals attendu par reporting_optimize = dict[str, dict]
+# On fournit T_R, T_cost, R_at_cost, C_min pour que le PDF ait tout.
+            intervals = {}
+            for eq in fits.keys():
+                intervals[eq] = {
+                    "T_R": intervals_R.get(eq),
+                    "T_cost": intervals_cost.get(eq),
+                    "R_at_T": R_at_cost.get(eq),
+                    "C_min": C_min_map.get(eq),
+                }
+
             path = export_optimization_report_pdf(
                 df=df,
                 fits=fits,
-                intervals_R=intervals_R,
+                intervals=intervals,
                 org_results=org_results,
                 out_dir=out_dir,
+                meta={
+                    "R_target": float(R_target),
+                    "C_prev": float(C_prev),
+                    "C_corr": float(C_corr),
+                    "R_min_cost": float(R_min_cost),
+                },
             )
+
             st.session_state["opt_pdf_path"] = path
             st.success(f"PDF généré : {path}")
         except Exception as e:
