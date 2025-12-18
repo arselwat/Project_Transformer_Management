@@ -4,35 +4,36 @@ from pathlib import Path
 import math
 import numpy as np
 import pandas as pd
+import streamlit as st
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import streamlit as st
 
-from core.security.auth import require_login
-from core.reliability.weibull import R, F, pdf, hazard, fit_weibull
+from core.reliability.weibull import fit_weibull
+from core.reliability.policy import suggested_actions
 from core.reliability.organigram import analyze_ttf_pipeline
+from core.reliability.optimize import propose_intervals_cost_and_reliability
+from core.security.auth import require_login
+
 
 # ==========================
 # PDF export (SAFE IMPORT)
 # ==========================
-export_merged_report_pdf = None
+export_optimization_report_pdf = None
 _pdf_import_error = None
 try:
-    from core.reliability.reporting_merged import export_merged_report_pdf as _export
-    export_merged_report_pdf = _export
+    from core.reliability.reporting_optimize import export_optimization_report_pdf as _export_opt_pdf
+    export_optimization_report_pdf = _export_opt_pdf
 except Exception as e:
     _pdf_import_error = e
-    export_merged_report_pdf = None
+    export_optimization_report_pdf = None
 
-st.set_page_config(page_title="Indicateurs", page_icon="📊", layout="wide")
+
+st.set_page_config(page_title="Optimisation maintenance", page_icon="🧠", layout="wide")
 require_login()
 
-st.title("📊 Indicateurs — Fiabilité")
-
-BASE_DIR = Path(__file__).resolve().parents[1]
-DATA_FILE = BASE_DIR / "data" / "failures_saved.csv"
+st.title("🧠 Optimisation — Intervalles, coût & fiabilité")
 
 
 # ---------- Helpers ----------
@@ -79,210 +80,315 @@ def fnum(x, nd=2, default="—"):
         return default
 
 
-def _pipeline_str(pipe: dict) -> str:
-    model = pipe.get("model", "RP")
-    dist = pipe.get("distribution", "weibull_2p")
-    mk = (pipe.get("tests", {}) or {}).get("trend_mk", {})
-    dep = (pipe.get("tests", {}) or {}).get("dependence", {})
-    good = pipe.get("goodness", {}) or {}
-
-    return (
-        f"TTF>0 → MK(p={fnum(mk.get('p'),3)}, dir={mk.get('direction','none')}) "
-        f"→ Dep(r={fnum(dep.get('r'),3)}, p={fnum(dep.get('p'),3)}) "
-        f"→ Model={model} ; Dist={dist} ; KS p={fnum(good.get('ks_p'),3)} ; Chi2 p={fnum(good.get('chi2_p'),3)}"
-    )
+def is_pos_number(x) -> bool:
+    return isinstance(x, (int, float)) and float(x) > 0 and np.isfinite(float(x))
 
 
-# ---------- Chargement ----------
-if isinstance(st.session_state.get("failures_df"), pd.DataFrame):
-    df_src = st.session_state["failures_df"].copy()
-else:
+# ==========================
+# 1) Chargement données
+# ==========================
+BASE_DIR = Path(__file__).resolve().parents[1]
+DATA_FILE = BASE_DIR / "data" / "failures_saved.csv"
+
+src = st.radio("Source TTF", ["Fichier projet", "Uploader CSV"], horizontal=True)
+
+if src == "Fichier projet":
     if not DATA_FILE.exists():
-        st.error("Aucun fichier consolidé. Va d’abord sur « Sources de données » et enregistre.")
+        st.error("Aucun fichier data/failures_saved.csv — va dans « Sources de données » pour enregistrer.")
         st.stop()
-    df_src = _read_csv_flex(DATA_FILE)
+    df = _read_csv_flex(DATA_FILE)
+else:
+    up = st.file_uploader("CSV (equipment_code, ttf_h)", type=["csv"])
+    if up is None:
+        st.stop()
+    df = _read_csv_flex(up)
 
-df_src.columns = [c.strip() for c in df_src.columns]
-if "equipment_code" not in df_src.columns or "ttf_h" not in df_src.columns:
-    st.error("Le jeu doit contenir: equipment_code, ttf_h.")
+if df.empty:
+    st.error("CSV vide ou illisible.")
     st.stop()
 
-df_src["equipment_code"] = df_src["equipment_code"].astype(str)
-df_src["ttf_h"] = pd.to_numeric(df_src["ttf_h"], errors="coerce")
-df_src = df_src.dropna(subset=["ttf_h"])
-df_src = df_src[df_src["ttf_h"] > 0]
-
-if df_src.empty:
-    st.error("Pas de TTF valides (>0).")
+required = {"equipment_code", "ttf_h"}
+if not required.issubset(set(df.columns)):
+    st.error("Colonnes requises: equipment_code, ttf_h")
     st.stop()
 
-eqs_all = sorted(df_src["equipment_code"].unique().tolist())
-sel = st.multiselect("Équipements", options=eqs_all, default=eqs_all[: min(5, len(eqs_all))])
-if not sel:
-    st.info("Sélectionne au moins un équipement.")
+df["equipment_code"] = df["equipment_code"].astype(str)
+df["ttf_h"] = pd.to_numeric(df["ttf_h"], errors="coerce")
+df = df.dropna(subset=["ttf_h"])
+df = df[df["ttf_h"] > 0]
+
+eqs = sorted(df["equipment_code"].unique().tolist())
+if not eqs:
+    st.error("Aucun équipement valide (TTF>0).")
     st.stop()
 
 
-# ---------- Fit + Pipeline ----------
-class _WB:
-    def __init__(self, beta, eta, gamma=0.0):
-        self.beta = float(beta)
-        self.eta = float(eta)
-        self.gamma = float(gamma or 0.0)
-
-
-fits: dict[str, _WB] = {}
-pipe_by: dict[str, dict] = {}
-metrics_rows: list[dict] = []
-
-for eq in sel:
-    ttfs = df_src.loc[df_src["equipment_code"] == eq, "ttf_h"].values
-    if len(ttfs) < 3:
-        continue
-    try:
-        wb = fit_weibull(ttfs)
-        fits[eq] = _WB(wb.beta, wb.eta, getattr(wb, "gamma", 0.0))
-
-        pipe = analyze_ttf_pipeline(ttfs.tolist())
-        pipe_by[eq] = pipe
-
-        mtbf = float(np.mean(ttfs))
-        metrics_rows.append({
-            "equipment_code": eq,
-            "n_ttf": int(len(ttfs)),
-            "MTBF": mtbf,
-            "beta": float(fits[eq].beta),
-            "eta": float(fits[eq].eta),
-            "gamma": float(fits[eq].gamma),
-            "model": pipe.get("model", "?"),
-            "distribution": pipe.get("distribution", "?"),
-            "ks_p": (pipe.get("goodness", {}) or {}).get("ks_p"),
-            "chi2_p": (pipe.get("goodness", {}) or {}).get("chi2_p"),
-        })
-    except Exception:
-        continue
+# ==========================
+# 2) Fit Weibull (baseline)
+# ==========================
+fits = {}
+for eq in eqs:
+    x = df.loc[df["equipment_code"] == eq, "ttf_h"].values
+    if len(x) >= 3:
+        try:
+            fits[eq] = fit_weibull(x)
+        except Exception:
+            pass
 
 if not fits:
-    st.error("Pas assez de TTF (≥3) pour les équipements sélectionnés.")
+    st.error("Pas assez de TTF (≥3) pour estimer Weibull.")
     st.stop()
 
 
-# ---------- Domaine temps ----------
-tmax = float(df_src[df_src["equipment_code"].isin(sel)]["ttf_h"].max())
-if not np.isfinite(tmax) or tmax <= 0:
-    tmax = 1000.0
-tmax = max(1000.0, tmax)
-t = np.linspace(0, tmax, 300)
+# ==========================
+# 3) Paramètres utilisateur
+# ==========================
+st.markdown("### Paramètres de fiabilité et de coût")
+
+colR, colC1, colC2, colRmin = st.columns(4)
+with colR:
+    R_target = st.slider("Fiabilité cible R(t)", 0.50, 0.99, 0.80, 0.01)
+with colC1:
+    C_prev = st.number_input("Coût maintenance préventive (C_prev)", min_value=0.0, value=1.0, step=0.1)
+with colC2:
+    C_corr = st.number_input("Coût panne / corrective (C_corr)", min_value=0.0, value=5.0, step=0.5)
+with colRmin:
+    R_min_cost = st.slider("Fiabilité min. pour l’optimum coût", 0.0, 0.99, 0.70, 0.01)
+
+st.caption(
+    "Formule coût (politique âge) : "
+    "C(T) = (C_prev·R(T) + C_corr·(1−R(T))) / ∫₀ᵀ R(t)dt. "
+    "Le préventif est pondéré par R(T) (on ne paye pas si la panne survient avant T)."
+)
+
+econ_enabled = (C_prev > 0) and (C_corr > 0)
+if not econ_enabled:
+    st.warning("Renseigne C_prev > 0 et C_corr > 0 pour activer l’optimisation économique (T_cost).")
 
 
-def multi_plot(ax, fun, title, ylabel):
-    for eq, ft in fits.items():
-        try:
-            y = fun(t, ft)
-            ax.plot(t, y, label=f"{eq} (β={ft.beta:.2f}, η={ft.eta:.1f}h)", linewidth=2)
-        except Exception:
-            continue
-    ax.set_title(title)
-    ax.set_xlabel("Temps (h)")
-    ax.set_ylabel(ylabel)
-    ax.grid(True, alpha=0.3)
-    ax.legend(fontsize=8)
+# ==========================
+# 4) Organigramme (par équipement)
+# ==========================
+org_results: dict[str, dict] = {}
+for eq in fits.keys():
+    ttf = df.loc[df["equipment_code"] == eq, "ttf_h"].tolist()
+    try:
+        org_results[eq] = analyze_ttf_pipeline(ttf)
+    except Exception:
+        org_results[eq] = {}
 
 
-# ---------- Graphiques ----------
-tabR, tabF, tabf, tabh, tabG = st.tabs(["R(t)", "F(t)", "f(t)", "h(t)", "🧭 Organigramme"])
+# ==========================
+# 5) Intervalles coût + fiabilité
+# ==========================
+res_all = {}
+if econ_enabled:
+    res_all = propose_intervals_cost_and_reliability(
+        fits=fits,
+        C_prev=float(C_prev),
+        C_corr=float(C_corr),
+        R_target=float(R_target),
+        R_min_cost=float(R_min_cost),
+    )
 
-with tabR:
-    fig, ax = plt.subplots()
-    multi_plot(ax, R, "Fiabilité R(t)", "R(t)")
-    st.pyplot(fig, clear_figure=True)
-
-with tabF:
-    fig, ax = plt.subplots()
-    multi_plot(ax, F, "Répartition F(t)", "F(t)")
-    st.pyplot(fig, clear_figure=True)
-
-with tabf:
-    fig, ax = plt.subplots()
-    multi_plot(ax, pdf, "Densité f(t)", "f(t)")
-    st.pyplot(fig, clear_figure=True)
-
-with tabh:
-    fig, ax = plt.subplots()
-    multi_plot(ax, hazard, "Taux de défaillance h(t)", "h(t)")
-    st.pyplot(fig, clear_figure=True)
-
-with tabG:
-    for eq in sel:
-        with st.expander(f"Trace organigramme — {eq}", expanded=False):
-            pipe = pipe_by.get(eq, {})
-            if not pipe:
-                st.info("Pas de trace disponible pour cet équipement.")
-                continue
-
-            st.write(f"- Modèle: **{pipe.get('model','?')}**")
-            st.write(f"- Distribution: **{pipe.get('distribution','?')}**")
-
-            mk = (pipe.get("tests", {}) or {}).get("trend_mk", {})
-            dep = (pipe.get("tests", {}) or {}).get("dependence", {})
-            good = pipe.get("goodness", {}) or {}
-            prm = pipe.get("params", {}) or {}
-
-            st.write(f"- MK: p={fnum(mk.get('p'),3)} • direction={mk.get('direction','none')}")
-            st.write(f"- Dépendance: r={fnum(dep.get('r'),3)} • p={fnum(dep.get('p'),3)} • méthode={dep.get('method','?')}")
-            st.write(f"- Goodness: KS p={fnum(good.get('ks_p'),3)} • Chi2 p={fnum(good.get('chi2_p'),3)} • AIC={fnum(good.get('aic'),2)}")
-
-            if prm.get("beta") is not None:
-                st.write(f"- Weibull: β={fnum(prm.get('beta'),3)} • η={fnum(prm.get('eta'),1)} h • γ={fnum(prm.get('gamma'),1)}")
-
-            st.code(_pipeline_str(pipe), language="text")
-
-            with st.expander("Détails bruts (JSON)", expanded=False):
-                st.json(pipe)
+intervals_R = {eq: (res_all.get(eq) or {}).get("T_R") for eq in fits.keys()}
+intervals_cost = {eq: (res_all.get(eq) or {}).get("T_cost") for eq in fits.keys()}
+R_at_cost = {eq: (res_all.get(eq) or {}).get("R_at_T") for eq in fits.keys()}
+C_min_map = {eq: (res_all.get(eq) or {}).get("C_min") for eq in fits.keys()}
 
 
-# ---------- Tableau synthèse ----------
+# ==========================
+# 6) Recommandations
+# ==========================
+def recommend_maintenance(beta: float, model: str | None = None) -> str:
+    if beta < 0.9:
+        return "Corrective + fiabilisation (pannes de jeunesse)"
+    if 0.9 <= beta <= 1.1:
+        return "Conditionnelle / inspection (pannes aléatoires)"
+    if model and "NHPP" in str(model).upper():
+        return "Préventive planifiée (bloc/inspection) — vieillissement"
+    return "Préventive planifiée (âge) — usure / vieillissement"
+
+
+def recommend_interval(beta: float, T_cost: float | None, T_R: float | None) -> float | None:
+    # si pas en usure => pas de périodicité stricte
+    if beta <= 1.1:
+        return None
+    vals = [v for v in [T_cost, T_R] if is_pos_number(v)]
+    return float(min(vals)) if vals else None
+
+
+# ==========================
+# 7) Tableau synthèse + CSV
+# ==========================
+rows = []
+for eq, ft in fits.items():
+    org = org_results.get(eq, {}) or {}
+    beta = float(getattr(ft, "beta", float("nan")))
+    eta = float(getattr(ft, "eta", float("nan")))
+    gamma = float(getattr(ft, "gamma", 0.0) or 0.0)
+
+    itv_R = intervals_R.get(eq)
+    itv_C = intervals_cost.get(eq)
+    R_cost = R_at_cost.get(eq)
+    C_min = C_min_map.get(eq)
+
+    maint_type = recommend_maintenance(beta, org.get("model"))
+    T_rec = recommend_interval(beta, itv_C, itv_R)
+
+    rows.append({
+        "equipment_code": eq,
+        "beta": round(beta, 3) if np.isfinite(beta) else None,
+        "eta_h": round(eta, 1) if np.isfinite(eta) else None,
+        "gamma_h": round(gamma, 1) if np.isfinite(gamma) else 0.0,
+
+        "T_cost_h": round(float(itv_C), 1) if is_pos_number(itv_C) else None,
+        "R(T_cost)": round(float(R_cost), 3) if is_pos_number(R_cost) else None,
+        "C_min_per_h": round(float(C_min), 4) if is_pos_number(C_min) else None,
+
+        "T_R_h": round(float(itv_R), 1) if is_pos_number(itv_R) else None,
+
+        "T_recommended_h": round(float(T_rec), 1) if is_pos_number(T_rec) else None,
+        "maintenance_type": maint_type,
+
+        "model": org.get("model", "?"),
+        "distribution": org.get("distribution", "?"),
+    })
+
+df_out = pd.DataFrame(rows).sort_values("equipment_code").reset_index(drop=True)
+
+st.subheader("📋 Synthèse optimisation (coût, fiabilité, recommandation)")
+st.dataframe(df_out, use_container_width=True, hide_index=True)
+
+csv_bytes = df_out.to_csv(index=False).encode("utf-8")
+st.download_button(
+    "⬇️ Télécharger CSV optimisé",
+    data=csv_bytes,
+    file_name="optimisation_intervalles.csv",
+    mime="text/csv",
+)
+
+
+# ==========================
+# 8) Courbes R(t) (Weibull)
+# ==========================
+st.subheader("📈 Courbes R(t) (Weibull)")
+
+# tmax raisonnable: basé sur max(eta) et max(T_R/T_cost) si dispo
+etas = [float(getattr(ft, "eta", 1.0) or 1.0) for ft in fits.values()]
+tmax = max(etas) * 1.6 if etas else 1000.0
+
+maybe_itv = []
+for eq in fits.keys():
+    if is_pos_number(intervals_R.get(eq)):
+        maybe_itv.append(float(intervals_R[eq]))
+    if is_pos_number(intervals_cost.get(eq)):
+        maybe_itv.append(float(intervals_cost[eq]))
+if maybe_itv:
+    tmax = max(tmax, max(maybe_itv) * 1.2)
+
+t = np.linspace(0, max(tmax, 1.0), 350)
+
+fig, ax = plt.subplots()
+for eq, ft in fits.items():
+    beta = float(getattr(ft, "beta", 1.0))
+    eta = float(getattr(ft, "eta", 1.0))
+    gamma = float(getattr(ft, "gamma", 0.0) or 0.0)
+
+    # Weibull 3p: R(t)=1 si t<=gamma, sinon exp(-((t-gamma)/eta)^beta)
+    y = np.ones_like(t, dtype=float)
+    mask = t > gamma
+    y[mask] = np.exp(-(((t[mask] - gamma) / max(eta, 1e-9)) ** max(beta, 1e-9)))
+
+    ax.plot(t, y, linewidth=2, label=f"{eq} (β={beta:.2f}, η={eta:.1f}, γ={gamma:.1f})")
+
+ax.grid(True, alpha=.3)
+ax.set_xlabel("Temps (h)")
+ax.set_ylabel("R(t)")
+ax.set_title("Fiabilité R(t)")
+ax.legend(fontsize=8)
+st.pyplot(fig, clear_figure=True)
+
+
+# ==========================
+# 9) Détails & interprétation
+# ==========================
+st.subheader("🔎 Détails & interprétation")
+
+sel_eq = st.selectbox("Équipement", options=df_out["equipment_code"].tolist())
+row = df_out[df_out["equipment_code"] == sel_eq].iloc[0].to_dict()
+ft = fits[sel_eq]
+org = (org_results.get(sel_eq, {}) or {})
+
+beta = float(getattr(ft, "beta", float("nan")))
+eta = float(getattr(ft, "eta", float("nan")))
+gamma = float(getattr(ft, "gamma", 0.0) or 0.0)
+
+itv_R = intervals_R.get(sel_eq)
+itv_C = intervals_cost.get(sel_eq)
+R_cost = R_at_cost.get(sel_eq)
+C_min = C_min_map.get(sel_eq)
+
+st.markdown(
+    f"### Résultats — **{sel_eq}**\n"
+    f"- **β (forme)** = **{fnum(beta,3)}** → tendance du taux de panne (jeunesse / aléatoire / usure)\n"
+    f"- **η (échelle)** = **{fnum(eta,1)} h** → temps caractéristique\n"
+    f"- **γ (décalage)** = **{fnum(gamma,1)} h** → délai sans panne (si modèle 3p)\n"
+    f"- **T_cost** = **{fnum(itv_C,1)} h** → optimum économique (si coûts valides)\n"
+    f"- **R(T_cost)** = **{fnum(R_cost,3)}** → fiabilité au moment de l’optimum économique\n"
+    f"- **C_min** = **{fnum(C_min,4)} /h** → coût moyen minimal par heure\n"
+    f"- **T_R** = **{fnum(itv_R,1)} h** → seuil calendaire pour **R_target={R_target:.2f}**\n"
+    f"- **Maintenance recommandée** : **{row.get('maintenance_type','—')}**\n"
+)
+
+if is_pos_number(row.get("T_recommended_h")):
+    st.markdown(f"- **Intervalle recommandé** : **{row['T_recommended_h']:.1f} h** (compromis prudent)")
+else:
+    st.markdown("- **Intervalle recommandé** : basé sur l’état/inspection (pas de périodicité stricte)")
+
+st.caption(
+    "Note: T_cost est économique, T_R est orienté fiabilité. "
+    "Sur un équipement critique, on privilégie souvent T_R ou on impose une fiabilité minimale élevée."
+)
+
+st.write(f"Modèle global (organigramme): **{org.get('model','?')}** • Distribution: **{org.get('distribution','?')}**")
+
+st.markdown("#### Actions suggérées (selon β)")
+for a in suggested_actions(beta if np.isfinite(beta) else 1.0):
+    st.markdown(f"- {a}")
+
+
+# ==========================
+# 10) Export PDF + Download
+# ==========================
 st.divider()
-st.subheader("📋 Tableau synthèse MTBF + β/η/γ (+ modèle/loi)")
+st.subheader("📄 Rapport PDF — Optimisation")
 
-dfm = pd.DataFrame(metrics_rows).sort_values("equipment_code").reset_index(drop=True)
-st.dataframe(dfm, use_container_width=True, hide_index=True)
-
-
-# ---------- Export PDF ----------
-st.divider()
-st.subheader("📄 Rapport complet (analyse + indicateurs + courbes)")
-
-if export_merged_report_pdf is None:
-    st.info("Module `core.reliability.reporting_merged` non détecté.")
+if export_optimization_report_pdf is None:
+    st.info("Module `core.reliability.reporting_optimize` non détecté.")
     if _pdf_import_error is not None:
         st.caption(f"Détail import: {_pdf_import_error}")
 else:
-    df_sel = df_src[df_src["equipment_code"].isin(sel)].copy()
-
-    colA, colB = st.columns([1, 1])
-    with colA:
-        out_dir = str(BASE_DIR / "reports")
-    with colB:
-        report_title = "Rapport complet — Analyse & Indicateurs"
-
-    if st.button("📄 Générer rapport complet"):
+    if st.button("📄 Générer rapport optimisation (PDF)"):
         try:
-            path = export_merged_report_pdf(
-                df=df_sel,
+            out_dir = str(BASE_DIR / "reports")
+            path = export_optimization_report_pdf(
+                df=df,
+                fits=fits,
+                intervals_R=intervals_R,
+                org_results=org_results,
                 out_dir=out_dir,
-                title=report_title,
             )
-            st.session_state["pdf_path"] = path
+            st.session_state["opt_pdf_path"] = path
             st.success(f"PDF généré : {path}")
         except Exception as e:
             st.error(f"PDF : {e}")
 
-    pdf_path = st.session_state.get("pdf_path")
+    pdf_path = st.session_state.get("opt_pdf_path")
     if pdf_path and Path(pdf_path).exists():
         with open(pdf_path, "rb") as f:
             st.download_button(
-                "📥 Télécharger le rapport PDF",
+                "📥 Télécharger le PDF optimisation",
                 data=f,
                 file_name=Path(pdf_path).name,
                 mime="application/pdf",
