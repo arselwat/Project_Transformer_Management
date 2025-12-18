@@ -211,7 +211,6 @@ def recommend_maintenance(beta: float, model: str | None = None) -> str:
 
 
 def recommend_interval(beta: float, T_cost: float | None, T_R: float | None) -> float | None:
-    # si pas en usure => pas de périodicité stricte
     if beta <= 1.1:
         return None
     vals = [v for v in [T_cost, T_R] if is_pos_number(v)]
@@ -274,7 +273,6 @@ st.download_button(
 # ==========================
 st.subheader("📈 Courbes R(t) (Weibull)")
 
-# tmax raisonnable: basé sur max(eta) et max(T_R/T_cost) si dispo
 etas = [float(getattr(ft, "eta", 1.0) or 1.0) for ft in fits.values()]
 tmax = max(etas) * 1.6 if etas else 1000.0
 
@@ -295,11 +293,9 @@ for eq, ft in fits.items():
     eta = float(getattr(ft, "eta", 1.0))
     gamma = float(getattr(ft, "gamma", 0.0) or 0.0)
 
-    # Weibull 3p: R(t)=1 si t<=gamma, sinon exp(-((t-gamma)/eta)^beta)
     y = np.ones_like(t, dtype=float)
     mask = t > gamma
     y[mask] = np.exp(-(((t[mask] - gamma) / max(eta, 1e-9)) ** max(beta, 1e-9)))
-
     ax.plot(t, y, linewidth=2, label=f"{eq} (β={beta:.2f}, η={eta:.1f}, γ={gamma:.1f})")
 
 ax.grid(True, alpha=.3)
@@ -335,7 +331,7 @@ st.markdown(
     f"- **η (échelle)** = **{fnum(eta,1)} h** → temps caractéristique\n"
     f"- **γ (décalage)** = **{fnum(gamma,1)} h** → délai sans panne (si modèle 3p)\n"
     f"- **T_cost** = **{fnum(itv_C,1)} h** → optimum économique (si coûts valides)\n"
-    f"- **R(T_cost)** = **{fnum(R_cost,3)}** → fiabilité au moment de l’optimum économique\n"
+    f"- **R(T_cost)** = **{fnum(R_cost,3)}** → fiabilité à l’optimum économique\n"
     f"- **C_min** = **{fnum(C_min,4)} /h** → coût moyen minimal par heure\n"
     f"- **T_R** = **{fnum(itv_R,1)} h** → seuil calendaire pour **R_target={R_target:.2f}**\n"
     f"- **Maintenance recommandée** : **{row.get('maintenance_type','—')}**\n"
@@ -372,8 +368,9 @@ else:
     if st.button("📄 Générer rapport optimisation (PDF)"):
         try:
             out_dir = str(BASE_DIR / "reports")
+
             # intervals attendu par reporting_optimize = dict[str, dict]
-# On fournit T_R, T_cost, R_at_cost, C_min pour que le PDF ait tout.
+            # On fournit T_R, T_cost, R_at_T, C_min pour que le PDF ait tout.
             intervals = {}
             for eq in fits.keys():
                 intervals[eq] = {
@@ -383,18 +380,12 @@ else:
                     "C_min": C_min_map.get(eq),
                 }
 
+            # ✅ Appel compatible: PAS de org_results, PAS de meta
             path = export_optimization_report_pdf(
                 df=df,
                 fits=fits,
                 intervals=intervals,
-                org_results=org_results,
                 out_dir=out_dir,
-                meta={
-                    "R_target": float(R_target),
-                    "C_prev": float(C_prev),
-                    "C_corr": float(C_corr),
-                    "R_min_cost": float(R_min_cost),
-                },
             )
 
             st.session_state["opt_pdf_path"] = path
