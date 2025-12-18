@@ -369,8 +369,7 @@ else:
         try:
             out_dir = str(BASE_DIR / "reports")
 
-            # intervals attendu par reporting_optimize = dict[str, dict]
-            # On fournit T_R, T_cost, R_at_T, C_min pour que le PDF ait tout.
+            # intervals attendu = dict[str, dict]
             intervals = {}
             for eq in fits.keys():
                 intervals[eq] = {
@@ -380,11 +379,12 @@ else:
                     "C_min": C_min_map.get(eq),
                 }
 
-            # ✅ Appel compatible: PAS de org_results, PAS de meta
+            # ✅ organigram_by_eq obligatoire (positional ou keyword exact)
             path = export_optimization_report_pdf(
-                df=df,
-                fits=fits,
-                intervals=intervals,
+                df,
+                fits,
+                intervals,
+                org_results,     # <- organigram_by_eq (obligatoire)
                 out_dir=out_dir,
             )
 
