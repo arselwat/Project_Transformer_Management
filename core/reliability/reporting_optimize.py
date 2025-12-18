@@ -32,8 +32,6 @@ try:
     HAVE_REPORTLAB = True
 except Exception:
     HAVE_REPORTLAB = False
-
-
 # ------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------
@@ -48,8 +46,6 @@ def _san(s: Any) -> str:
         .replace("—", "-")
         .replace("\u00A0", " ")
     )
-
-
 def _safe_float(x: Any) -> Optional[float]:
     try:
         v = float(x)
@@ -58,23 +54,17 @@ def _safe_float(x: Any) -> Optional[float]:
         return v
     except Exception:
         return None
-
-
 def _fmt(x: Any, nd: int = 2, dash: str = "—") -> str:
     v = _safe_float(x)
     if v is None:
         return dash
     return f"{v:.{nd}f}"
-
-
 def _require_reportlab():
     if not HAVE_REPORTLAB:
         raise RuntimeError(
             "ReportLab n’est pas disponible. Ajoute `reportlab` dans requirements.txt "
             "ou installe-le: pip install reportlab. Ensuite relance l’application."
         )
-
-
 def _plot_R_curves_png(fits: Dict[str, Any], out_png: Path) -> Optional[str]:
     """
     Courbes R(t).
@@ -153,7 +143,7 @@ def _mk_table(
     tbl = Table(wrapped, colWidths=col_widths, repeatRows=1 if repeat_header else 0)
 
     tbl.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#111827")),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#96AEE4")),
         ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
         ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
         ("FONTSIZE", (0, 0), (-1, 0), 9),
