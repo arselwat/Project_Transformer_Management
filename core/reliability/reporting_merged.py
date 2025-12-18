@@ -97,7 +97,7 @@ def _mk_table(data: List[List[Any]], col_widths=None, font_size=8, avail_width=N
         TableStyle(
             [
                 ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#111827")),
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#7390CF")),
                 ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
 
                 ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#D1D5DB")),
