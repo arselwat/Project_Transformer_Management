@@ -153,25 +153,49 @@ with tab_stock:
 
     parts, by_code = _ensure_spares_exist()
 
-    # Construire la liste affichée (priorité aux SPARE_PARTS)
+    # 1) Construire rows
     rows = []
-    for sp in SPARE_PARTS:
-        if not isinstance(sp, dict):
-            continue
-        code = str(sp.get("code") or "").strip()
-        if not code:
-            continue
-        base = by_code.get(code, {})
-        rows.append({
-            "code": code,
-            "nom": sp.get("piece", "") or base.get("nom", ""),
-            "famille": sp.get("categorie", "") or base.get("famille", ""),
-            "quantite_dispo": int(base.get("quantite_dispo", 0) or 0),
-            "seuil_min": int(base.get("seuil_min", 0) or 0),
-            "criticite": sp.get("criticite", ""),
-        })
 
+    # --- Priorité: SPARE_PARTS si disponible
+    if isinstance(SPARE_PARTS, list) and len(SPARE_PARTS) > 0:
+        for sp in SPARE_PARTS:
+            if not isinstance(sp, dict):
+                continue
+            code = str(sp.get("code") or "").strip()
+            if not code:
+                continue
+            base = by_code.get(code, {})
+            rows.append({
+                "code": code,
+                "nom": sp.get("piece", "") or base.get("nom", ""),
+                "famille": sp.get("categorie", "") or base.get("famille", ""),
+                "quantite_dispo": int(base.get("quantite_dispo", 0) or 0),
+                "seuil_min": int(base.get("seuil_min", 0) or 0),
+                "criticite": sp.get("criticite", ""),
+            })
+    else:
+        # --- Fallback: afficher tous les articles existants en inventaire
+        for p in (parts or []):
+            code = str(p.get("code") or "").strip()
+            if not code:
+                continue
+            rows.append({
+                "code": code,
+                "nom": p.get("nom", ""),
+                "famille": p.get("famille", ""),
+                "quantite_dispo": int(p.get("quantite_dispo", 0) or 0),
+                "seuil_min": int(p.get("seuil_min", 0) or 0),
+                "criticite": "",
+            })
+
+    # ✅ Tri
+    rows = sorted(rows, key=lambda x: x["code"])
+
+    # 2) Tableau visible (même si on garde les boutons dessous)
     df_disp = pd.DataFrame(rows)
+    if df_disp.empty:
+        st.warning("Aucun article à afficher (SPARE_PARTS vide + inventaire vide).")
+        st.stop()
 
     # bandeau alerte
     low_now = inv.low_stock(threshold_factor=1.0) or []
@@ -182,7 +206,16 @@ with tab_stock:
 
     st.caption("Clique sur Ajouter/Retirer à côté d’un article, saisis la quantité, puis valide.")
 
-    # Rendu “ligne par ligne” avec boutons
+    st.dataframe(
+        df_disp[["code", "nom", "famille", "quantite_dispo", "seuil_min", "criticite"]],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.markdown("### Actions rapides (Ajouter / Retirer)")
+    st.caption("Les mouvements sont enregistrés automatiquement dans l’onglet Historique.")
+
+    # 3) Boutons par ligne
     for r in rows:
         code = r["code"]
         nom = r["nom"]
@@ -203,17 +236,26 @@ with tab_stock:
 
             with colA:
                 with st.popover("➕ Ajouter", use_container_width=True):
-                    q_add = st.number_input("Quantité à ajouter", min_value=1, value=1, step=1, key=f"add_{code}")
+                    q_add = st.number_input(
+                        "Quantité à ajouter",
+                        min_value=1, value=1, step=1,
+                        key=f"add_{code}"
+                    )
                     if st.button("Valider ajout", key=f"btn_add_{code}", type="primary"):
                         _do_move(code, int(q_add), "IN")
 
             with colB:
                 with st.popover("➖ Retirer", use_container_width=True):
-                    q_out = st.number_input("Quantité à retirer", min_value=1, value=1, step=1, key=f"out_{code}")
-                    if st.button("Valider retrait", key=f"btn_out_{code}", type="primary"):
+                    q_out = st.number_input(
+                        "Quantité à retirer",
+                        min_value=1, value=1, step=1,
+                        key=f"out_{code}"
+                    )
+                    if st.button("Valider retrait", key=f"btn_out_{code}"):
                         _do_move(code, int(q_out), "OUT")
 
         st.divider()
 
-    # Auto: si l’utilisateur reste sur cette page longtemps (anti-spam 10 min)
+    # Auto alert (anti-spam 10 min)
     _send_alert_if_needed()
+    st.caption("⚠️ Les actions de gestion de stock via cette interface sont simplifiées et ne remplacent pas un ERP complet.")
