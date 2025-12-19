@@ -1,5 +1,6 @@
 # pages/5_Maintenance.py
 from __future__ import annotations
+
 from pathlib import Path
 import time
 from typing import List, Dict, Any
@@ -21,23 +22,23 @@ try:
     from core.notify.alerts_plus import notify_stock_alerts
 except Exception:
     notify_stock_alerts = None
-import streamlit as st
+
 from core.security.auth import require_login
 
-st.set_page_config(page_title="Transformateurs", page_icon="🔌", layout="wide")
 
-require_login()  # tant que auth_ok n’est pas True, cette page est bloquée
-
-# ... le reste de ta page ...
-
+# =========================
+# Page config + Auth
+# =========================
 st.set_page_config(page_title="Maintenance — Simple", page_icon="🛠️", layout="wide")
+require_login()
 st.title("🛠️ Maintenance")
 
 DATA_CSV = Path("data/failures_saved.csv")
 
 
-# ========= Helpers =========
-
+# =========================
+# Helpers
+# =========================
 def _read_csv_flex(src: Path) -> pd.DataFrame:
     def _try(**kw):
         try:
@@ -47,6 +48,7 @@ def _read_csv_flex(src: Path) -> pd.DataFrame:
 
     if not src.exists():
         return pd.DataFrame()
+
     df = _try()
     if df is None:
         df = _try(engine="python", on_bad_lines="skip", sep=None)
@@ -54,6 +56,7 @@ def _read_csv_flex(src: Path) -> pd.DataFrame:
         df = _try(sep=";", engine="python", on_bad_lines="skip")
     if df is None:
         return pd.DataFrame()
+
     df.columns = [str(c).strip() for c in df.columns]
     return df
 
@@ -67,17 +70,11 @@ def _ttf_df() -> pd.DataFrame:
 
 
 def _build_kits_by_eq(due_list: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
-    """
-    Construit les kits recommandés par équipement à partir des tâches dues.
-    Utilise core.inventory.recommendations.build_pm_kit_for_equipment si dispo.
-    """
     kits: Dict[str, List[Dict[str, Any]]] = {}
     if not due_list:
         return kits
 
-    eqs = sorted(
-        {str(d.get("equipment_code")) for d in due_list if d.get("equipment_code")}
-    )
+    eqs = sorted({str(d.get("equipment_code")) for d in due_list if d.get("equipment_code")})
     for eq in eqs:
         try:
             kit = build_pm_kit_for_equipment(eq) or []
@@ -88,13 +85,9 @@ def _build_kits_by_eq(due_list: List[Dict[str, Any]]) -> Dict[str, List[Dict[str
 
 
 def _build_parts_request(kits_by_eq: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
-    """
-    Aggrège toutes les pièces des kits (par code) et ajoute les infos de stock actuelles.
-    """
     if not kits_by_eq:
         return []
 
-    # Stock actuel
     parts = inv.list_parts_as_dicts() or []
     stock_map = {str(p.get("code")): p for p in parts if p.get("code")}
 
@@ -105,6 +98,7 @@ def _build_parts_request(kits_by_eq: Dict[str, List[Dict[str, Any]]]) -> List[Di
             code = str(item.get("code") or item.get("part_code") or "").strip()
             if not code:
                 continue
+
             q_req = float(item.get("qty") or item.get("quantite") or 0)
             if q_req <= 0:
                 continue
@@ -117,23 +111,25 @@ def _build_parts_request(kits_by_eq: Dict[str, List[Dict[str, Any]]]) -> List[Di
                     "famille": base.get("famille", ""),
                     "localisation": base.get("localisation", ""),
                     "fournisseur": base.get("fournisseur", ""),
-                    "prix_unitaire": base.get("prix_unitaire", 0.0),
+                    "prix_unitaire": float(base.get("prix_unitaire") or 0.0),
                     "seuil_min": float(base.get("seuil_min") or 0),
                     "quantite_dispo": float(base.get("quantite_dispo") or 0),
                     "qte_requise": 0.0,
                 }
+
             agg[code]["qte_requise"] += q_req
 
-    # Calcule les champs dérivés
     rows: List[Dict[str, Any]] = []
-    for code, row in agg.items():
+    for _, row in agg.items():
         dispo = float(row.get("quantite_dispo") or 0)
         req = float(row.get("qte_requise") or 0)
+
         q_prelevable = min(dispo, req)
         q_manquante = max(0.0, req - dispo)
         stock_restant = max(0.0, dispo - q_prelevable)
+
         seuil_min = float(row.get("seuil_min") or 0)
-        sous_seuil_apres = stock_restant <= seuil_min if seuil_min > 0 else False
+        sous_seuil_apres = (stock_restant <= seuil_min) if seuil_min > 0 else False
 
         row["qte_prelevable"] = q_prelevable
         row["qte_manquante"] = q_manquante
@@ -145,12 +141,6 @@ def _build_parts_request(kits_by_eq: Dict[str, List[Dict[str, Any]]]) -> List[Di
 
 
 def _apply_parts_request(parts_req: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Applique la demande de pièces :
-      - Déduit du stock (move_out) la quantité prélevable.
-      - Construit un résumé de consommation pour le PDF.
-    Retourne consumption_summary (liste de dict).
-    """
     summary: List[Dict[str, Any]] = []
     if not parts_req:
         return summary
@@ -159,6 +149,7 @@ def _apply_parts_request(parts_req: List[Dict[str, Any]]) -> List[Dict[str, Any]
         code = str(row.get("code") or "").strip()
         if not code:
             continue
+
         nom = row.get("nom", "")
         req = float(row.get("qte_requise") or 0)
         dispo = float(row.get("quantite_dispo") or 0)
@@ -197,24 +188,111 @@ def _apply_parts_request(parts_req: List[Dict[str, Any]]) -> List[Dict[str, Any]
     return summary
 
 
+def _is_opt_task(t: Dict[str, Any]) -> bool:
+    return "(optimisation)" in str(t.get("title") or "").lower()
+
+
+def _planning_from_optimization(within_days: int = 60) -> pd.DataFrame:
+    try:
+        tasks = pm.list_tasks() or []
+    except Exception:
+        tasks = []
+
+    opt_tasks = [t for t in tasks if _is_opt_task(t)]
+    if not opt_tasks:
+        return pd.DataFrame(columns=[
+            "id", "equipment_code", "title", "periodicity_days",
+            "next_due_date", "last_done_date", "status", "days_left"
+        ])
+
+    dfp = pd.DataFrame(opt_tasks)
+    try:
+        today = pd.Timestamp.today().normalize()
+        dfp["next_due_date_dt"] = pd.to_datetime(dfp.get("next_due_date"), errors="coerce")
+        dfp["days_left"] = (dfp["next_due_date_dt"].dt.normalize() - today).dt.days
+    except Exception:
+        dfp["days_left"] = None
+
+    if "days_left" in dfp.columns:
+        dfp = dfp[(dfp["days_left"].isna()) | (dfp["days_left"] <= int(within_days))]
+
+    keep = [c for c in [
+        "id", "equipment_code", "title", "periodicity_days",
+        "next_due_date", "last_done_date", "status", "days_left"
+    ] if c in dfp.columns]
+
+    if "next_due_date" in dfp.columns:
+        dfp = dfp.sort_values(["next_due_date"], na_position="last")
+
+    return dfp[keep].reset_index(drop=True)
+
+
+def _build_purchase_list_from_parts_request(parts_req: List[Dict[str, Any]]) -> pd.DataFrame:
+    cols = ["code", "nom", "qte_manquante", "seuil_min", "stock_actuel", "suggestion_achat", "raison"]
+    if not parts_req:
+        return pd.DataFrame(columns=cols)
+
+    rows = []
+    for r in parts_req:
+        code = str(r.get("code") or "").strip()
+        if not code:
+            continue
+
+        nom = str(r.get("nom") or "")
+        dispo = float(r.get("quantite_dispo") or 0)
+        missing = float(r.get("qte_manquante") or 0)
+        seuil = float(r.get("seuil_min") or 0)
+        restant = float(r.get("stock_restant") or 0)
+
+        achat = 0.0
+        raisons = []
+
+        if missing > 0:
+            achat = max(achat, missing)
+            raisons.append("manquant pour exécuter le plan")
+
+        if seuil > 0 and restant < seuil:
+            topup = max(0.0, seuil - restant)
+            achat = max(achat, topup)
+            raisons.append("remise à niveau du seuil")
+
+        if achat > 0:
+            rows.append({
+                "code": code,
+                "nom": nom,
+                "qte_manquante": round(missing, 2),
+                "seuil_min": round(seuil, 2),
+                "stock_actuel": round(dispo, 2),
+                "suggestion_achat": round(achat, 2),
+                "raison": " + ".join(raisons),
+            })
+
+    dfb = pd.DataFrame(rows)
+    if dfb.empty:
+        return pd.DataFrame(columns=cols)
+    return dfb.sort_values(["suggestion_achat"], ascending=False).reset_index(drop=True)
+
+
+# =========================
+# UI
+# =========================
 st.caption("Flux : **Scanner événements** ⟶ **Voir tâches dues** ⟶ **Demande de pièces & Validation** ⟶ **Plan PDF & Envoi**.")
 
-
-# ========= 0) Événements → Propositions de tâches =========
-
+# -------- 0) Ingestion events --------
 with st.container(border=True):
     st.subheader("1) Événements temps réel → tâches")
     c1, c2 = st.columns([1, 1])
+
     with c1:
         if st.button("🔎 Scanner les événements non traités", use_container_width=True):
             try:
                 from core.maintenance.ingest_events import ingest_events_to_tasks
-
                 res = ingest_events_to_tasks("data/realtime_events.csv")
                 st.session_state["ingested_tasks"] = res
                 st.success(f"{res.get('marked_processed', 0)} événement(s) ingéré(s).")
             except Exception as e:
                 st.error(f"Ingestion: {e}")
+
     with c2:
         if st.button("💾 Exporter les propositions (CSV)", use_container_width=True):
             res = st.session_state.get("ingested_tasks", {}) or {}
@@ -233,12 +311,11 @@ with st.container(border=True):
     else:
         st.caption("Aucune proposition (scanne les événements).")
 
-
-# ========= 1) Tâches dues (période courte) =========
-
+# -------- 1) Due tasks --------
 with st.container(border=True):
     st.subheader("2) Tâches dues (prochaines semaines)")
-    within = st.slider("Fenêtre (jours)", 7, 60, 14, 1)
+    within = st.slider("Fenêtre (jours)", 7, 60, 14, 1, key="due_window_days")
+
     try:
         due = pm.due_within(days=int(within)) or []
     except Exception as e:
@@ -249,72 +326,96 @@ with st.container(border=True):
         st.info("Aucune tâche due dans l’intervalle.")
     else:
         df_due = pd.DataFrame(due)
-        keep = [
-            c
-            for c in [
-                "id",
-                "equipment_code",
-                "title",
-                "priority",
-                "next_due_date",
-                "days_left",
-                "status",
-            ]
-            if c in df_due.columns
-        ]
-        st.dataframe(
-            df_due[keep] if not df_due.empty else df_due,
+        keep = [c for c in [
+            "id", "equipment_code", "title", "priority", "next_due_date", "days_left", "status"
+        ] if c in df_due.columns]
+        st.dataframe(df_due[keep] if not df_due.empty else df_due, use_container_width=True, hide_index=True)
+
+# -------- Planning optimisation --------
+with st.container(border=True):
+    st.subheader("📌 Planning issu de l’optimisation")
+    win_opt = st.slider("Fenêtre (jours) — planning optimisation", 7, 180, 60, 1, key="opt_plan_win")
+    df_opt_plan = _planning_from_optimization(within_days=int(win_opt))
+
+    if df_opt_plan.empty:
+        st.info("Aucune tâche provenant de l’optimisation (titre contenant '(optimisation)').")
+    else:
+        st.dataframe(df_opt_plan, use_container_width=True, hide_index=True)
+        st.download_button(
+            "⬇️ Export CSV (planning optimisation)",
+            data=df_opt_plan.to_csv(index=False).encode("utf-8"),
+            file_name="planning_optimisation_pm_task.csv",
+            mime="text/csv",
             use_container_width=True,
-            hide_index=True,
         )
 
-# Calculs de base pour la suite (kits + fiabilité)
+# -------- Bundle metrics --------
 bundle = compute_bundle(_ttf_df())
 dfm = bundle.metrics_df.copy() if hasattr(bundle, "metrics_df") else pd.DataFrame()
+
+# -------- Kits + request --------
 kits_by_eq = _build_kits_by_eq(due)
 parts_request = _build_parts_request(kits_by_eq)
 st.session_state["parts_request"] = parts_request
 
+# -------- Purchase list --------
+with st.container(border=True):
+    st.subheader("🧾 Comparaison Stock vs Kits recommandés (liste d’achat)")
 
-# ========= 2) Demande de pièces & réservation (avant PDF) =========
+    if not parts_request:
+        st.info("Aucune demande de pièces (kits vides ou aucune tâche due).")
+    else:
+        df_parts_req = pd.DataFrame(parts_request)
+        show_cols = [
+            "code", "nom",
+            "quantite_dispo", "qte_requise",
+            "qte_prelevable", "qte_manquante",
+            "stock_restant", "seuil_min", "sous_seuil_apres",
+        ]
+        show_cols = [c for c in show_cols if c in df_parts_req.columns]
 
+        st.markdown("#### 1) Détail besoin vs stock")
+        st.dataframe(df_parts_req[show_cols], use_container_width=True, hide_index=True)
+
+        st.markdown("#### 2) Liste d’achat proposée (manquants + remise à niveau du seuil)")
+        df_buy = _build_purchase_list_from_parts_request(parts_request)
+
+        if df_buy.empty:
+            st.success("✅ Aucun achat nécessaire : tout est disponible et au-dessus des seuils.")
+        else:
+            st.dataframe(df_buy, use_container_width=True, hide_index=True)
+            st.download_button(
+                "⬇️ Télécharger la liste d’achat (CSV)",
+                data=df_buy.to_csv(index=False).encode("utf-8"),
+                file_name="liste_achat_pieces.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+            if st.button("💾 Enregistrer la liste d’achat dans data/purchase_list.csv", use_container_width=True):
+                outp = Path("data") / "purchase_list.csv"
+                outp.parent.mkdir(parents=True, exist_ok=True)
+                df_buy.to_csv(outp, index=False)
+                st.success(f"Enregistré → {outp}")
+
+# -------- Parts request table --------
 with st.container(border=True):
     st.subheader("3) Demande de pièces (kits de maintenance)")
 
     if not parts_request:
-        st.info(
-            "Aucune pièce recommandée n'a été identifiée pour les tâches dues "
-            "(kits vides ou non configurés)."
-        )
+        st.info("Aucune pièce recommandée n'a été identifiée pour les tâches dues (kits vides ou non configurés).")
     else:
         df_parts = pd.DataFrame(parts_request)
         cols_aff = [
-            "code",
-            "nom",
-            "quantite_dispo",
-            "qte_requise",
-            "qte_prelevable",
-            "qte_manquante",
-            "stock_restant",
-            "seuil_min",
-            "sous_seuil_apres",
+            "code", "nom", "quantite_dispo", "qte_requise",
+            "qte_prelevable", "qte_manquante",
+            "stock_restant", "seuil_min", "sous_seuil_apres",
         ]
         cols_aff = [c for c in cols_aff if c in df_parts.columns]
-        st.dataframe(
-            df_parts[cols_aff],
-            use_container_width=True,
-            hide_index=True,
-        )
-        st.caption(
-            "Vérifie bien la demande : les quantités **prélevables** sont celles qui seront retirées du stock "
-            "après validation ci-dessous."
-        )
+        st.dataframe(df_parts[cols_aff], use_container_width=True, hide_index=True)
 
-
-# ========= 3) Plan PDF & Envoi (avec déduction stock) =========
-
+# -------- PDF Plan + Download + Send --------
 with st.container(border=True):
-    st.subheader("4) Plan de maintenance — PDF, déduction stock & envoi")
+    st.subheader("4) Plan de maintenance — PDF, téléchargement, déduction stock & envoi")
 
     include_kits = st.checkbox(
         "Inclure les kits (résumé) dans le PDF",
@@ -324,7 +425,6 @@ with st.container(border=True):
 
     colA, colB = st.columns([1, 1])
 
-    # ---- Bouton simple : génération PDF sans déduction ----
     with colA:
         if st.button("📄 Générer le PDF (sans déduire le stock)", use_container_width=True):
             try:
@@ -337,13 +437,13 @@ with st.container(border=True):
                     procedure_docx=None,
                     include_kits=bool(include_kits),
                     tools_checklist=None,
-                    consumption_summary=None,  # pas de déduction, juste analyse
+                    consumption_summary=None,
                 )
+                st.session_state["pm_plan_pdf_path"] = path_pdf
                 st.success(f"PDF généré : {path_pdf}")
             except Exception as e:
                 st.error(f"PDF : {e}")
 
-    # ---- Bouton principal : validation demande + déduction + PDF + envois ----
     with colB:
         if st.button(
             "✅ Valider la demande, déduire le stock, générer & envoyer le plan",
@@ -351,11 +451,9 @@ with st.container(border=True):
             use_container_width=True,
         ):
             try:
-                # 1) Appliquer la consommation de stock
                 parts_req = st.session_state.get("parts_request") or []
                 consumption_summary = _apply_parts_request(parts_req)
 
-                # 2) Générer le PDF avec la section 'Consommation de stock'
                 path_pdf = export_pm_plan_with_kits_pdf(
                     tasks_due=due or [],
                     kits_by_eq=kits_by_eq,
@@ -367,8 +465,9 @@ with st.container(border=True):
                     tools_checklist=None,
                     consumption_summary=consumption_summary,
                 )
+                st.session_state["pm_plan_pdf_path"] = path_pdf
 
-                # 3) Alertes stock (après mise à jour)
+                # Alertes stock (après MAJ)
                 low_after = inv.low_stock(threshold_factor=1.0) or []
                 if low_after:
                     if notify_stock_alerts:
@@ -380,31 +479,41 @@ with st.container(border=True):
                     else:
                         out_low = Path("data/low_stock_alert_after_plan.csv")
                         pd.DataFrame(low_after).to_csv(out_low, index=False)
-                        st.info(
-                            f"Module d’alerte dédié indisponible — CSV généré : {out_low}"
-                        )
+                        st.info(f"Module d’alerte indisponible — CSV généré : {out_low}")
 
-                # 4) Notifications maintenance (plan + kits) via module dédié
+                # Notifications maintenance
                 res = notify_pm_with_kits(due or [], kits_by_eq, dfm.to_dict("records")) or {}
 
                 st.success("Plan de maintenance généré, stock mis à jour et notifications envoyées.")
                 if path_pdf:
                     st.caption(f"PDF (Plan) : {path_pdf}")
                 if res:
-                    from pathlib import Path as _P
+                    name_pdf = Path(res.get("pdf", "")).name or "—"
+                    name_csv = Path(res.get("csv", "")).name or "—"
+                    st.caption(f"Attachements notify_pm_with_kits : PDF={name_pdf} • CSV={name_csv}")
 
-                    name_pdf = _P(res.get("pdf", "")).name or "—"
-                    name_csv = _P(res.get("csv", "")).name or "—"
-                    st.caption(f"Attachements (module notify_pm_with_kits) : PDF={name_pdf} • CSV={name_csv}")
             except Exception as e:
                 st.error(f"Erreur lors de la validation & envoi : {e}")
 
+    # ✅ Téléchargement du plan de maintenance (si dispo)
+    pdf_path = st.session_state.get("pm_plan_pdf_path")
+    if pdf_path and Path(str(pdf_path)).exists():
+        st.markdown("### 📥 Télécharger le plan de maintenance (PDF)")
+        with open(str(pdf_path), "rb") as f:
+            st.download_button(
+                "📥 Télécharger le PDF du plan",
+                data=f,
+                file_name=Path(str(pdf_path)).name,
+                mime="application/pdf",
+                use_container_width=True,
+            )
+    else:
+        st.caption("Génère d’abord un PDF pour activer le bouton de téléchargement.")
 
-# ========= 4) Alertes “Seuil stock” (rappel simple) =========
 
+# -------- Stock alerts reminder --------
 with st.container(border=True):
     st.subheader("🔔 Alertes stock — seuils (rappel)")
-
     st.caption("Alerte quand `quantite_dispo ≤ seuil_min`. Paramétrage des destinataires dans le module d'alertes.")
 
     auto = st.toggle(
@@ -419,31 +528,30 @@ with st.container(border=True):
     else:
         df_low = pd.DataFrame(low)
         st.dataframe(df_low, use_container_width=True, hide_index=True)
+
         c1, c2 = st.columns([1, 1])
         with c1:
             if st.button("📤 Envoyer alerte stock maintenant", use_container_width=True):
                 try:
                     if notify_stock_alerts:
-                        r = notify_stock_alerts(low) or {}
+                        notify_stock_alerts(low)
                         st.success("Alerte stock envoyée.")
                     else:
                         out = Path("data/low_stock_alert.csv")
                         pd.DataFrame(low).to_csv(out, index=False)
-                        st.info(
-                            f"Module d’alerte dédié indisponible — CSV généré : {out}"
-                        )
+                        st.info(f"Module d’alerte indisponible — CSV généré : {out}")
                 except Exception as e:
                     st.error(f"Alerte stock : {e}")
+
         with c2:
             if st.button("⬇️ Export CSV", use_container_width=True):
                 out = Path("data/low_stock_alert.csv")
                 pd.DataFrame(low).to_csv(out, index=False)
                 st.success(f"Exporté → {out}")
 
-    # Auto (anti-spam : 10 min)
     if auto and low:
         last = st.session_state.get("_last_stock_alert_ts", 0.0)
-        if time.time() - last > 600:  # 10 minutes
+        if time.time() - last > 600:
             try:
                 if notify_stock_alerts:
                     notify_stock_alerts(low)

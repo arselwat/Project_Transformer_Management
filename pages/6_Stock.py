@@ -14,9 +14,15 @@ try:
 except Exception:
     notify_stock_alerts = None
 
+from core.security.auth import require_login
 
 st.set_page_config(page_title="Stock — Simplifié", page_icon="📦", layout="wide")
+require_login()
+
 st.title("📦 Gestion de Stock (simplifiée)")
+
+st.set_page_config(page_title="Stock", page_icon="📦", layout="wide")
+st.title("📦 Gestion de Stock ")
 
 tab_hist, tab_stock = st.tabs(["📑 Historique mouvements", "📦 Stock & Alertes seuil"])
 

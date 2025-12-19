@@ -255,6 +255,32 @@ for eq, ft in fits.items():
     })
 
 df_out = pd.DataFrame(rows).sort_values("equipment_code").reset_index(drop=True)
+st.divider()
+st.subheader("🔁 Passerelle → Maintenance (création/MAJ des tâches PM)")
+
+from core.maintenance.bridge import upsert_tasks_from_optimization, BridgeParams
+
+col1, col2, col3 = st.columns(3)
+with col1:
+    only_prev = st.toggle("Créer tâches uniquement si Préventive", value=True)
+with col2:
+    min_days = st.number_input("Périodicité minimale (jours)", min_value=1, value=7, step=1)
+with col3:
+    start_dt = st.date_input("Date de départ planning", value=None)
+
+if st.button("✅ Synchroniser les tâches vers Maintenance", type="primary"):
+    cfg = BridgeParams(min_days=int(min_days), only_if_preventive=bool(only_prev))
+    res = upsert_tasks_from_optimization(
+        opt_df=df_out,
+        start_date=str(start_dt) if start_dt else None,
+        params=cfg,
+    )
+    if res.get("ok"):
+        st.success(f"Tâches synchronisées ✅ | créées={res['created']} | MAJ={res['updated']} | ignorées={res['skipped']}")
+    else:
+        st.warning(f"Synchronisation partielle | créées={res['created']} | MAJ={res['updated']} | ignorées={res['skipped']}")
+        if res.get("errors"):
+            st.error("Erreurs: " + " | ".join(res["errors"]))
 
 st.subheader("📋 Synthèse optimisation (coût, fiabilité, recommandation)")
 st.dataframe(df_out, use_container_width=True, hide_index=True)
