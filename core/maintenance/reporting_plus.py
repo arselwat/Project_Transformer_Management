@@ -1174,18 +1174,32 @@ def _add_per_equipment_summaries(
     """Section : 'Résultats d’analyse par équipement' (partie dynamique)."""
     if not metrics_table:
         return
-    _title(story, styles, "Résultats d’analyse par équipement", level=2, space_after_pt=4)
+
+    _title(story, styles, "Résultats d’analyse par équipement (issus optimisation)", level=2, space_after_pt=4)
 
     for r in metrics_table:
         r = r if isinstance(r, dict) else {}
         orig_eq = (r or {}).get("equipment_code", "")
         eq_disp = SAN(orig_eq)
+
+        # compat: eta / eta_h
         beta = (r or {}).get("beta")
-        eta = (r or {}).get("eta")
-        gamma = (r or {}).get("gamma")
-        itv = (r or {}).get("interval_opt_h")
+        eta = (r or {}).get("eta_h", (r or {}).get("eta"))
+        gamma = (r or {}).get("gamma_h", (r or {}).get("gamma"))
+
+        # intervals (priorité affichage)
+        T_rec = (r or {}).get("T_recommended_h")
+        T_R = (r or {}).get("T_R_h")
+        T_cost = (r or {}).get("T_cost_h")
+        itv_opt = (r or {}).get("interval_opt_h", (r or {}).get("interval_h"))
+
+        model = (r or {}).get("model")
+        dist = (r or {}).get("distribution")
+        mtype = (r or {}).get("maintenance_type")
+
         mtbf = (r or {}).get("MTBF")
         mttr = (r or {}).get("MTTR")
+
         avail = None
         try:
             if mtbf is not None and mttr is not None and (float(mtbf) + float(mttr)) > 0:
@@ -1197,10 +1211,18 @@ def _add_per_equipment_summaries(
 
         data_param = [
             ["Élément", "Valeur"],
+            ["Type de maintenance (optimisation)", SAN(mtype)],
+            ["Modèle / Loi", f"{SAN(model)} / {SAN(dist)}"],
+
             ["β (forme)", fnum(beta, 2)],
             ["η (échelle, h)", fnum(eta, 1)],
             ["γ (décalage, h)", fnum(gamma, 1)],
-            ["Intervalle de visite optimisé (h)", fnum(itv, 1)],
+
+            ["T_recommended (h)", fnum(T_rec, 1)],
+            ["T_R (h)", fnum(T_R, 1)],
+            ["T_cost (h)", fnum(T_cost, 1)],
+            ["Intervalle opt (h) (fallback)", fnum(itv_opt, 1)],
+
             ["MTBF (h)", fnum(mtbf, 1)],
             ["MTTR (h)", fnum(mttr, 1)],
             ["Disponibilité (%)", fnum(avail, 1)],
@@ -1208,42 +1230,74 @@ def _add_per_equipment_summaries(
         story.append(_mk_table(data_param, font_size=8))
         story.append(Spacer(1, 4))
 
-        _title(story, styles, "Politique recommandée (d’après β)", level=3, space_after_pt=2)
-        story.append(Paragraph(SAN(_policy_from_beta(beta)), styles["BodyText"]))
-        story.append(Spacer(1, 4))
+        _title(story, styles, "Politique recommandée", level=3, space_after_pt=2)
 
-        _title(story, styles, "Tâches planifiées / dues (résumé)", level=3, space_after_pt=2)
-        story.append(Paragraph(SAN("Voir le tableau global des tâches dues en fin de document."), styles["BodyText"]))
-        story.append(Spacer(1, 4))
+        # Si maintenance_type existe, on l'utilise aussi en explication,
+        # sinon fallback beta.
+        pol = ""
+        if mtype:
+            pol += f"Type recommandé (optimisation) : {mtype}. "
+        pol += _policy_from_beta(beta)
+        story.append(Paragraph(SAN(pol), styles["BodyText"]))
+        story.append(Spacer(1, 6))
 
         _title(story, styles, "Kit de pièces recommandé (résumé)", level=3, space_after_pt=2)
         has_kit = bool((kits_by_eq or {}).get(str(orig_eq)))
         if has_kit:
             story.append(Paragraph(SAN("Un kit est recommandé. Voir module Inventaire pour la liste à jour."), styles["BodyText"]))
         else:
-            story.append(Paragraph(SAN("Aucune pièce recommandée détectée."), styles["BodyText"]))
-        story.append(Spacer(1, 6))
+            story.append(Paragraph(SAN("Aucune pièce recommandée détectée (ou stock non activé)."), styles["BodyText"]))
+        story.append(Spacer(1, 8))
 
 
 def _table_from_tasks_due(tasks_due: List[Dict[str, Any]]):
     if not tasks_due:
         return None
-    data = [["Équipement", "Titre", "Priorité", "Échéance", "Jours restants", "Statut"]]
+
+    # Table enrichie: optimisation visible
+    data = [[
+        "Équipement",
+        "Type maint.",
+        "Intervalle (h)",
+        "Source",
+        "Échéance",
+        "Jours restants",
+        "T_rec (h)",
+        "T_R (h)",
+        "T_cost (h)",
+        "Statut",
+    ]]
+
     for t in tasks_due:
         td = t if isinstance(t, dict) else {}
         data.append([
             SAN(td.get("equipment_code", "")),
-            SAN(td.get("title", "")),
-            SAN(td.get("priority", "")),
+            SAN(td.get("maintenance_type", "")),
+            fnum(td.get("interval_h"), 1),
+            SAN(td.get("interval_source", "")),
             SAN(td.get("next_due_date", "")),
             SAN(td.get("days_left", "")),
+            fnum(td.get("T_recommended_h"), 1),
+            fnum(td.get("T_R_h"), 1),
+            fnum(td.get("T_cost_h"), 1),
             SAN(td.get("status", "")),
         ])
-    return _mk_table(
-        data,
-        widths=[3.2*cm, 5.5*cm, 2.0*cm, 2.5*cm, 2.5*cm, 2.5*cm],
-        font_size=9,
-    )
+
+    # Largeur adaptée A4 (marges déjà prises)
+    widths = [
+        2.2*cm,  # eq
+        2.4*cm,  # type
+        2.2*cm,  # interval
+        1.8*cm,  # source
+        2.2*cm,  # due
+        1.9*cm,  # days
+        2.0*cm,  # Trec
+        1.7*cm,  # TR
+        1.9*cm,  # Tcost
+        1.8*cm,  # status
+    ]
+    return _mk_table(data, widths=widths, font_size=7.5)
+
 
 
 DEFAULT_TOOLS = [

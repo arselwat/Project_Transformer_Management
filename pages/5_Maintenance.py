@@ -1,68 +1,25 @@
 # pages/5_Maintenance.py
 from __future__ import annotations
 
-from pathlib import Path
-from datetime import date, timedelta
 import hashlib
-from typing import List, Dict, Any
+from datetime import date, timedelta
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import streamlit as st
 
-from core.security.auth import require_login
-from core.reliability.unify import compute_bundle
-
-from core.inventory.recommendations import build_pm_kit_for_equipment
 from core.maintenance.reporting_plus import export_pm_plan_with_kits_pdf
-from core.notify.alerts_plus import notify_pm_with_kits
 
 
-# =========================================================
-# Config + Auth
-# =========================================================
-st.set_page_config(page_title="Maintenance (simple)", page_icon="🛠️", layout="wide")
-require_login()
+# ============================================================
+# Helpers (Optimisation -> Plan PM virtuel)
+# ============================================================
 
-st.title("🛠️ Maintenance (simple)")
-st.caption("Ici : tâches dues + kits recommandés + PDF plan. Le stock se gère uniquement dans la page Stock.")
-
-BASE_DIR = Path(__file__).resolve().parents[1]
-DATA_CSV = BASE_DIR / "data" / "failures_saved.csv"
-OPT_FALLBACK = BASE_DIR / "data" / "last_optimization.csv"
-
-
-# =========================================================
-# Helpers dataset (source/indicateurs)
-# =========================================================
-def _read_csv_flex(path: Path) -> pd.DataFrame:
-    def _try(**kw):
-        try:
-            return pd.read_csv(path, **kw)
-        except Exception:
-            return None
-
-    if not path.exists():
-        return pd.DataFrame()
-
-    df = _try()
-    if df is None:
-        df = _try(engine="python", on_bad_lines="skip", sep=None)
-    if df is None:
-        df = _try(sep=";", engine="python", on_bad_lines="skip")
-    if df is None:
-        return pd.DataFrame()
-
-    df.columns = [str(c).strip() for c in df.columns]
-    return df
-
-
-def _ttf_df() -> pd.DataFrame:
-    if isinstance(st.session_state.get("failures_df"), pd.DataFrame):
-        df = st.session_state["failures_df"].copy()
-        df.columns = [str(c).strip() for c in df.columns]
-        return df
-    return _read_csv_flex(DATA_CSV)
-
+def _hash_df(df: pd.DataFrame) -> str:
+    if df is None or df.empty:
+        return "empty"
+    b = df.to_csv(index=False).encode("utf-8")
+    return hashlib.md5(b).hexdigest()
 
 def _safe_float(x, default=0.0) -> float:
     try:
@@ -73,219 +30,229 @@ def _safe_float(x, default=0.0) -> float:
     except Exception:
         return default
 
+def _maintenance_label(mtype: str) -> str:
+    s = (mtype or "").strip().lower()
+    if not s:
+        return "Non défini"
+    if "correct" in s:
+        return "Corrective"
+    if "condition" in s or "inspection" in s:
+        return "Conditionnelle / Inspection"
+    if "predict" in s or "prédict" in s:
+        return "Prédictive"
+    if "prévent" in s or "prevent" in s:
+        return "Préventive planifiée"
+    return mtype
 
-def _df_hash(df: pd.DataFrame) -> str:
-    b = df.to_csv(index=False).encode("utf-8")
-    return hashlib.md5(b).hexdigest()
-
-
-# =========================================================
-# Helpers optimisation bridge (NO DB)
-# =========================================================
-def _load_opt_df() -> pd.DataFrame:
-    df = st.session_state.get("opt_df_out")
-    if isinstance(df, pd.DataFrame) and not df.empty:
-        return df.copy()
-
-    if OPT_FALLBACK.exists():
-        try:
-            d0 = pd.read_csv(OPT_FALLBACK)
-            if not d0.empty:
-                return d0
-        except Exception:
-            pass
-
-    return pd.DataFrame()
-
-
-def _interval_col(df: pd.DataFrame) -> str | None:
-    for c in ["T_recommended_h", "T_R_h", "T_cost_h"]:
-        if c in df.columns:
-            return c
-    return None
-
-
-def _tasks_from_optimization(df_opt: pd.DataFrame, within_days: int) -> List[Dict[str, Any]]:
+def _pick_interval_h(row: dict) -> tuple[Optional[float], Optional[str]]:
     """
-    Fabrique des tâches 'virtuelles' depuis optimisation (sans BD pm_task).
-    - periodicity_days = round(interval_h / 24)
-    - next_due_date = today + periodicity_days
+    Priorité stricte:
+      1) T_recommended_h
+      2) T_R_h
+      3) T_cost_h
+      4) interval_opt_h
+      5) interval_h
     """
-    if df_opt is None or df_opt.empty:
-        return []
+    for c in ["T_recommended_h", "T_R_h", "T_cost_h", "interval_opt_h", "interval_h"]:
+        if c in row and row[c] is not None:
+            v = _safe_float(row[c], 0.0)
+            if v > 0:
+                return v, c
+    return None, None
 
-    df = df_opt.copy()
+def build_virtual_pm_plan_from_optimization(
+    opt_df: pd.DataFrame,
+    start_date: date,
+    within_days: int,
+    show_all: bool = True,
+    only_preventive: bool = False,
+    min_days: int = 1,
+) -> Dict[str, Any]:
+    """
+    Construit un plan PM VIRTUEL depuis l'optimisation (sans BD).
+
+    Règle:
+      - interval_h = T_recommended_h > T_R_h > T_cost_h > interval_opt_h > interval_h
+      - periodicity_days = max(min_days, round(interval_h/24))
+      - next_due_date = start_date + periodicity_days
+    """
+    if opt_df is None or opt_df.empty:
+        return {"ok": False, "msg": "Optimisation vide", "rows": [], "due": []}
+
+    df = opt_df.copy()
     df.columns = [str(c).strip() for c in df.columns]
+
     if "equipment_code" not in df.columns:
-        return []
+        return {"ok": False, "msg": "Colonne equipment_code absente", "rows": [], "due": []}
 
-    col = _interval_col(df)
-    if not col:
-        return []
+    within_days = int(within_days or 0)
+    if within_days < 0:
+        within_days = 0
 
-    today = date.today()
-    out: List[Dict[str, Any]] = []
+    rows: List[Dict[str, Any]] = []
+    used_cols = {"T_recommended_h": 0, "T_R_h": 0, "T_cost_h": 0, "interval_opt_h": 0, "interval_h": 0, "none": 0}
 
     for _, r in df.iterrows():
-        eq = str(r.get("equipment_code") or "").strip()
+        row = r.to_dict()
+        eq = str(row.get("equipment_code") or "").strip()
         if not eq:
             continue
 
-        interval_h = _safe_float(r.get(col), 0.0)
-        if interval_h <= 0:
+        mtype = _maintenance_label(str(row.get("maintenance_type") or "").strip())
+        if only_preventive and ("Préventive" not in mtype):
             continue
 
-        periodicity_days = max(1, int(round(interval_h / 24.0)))
-        next_due = today + timedelta(days=periodicity_days)
-        days_left = (next_due - today).days
+        interval_h, src = _pick_interval_h(row)
+        if not interval_h:
+            used_cols["none"] += 1
+            continue
 
-        if days_left <= int(within_days):
-            out.append({
-                "id": None,
-                "equipment_code": eq,
-                "title": "Maintenance issue de l’optimisation",
-                "maintenance_type": str(r.get("maintenance_type") or "").strip(),
-                "periodicity_days": periodicity_days,
-                "interval_h": interval_h,
-                "next_due_date": next_due.isoformat(),
-                "days_left": days_left,
-                "status": "VIRTUAL",
-            })
+        if src in used_cols:
+            used_cols[src] += 1
 
-    return sorted(out, key=lambda x: x.get("days_left", 999999))
+        periodicity_days = max(int(min_days), int(round(float(interval_h) / 24.0)))
+        next_due = start_date + timedelta(days=periodicity_days)
+        days_left = (next_due - start_date).days
 
+        task = {
+            "equipment_code": eq,
+            "title": "Plan issu de l’optimisation",
+            "maintenance_type": mtype,
 
-# =========================================================
-# Kits
-# =========================================================
-def _build_kits_by_eq(due_list: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
-    kits: Dict[str, List[Dict[str, Any]]] = {}
-    if not due_list:
-        return kits
+            "interval_source": src,
+            "interval_h": float(interval_h),
+            "periodicity_days": periodicity_days,
+            "next_due_date": next_due.isoformat(),
+            "days_left": int(days_left),
 
-    eqs = sorted({str(d.get("equipment_code")) for d in due_list if d.get("equipment_code")})
-    for eq in eqs:
-        try:
-            kit = build_pm_kit_for_equipment(eq) or []
-        except Exception:
-            kit = []
-        kits[eq] = kit
-    return kits
+            # garder toutes infos optimisation utiles au PDF
+            "beta": row.get("beta"),
+            "eta_h": row.get("eta_h", row.get("eta")),
+            "gamma_h": row.get("gamma_h", row.get("gamma")),
+            "model": row.get("model"),
+            "distribution": row.get("distribution"),
 
+            "T_recommended_h": row.get("T_recommended_h"),
+            "T_R_h": row.get("T_R_h"),
+            "T_cost_h": row.get("T_cost_h"),
+            "T_cost": row.get("T_cost"),
+            "R_at_T": row.get("R_at_T", row.get("R(T_cost)")),
+            "C_min_per_h": row.get("C_min_per_h", row.get("C_min")),
 
-# =========================================================
-# Bandeau sync (debug clair)
-# =========================================================
-df_opt = _load_opt_df()
-meta = st.session_state.get("opt_meta", {}) or {}
+            "status": "VIRTUAL",
+        }
 
-if df_opt.empty:
-    st.warning(
-        "Aucun résultat d’optimisation disponible. "
-        "Va dans la page **Optimisation** puis clique **'Envoyer ce planning à Maintenance'** "
-        "(ou sauvegarde le fallback `data/last_optimization.csv`)."
-    )
-else:
-    h = meta.get("hash") or _df_hash(df_opt)
-    rows = int(meta.get("rows") or len(df_opt))
-    src = meta.get("source") or ("file:last_optimization.csv" if OPT_FALLBACK.exists() else "session")
-    st.success(f"Dataset optimisation synchronisé ✅ | rows={rows} | hash={h} | source={src}")
+        if show_all or (days_left <= within_days):
+            rows.append(task)
+
+    rows = sorted(rows, key=lambda x: (x.get("days_left", 999999), x.get("equipment_code", "")))
+    due = [t for t in rows if int(t.get("days_left", 999999)) <= within_days]
+
+    return {
+        "ok": True,
+        "rows": rows,
+        "due": due,
+        "used_cols_stats": used_cols,
+        "interval_priority": ["T_recommended_h", "T_R_h", "T_cost_h", "interval_opt_h", "interval_h"],
+    }
 
 
-# =========================================================
+# ============================================================
 # UI
-# =========================================================
-st.divider()
-st.subheader("1) Tâches dues (prochaines semaines)")
+# ============================================================
 
-within = st.slider("Fenêtre (jours)", 7, 90, 14, 1)
+st.title("🛠️ Maintenance (basée sur l’optimisation)")
+st.caption("Ici : plan PM virtuel + PDF. Sans SQLite/BD (temporaire).")
 
-due = _tasks_from_optimization(df_opt, within_days=int(within)) if not df_opt.empty else []
-
-if not due:
-    st.info("Aucune tâche due dans la fenêtre (sur base optimisation).")
+df_opt = st.session_state.get("optimization_df")
+if not isinstance(df_opt, pd.DataFrame) or df_opt.empty:
+    st.info("Aucune optimisation en mémoire. Va d’abord sur la page Optimisation, puis reviens ici.")
     st.stop()
 
-df_due = pd.DataFrame(due)
-cols = [c for c in ["equipment_code", "title", "maintenance_type", "periodicity_days", "next_due_date", "days_left", "status"] if c in df_due.columns]
-st.dataframe(df_due[cols] if cols else df_due, use_container_width=True, hide_index=True)
+h = _hash_df(df_opt)
+st.success(f"Dataset optimisation synchronisé ✅ | rows={len(df_opt)} | hash={h} | source=optimisation_page")
 
+c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
+with c1:
+    within = st.slider("Fenêtre (jours) — tâches dues", 7, 365, 14, 1)
+with c2:
+    show_all = st.toggle("Afficher tout le planning", value=True)
+with c3:
+    only_prev = st.toggle("Seulement Préventive", value=False)
+with c4:
+    start_dt = st.date_input("Date de départ", value=date.today())
 
-st.divider()
-st.subheader("2) Kits recommandés (résumé)")
+plan = build_virtual_pm_plan_from_optimization(
+    opt_df=df_opt,
+    start_date=start_dt,
+    within_days=int(within),
+    show_all=bool(show_all),
+    only_preventive=bool(only_prev),
+    min_days=1,
+)
 
-kits_by_eq = _build_kits_by_eq(due)
-kit_rows = [{"equipment_code": eq, "nb_items": len(kit or [])} for eq, kit in kits_by_eq.items()]
-st.dataframe(pd.DataFrame(kit_rows), use_container_width=True, hide_index=True)
+if not plan.get("ok"):
+    st.error(plan.get("msg", "Erreur plan"))
+    st.stop()
 
-with st.expander("Voir le détail des kits (par équipement)", expanded=False):
-    for eq, kit in kits_by_eq.items():
-        st.markdown(f"**{eq}** — {len(kit or [])} item(s)")
-        if kit:
-            st.dataframe(pd.DataFrame(kit), use_container_width=True, hide_index=True)
-        else:
-            st.caption("Aucun kit configuré pour cet équipement.")
+st.caption(f"Priorité intervalles: {', '.join(plan.get('interval_priority', []))}")
+st.caption(f"Colonnes réellement utilisées: {plan.get('used_cols_stats')}")
 
+rows_all = plan.get("rows", [])
+rows_due = plan.get("due", [])
 
-# =========================================================
-# PDF plan + download + notifications
-# =========================================================
-st.divider()
-st.subheader("3) Générer le plan de maintenance (PDF)")
-
-include_kits = st.checkbox("Inclure les kits dans le PDF", value=True)
-
-# fiabilité (pour enrichir PDF)
-try:
-    bundle = compute_bundle(_ttf_df())
-    dfm = bundle.metrics_df.copy() if hasattr(bundle, "metrics_df") else pd.DataFrame()
-    metrics_table = dfm.to_dict("records") if isinstance(dfm, pd.DataFrame) else []
-except Exception:
-    metrics_table = []
-
-colA, colB = st.columns([1, 1])
-
-with colA:
-    if st.button("📄 Générer PDF (plan)", type="primary", use_container_width=True):
-        try:
-            path_pdf = export_pm_plan_with_kits_pdf(
-                tasks_due=due,
-                kits_by_eq=kits_by_eq,
-                metrics_table=metrics_table,
-                out_dir=str(BASE_DIR / "reports"),
-                title="Plan de maintenance — issu de l’optimisation",
-                procedure_docx=None,
-                include_kits=bool(include_kits),
-                tools_checklist=None,
-                consumption_summary=None,
-            )
-            st.session_state["pm_pdf_path"] = path_pdf
-            st.success(f"PDF généré : {path_pdf}")
-        except Exception as e:
-            st.error(f"PDF : {e}")
-
-with colB:
-    if st.button("📨 Envoyer notifications (plan + kits)", use_container_width=True):
-        try:
-            res = notify_pm_with_kits(due, kits_by_eq, metrics_table) or {}
-            st.success("Notifications envoyées ✅")
-            if res:
-                st.caption(f"Détails: {res}")
-        except Exception as e:
-            st.error(f"Notifications : {e}")
-
-
-pdf_path = st.session_state.get("pm_pdf_path")
-if pdf_path and Path(str(pdf_path)).exists():
-    st.divider()
-    st.subheader("📥 Télécharger le plan de maintenance (PDF)")
-    with open(str(pdf_path), "rb") as f:
-        st.download_button(
-            "⬇️ Télécharger le plan (PDF)",
-            data=f,
-            file_name=Path(str(pdf_path)).name,
-            mime="application/pdf",
-            use_container_width=True,
-        )
+st.markdown("## 1) Planning (issu de l’optimisation)")
+if not rows_all:
+    st.warning("Aucune ligne exploitable (intervalles manquants ou <=0).")
 else:
-    st.caption("Aucun PDF prêt au téléchargement pour l’instant.")
+    df_all = pd.DataFrame(rows_all)
+    cols = [
+        "equipment_code", "maintenance_type",
+        "interval_source", "interval_h", "periodicity_days",
+        "next_due_date", "days_left",
+        "beta", "eta_h", "model", "distribution",
+        "T_recommended_h", "T_R_h", "T_cost_h",
+    ]
+    cols = [c for c in cols if c in df_all.columns]
+    st.dataframe(df_all[cols], use_container_width=True, hide_index=True)
+
+st.markdown("## 2) Tâches dues (dans la fenêtre)")
+if not rows_due:
+    st.info("Aucune tâche due dans la fenêtre. Augmente la fenêtre (ex: 60/90 jours) ou change la date de départ.")
+else:
+    df_due = pd.DataFrame(rows_due)
+    cols = [
+        "equipment_code", "maintenance_type",
+        "interval_source", "interval_h",
+        "next_due_date", "days_left",
+        "beta", "eta_h", "model", "distribution",
+        "T_recommended_h", "T_R_h", "T_cost_h",
+    ]
+    cols = [c for c in cols if c in df_due.columns]
+    st.dataframe(df_due[cols], use_container_width=True, hide_index=True)
+
+# garder pour PDF
+st.session_state["pm_virtual_all"] = rows_all
+st.session_state["pm_virtual_due"] = rows_due
+
+st.markdown("## 3) Générer le plan de maintenance (PDF)")
+include_all_in_pdf = st.toggle("Inclure TOUT le planning dans le PDF (sinon seulement les tâches dues)", value=False)
+
+if st.button("📄 Générer PDF (plan issu optimisation)", use_container_width=True):
+    tasks_for_pdf = rows_all if include_all_in_pdf else rows_due
+
+    # IMPORTANT: metrics_table = optimisation (pour fiches par équipement)
+    metrics_table = df_opt.to_dict("records")
+
+    out = export_pm_plan_with_kits_pdf(
+        tasks_due=tasks_for_pdf,
+        kits_by_eq={},  # pas de BD/stock ici
+        metrics_table=metrics_table,
+        out_dir="reports",
+        title="Plan de maintenance — issu de l’optimisation",
+        include_kits=False,
+        tools_checklist=None,
+    )
+    st.success("PDF généré.")
+    with open(out, "rb") as f:
+        st.download_button("⬇️ Télécharger le PDF", f, file_name=out.split("/")[-1], use_container_width=True)
