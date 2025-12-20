@@ -268,6 +268,8 @@ for eq, ft in fits.items():
     })
 
 df_out = pd.DataFrame(rows).sort_values("equipment_code").reset_index(drop=True)
+st.session_state["optimization_df"] = df_out.copy()
+st.session_state["optimization_src"] = "optimisation_page"
 
 st.divider()
 st.subheader("🧩 Passerelle → Maintenance (SANS BD)")
