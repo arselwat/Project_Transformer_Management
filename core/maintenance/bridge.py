@@ -1,151 +1,110 @@
 # core/maintenance/bridge.py
 from __future__ import annotations
-
 from dataclasses import dataclass
 from datetime import date, timedelta
-from typing import Dict, Any, Optional, List, Tuple
-import math
+from typing import Optional, Dict, Any, List
+import pandas as pd
 
 from core.maintenance import services as pm
-
+from core.datahub import get_failures_meta  # pour dataset_hash
 
 @dataclass
 class BridgeParams:
-    # seuil minimum en jours pour éviter des périodicités absurdes
     min_days: int = 7
-    # plafond pour éviter des périodicités trop longues (tu peux changer)
-    max_days: int = 365 * 5
-    # si True, on ne crée des tâches que si maintenance_type est "préventive"
     only_if_preventive: bool = True
 
-
-def _to_days(hours: Optional[float], *, min_days: int, max_days: int) -> Optional[int]:
-    if hours is None:
-        return None
+def _safe_float(x, default=0.0) -> float:
     try:
-        h = float(hours)
-        if not math.isfinite(h) or h <= 0:
-            return None
-        d = int(round(h / 24.0))
-        d = max(min_days, d)
-        d = min(max_days, d)
-        return d
+        v = float(x)
+        if pd.isna(v): 
+            return default
+        return v
     except Exception:
-        return None
+        return default
 
-
-def _build_title(maintenance_type: str) -> str:
-    """
-    Titre stable (sert de "clé" fonctionnelle).
-    On garde simple: un seul type de tâche par équipement provenant de l'optimisation.
-    """
-    mt = (maintenance_type or "").lower()
-    if "condition" in mt or "inspection" in mt:
-        return "Maintenance conditionnelle / inspection (optimisation)"
-    if "corrective" in mt:
-        return "Maintenance corrective (optimisation)"
-    return "Maintenance préventive planifiée (optimisation)"
-
-
-def _is_preventive(maintenance_type: str) -> bool:
-    mt = (maintenance_type or "").lower()
-    return ("préventive" in mt) or ("prevent" in mt)
-
+def _is_preventive(maintenance_type: str | None) -> bool:
+    if not maintenance_type:
+        return False
+    return "préventive" in str(maintenance_type).lower()
 
 def upsert_tasks_from_optimization(
-    *,
-    opt_df,  # DataFrame ou liste dict
+    opt_df: pd.DataFrame,
     start_date: Optional[str] = None,
-    params: Optional[BridgeParams] = None,
+    params: BridgeParams = BridgeParams(),
 ) -> Dict[str, Any]:
-    """
-    Entrée attendue (par équipement) :
-      - equipment_code
-      - T_recommended_h (priorité)
-      - sinon T_R_h
-      - sinon T_cost_h
-      - maintenance_type
 
-    Sortie : dict (résumé)
-    """
-    cfg = params or BridgeParams()
+    if opt_df is None or opt_df.empty:
+        return {"ok": False, "created": 0, "updated": 0, "skipped": 0, "errors": ["opt_df vide"]}
 
-    # normaliser en liste de dict
-    rows: List[Dict[str, Any]] = []
-    if opt_df is None:
-        return {"ok": False, "error": "opt_df vide", "created": 0, "updated": 0, "skipped": 0}
-    if hasattr(opt_df, "to_dict"):
-        rows = opt_df.to_dict("records")
-    elif isinstance(opt_df, list):
-        rows = opt_df
-    else:
-        return {"ok": False, "error": "opt_df format inconnu", "created": 0, "updated": 0, "skipped": 0}
+    df = opt_df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
 
-    # date de base
-    base = date.today()
-    if start_date:
-        try:
-            base = date.fromisoformat(str(start_date))
-        except Exception:
-            pass
+    if "equipment_code" not in df.columns:
+        return {"ok": False, "created": 0, "updated": 0, "skipped": 0, "errors": ["equipment_code manquant"]}
 
-    created = 0
-    updated = 0
-    skipped = 0
+    # intervalle choisi
+    interval_col = None
+    for c in ["T_recommended_h", "T_R_h", "T_cost_h"]:
+        if c in df.columns:
+            interval_col = c
+            break
+    if interval_col is None:
+        return {"ok": False, "created": 0, "updated": 0, "skipped": 0, "errors": ["Aucune colonne d’intervalle (h)"]}
+
+    # dataset hash (traçabilité)
+    meta = get_failures_meta()
+    ds_hash = meta.get("hash") if meta.get("ok") else None
+
+    base = date.fromisoformat(start_date) if start_date else date.today()
+
+    created = updated = skipped = 0
     errors: List[str] = []
 
-    # pour savoir si une tâche existe déjà : (equipment_code, title)
     existing = pm.list_tasks() or []
-    key_to_id: Dict[Tuple[str, str], int] = {}
-    for t in existing:
-        try:
-            key_to_id[(str(t.get("equipment_code")), str(t.get("title")))] = int(t.get("id"))
-        except Exception:
-            continue
+    # clé : (equipment_code, title, source)
+    key_map = {(str(t.get("equipment_code")), str(t.get("title")), str(t.get("source","MANUAL"))): t for t in existing}
 
-    for r in rows:
+    for _, r in df.iterrows():
         eq = str(r.get("equipment_code") or "").strip()
         if not eq:
             skipped += 1
             continue
 
-        maintenance_type = str(r.get("maintenance_type") or "")
-        title = _build_title(maintenance_type)
+        mtype = str(r.get("maintenance_type") or "").strip() or None
 
-        # intervalle en h -> jours (priorité recommended, sinon R, sinon cost)
-        h = r.get("T_recommended_h")
-        if h is None:
-            h = r.get("T_R_h")
-        if h is None:
-            h = r.get("T_cost_h")
-
-        # si pas d’intervalle => on skip (inspection/correctif non périodiques)
-        days = _to_days(h, min_days=cfg.min_days, max_days=cfg.max_days)
-
-        if cfg.only_if_preventive and (not _is_preventive(maintenance_type)):
-            # pas de planification calendaire stricte
+        # si option “only preventive”
+        if params.only_if_preventive and not _is_preventive(mtype):
             skipped += 1
             continue
 
-        if days is None:
+        interval_h = _safe_float(r.get(interval_col), 0.0)
+        if interval_h <= 0:
             skipped += 1
             continue
 
-        next_due = (base + timedelta(days=int(days))).isoformat()
+        per_days = max(int(params.min_days), int(round(interval_h / 24.0)))
+        next_due = (base + timedelta(days=per_days)).isoformat()
 
+        title = "Maintenance (issue de l’optimisation)"
+        src = "OPTIMISATION"
+
+        old = key_map.get((eq, title, src))
         payload = {
             "equipment_code": eq,
             "title": title,
-            "periodicity_days": int(days),
+            "periodicity_days": per_days,
             "next_due_date": next_due,
-            "last_done_date": None,
-            "status": "ACTIVE",
+            "last_done_date": old.get("last_done_date") if old else None,
+            "status": old.get("status","ACTIVE") if old else "ACTIVE",
+            "source": src,
+            "maintenance_type": mtype,
+            "opt_interval_h": interval_h,
+            "dataset_hash": ds_hash,
         }
 
         try:
-            k = (eq, title)
-            if k in key_to_id:
-                payload["id"] = key_to_id[k]
+            if old and old.get("id"):
+                payload["id"] = int(old["id"])
                 pm.upsert_task(payload)
                 updated += 1
             else:
@@ -154,10 +113,5 @@ def upsert_tasks_from_optimization(
         except Exception as e:
             errors.append(f"{eq}: {e}")
 
-    return {
-        "ok": len(errors) == 0,
-        "created": created,
-        "updated": updated,
-        "skipped": skipped,
-        "errors": errors[:20],
-    }
+    ok = len(errors) == 0
+    return {"ok": ok, "created": created, "updated": updated, "skipped": skipped, "errors": errors, "interval_col": interval_col}
