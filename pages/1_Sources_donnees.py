@@ -1,27 +1,29 @@
+# pages/1_Sources.py  (ou ton nom réel de page)
 from __future__ import annotations
-import io, sqlite3, time
+
+import io
+import sqlite3
 from pathlib import Path
 from typing import Optional
+
 import pandas as pd
 import streamlit as st
+
 from core.security.auth import require_login
-
-st.set_page_config(page_title="Transformateurs", page_icon="🔌", layout="wide")
-
-require_login()  # tant que auth_ok n’est pas True, cette page est bloquée
-
-# ... le reste de ta page ...
+from core.datahub import set_current_failures_df, get_failures_meta, get_current_failures_df
 
 st.set_page_config(page_title="Sources de données", page_icon="📥", layout="wide")
+require_login()
+
 st.title("📥 Sources de données")
+st.caption("Ici tu charges/constructs les TTF. Ensuite **Indicateurs / Optimisation / Maintenance** utilisent ce même dataset automatiquement.")
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True, parents=True)
-CONSOLIDATED = DATA_DIR / "failures_saved.csv"
 DB_PATH = DATA_DIR / "reliability.sqlite"
 
-# ------- DB helpers (autonomes, ne cassent rien) -------
+# ------- DB helpers -------
 def _db_conn():
     DB_PATH.parent.mkdir(exist_ok=True, parents=True)
     return sqlite3.connect(DB_PATH)
@@ -41,24 +43,30 @@ def init_db():
         cx.commit()
 
 def bulk_insert_failures(df: pd.DataFrame, source: str):
-    if df.empty: return 0
-    cols = ["equipment_code","ttf_h","duree_rep_h"]
-    for c in cols:
+    if df is None or df.empty:
+        return 0
+    df = df.copy()
+    for c in ["equipment_code", "ttf_h", "duree_rep_h"]:
         if c not in df.columns:
             df[c] = None
-    rows = df[cols].values.tolist()
+    df["equipment_code"] = df["equipment_code"].astype(str)
+    df["ttf_h"] = pd.to_numeric(df["ttf_h"], errors="coerce")
+    df = df.dropna(subset=["ttf_h"])
+    df = df[df["ttf_h"] > 0]
+
+    rows = df[["equipment_code","ttf_h","duree_rep_h"]].values.tolist()
     with _db_conn() as cx:
-        cx.executemany("INSERT INTO failures (equipment_code, ttf_h, duree_rep_h, source) VALUES (?,?,?,?)",
-                       [(*r, source) for r in rows])
+        cx.executemany(
+            "INSERT INTO failures (equipment_code, ttf_h, duree_rep_h, source) VALUES (?,?,?,?)",
+            [(*r, source) for r in rows]
+        )
         cx.commit()
     return len(rows)
 
-def clear_db_and_csv():
-    if CONSOLIDATED.exists():
-        try: CONSOLIDATED.unlink()
-        except Exception: pass
+def clear_db():
     with _db_conn() as cx:
-        cx.execute("DELETE FROM failures"); cx.commit()
+        cx.execute("DELETE FROM failures")
+        cx.commit()
 
 init_db()
 
@@ -70,7 +78,7 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
         "equipment": "equipment_code", "equipement": "equipment_code",
         "code_equipement": "equipment_code", "eqp": "equipment_code",
         "ttf": "ttf_h", "ttf_hours": "ttf_h",
-        "duree_rep_h": "duree_rep_h", "mttr_h": "duree_rep_h",
+        "mttr_h": "duree_rep_h",
         "repair_hours": "duree_rep_h",
         "failure_time": "failure_time", "failure_date": "failure_time",
         "date_panne": "failure_time",
@@ -91,19 +99,21 @@ def _compute_ttf_from_timestamps(df: pd.DataFrame, eq_col: str, ts_col: str) -> 
         t = g[ts_col].tolist()
         for i in range(1, len(t)):
             dh = (t[i] - t[i-1]).total_seconds() / 3600.0
-            if dh > 0: out.append({"equipment_code": str(eq), "ttf_h": dh})
+            if dh > 0:
+                out.append({"equipment_code": str(eq), "ttf_h": dh})
     return pd.DataFrame(out)
 
-def _put_session(df: pd.DataFrame, src_label: str):
-    st.session_state["failures_df"] = df.copy()
-    st.session_state["failures_src"] = src_label
+# ------------------------- Header meta -------------------------
+meta = get_failures_meta()
+if meta.get("ok"):
+    st.success(f"Dataset actif ✅ | rows={meta['rows']} | hash={meta['hash']} | source={meta['source']}")
+else:
+    st.warning("Aucun dataset actif pour le moment. Charge un CSV ci-dessous.")
 
-# ------------------------- Onglets -------------------------
-tab_csv, tab_mqtt = st.tabs(["Fichier CSV / DB", "Données MQTT (réglages)"])
+tab_csv, tab_mqtt = st.tabs(["📄 Fichier CSV / DB", "📡 Données MQTT (réglages)"])
 
 with tab_csv:
     st.subheader("Importer ou construire les TTF (heures)")
-
     c1, c2 = st.columns(2)
     with c1:
         up = st.file_uploader("Déposer un CSV", type=["csv"])
@@ -114,8 +124,8 @@ with tab_csv:
 
     df_loaded: Optional[pd.DataFrame] = None
     if up is not None:
-        content = up.read()
         try:
+            content = up.read()
             df_loaded = pd.read_csv(io.BytesIO(content))
         except Exception as e:
             st.error(f"Lecture CSV: {e}")
@@ -127,100 +137,50 @@ with tab_csv:
             existing = df_loaded.columns.tolist()
             eq_col = st.selectbox("Colonne équipement", options=existing, index=0)
             ts_col = st.selectbox("Colonne horodatage panne", options=existing, index=min(1, len(existing)-1))
-            if st.button("🧮 Construire ttf_h"):
+            if st.button("🧮 Construire ttf_h", type="primary"):
                 try:
                     ttf_df = _compute_ttf_from_timestamps(df_loaded, eq_col, ts_col)
-                    st.success(f"{len(ttf_df)} TTF construits.")
-                    st.dataframe(ttf_df.head(50), use_container_width=True, hide_index=True)
-                    _put_session(ttf_df, src_label=f"upload:{up.name} (TTF construit)")
+                    if ttf_df.empty:
+                        st.error("Impossible de construire des TTF (vérifie les dates/format).")
+                    else:
+                        res = set_current_failures_df(ttf_df, source_name=f"upload:{up.name}(timestamps)", persist=True)
+                        st.success(f"Dataset synchronisé ✅ | {res['rows']} lignes | hash={res['hash']}")
+                        st.dataframe(ttf_df.head(50), use_container_width=True, hide_index=True)
                 except Exception as e:
                     st.error(f"Construction TTF: {e}")
         else:
             missing = [c for c in REQUIRED if c not in df_loaded.columns]
             if missing:
-                st.warning(f"Colonnes manquantes: {missing}. Essaie l'option horodatage ou renomme tes colonnes.")
+                st.warning(f"Colonnes manquantes: {missing}. Active l’option horodatage ou renomme tes colonnes.")
             else:
-                st.success(f"Colonnes OK: {REQUIRED}")
                 st.dataframe(df_loaded.head(50), use_container_width=True, hide_index=True)
                 cL, cR = st.columns(2)
                 with cL:
-                    if st.button("📥 Charger en session"):
-                        _put_session(df_loaded, src_label=f"upload:{up.name}")
-                        st.toast("Jeu chargé en session ✅")
+                    if st.button("✅ Utiliser ce dataset (session + fichier)", type="primary"):
+                        res = set_current_failures_df(df_loaded, source_name=f"upload:{up.name}", persist=True)
+                        st.success(f"Dataset synchronisé ✅ | {res['rows']} lignes | hash={res['hash']}")
                 with cR:
-                    if st.button("💾 Enregistrer → CSV (data/failures_saved.csv)"):
-                        try:
-                            df_loaded.to_csv(CONSOLIDATED, index=False, encoding="utf-8")
-                            st.success(f"Écrit: {CONSOLIDATED}")
-                        except Exception as e:
-                            st.error(f"Écriture: {e}")
+                    if st.button("⬆️ Envoyer dans SQLite (historique)", use_container_width=True):
+                        n = bulk_insert_failures(df_loaded, source=f"upload:{up.name}")
+                        st.success(f"{n} lignes insérées dans {DB_PATH.name}")
 
     st.divider()
-    st.subheader("Sauvegarde projet / Base SQLite")
-
-    # Vue du jeu en session
-    if isinstance(st.session_state.get("failures_df"), pd.DataFrame):
-        cur = st.session_state["failures_df"]
-        st.caption(f"Source: {st.session_state.get('failures_src','')}")
-        st.dataframe(cur.head(30), use_container_width=True, hide_index=True)
-
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            if st.button("💾 Sauver en CSV (consolidé)"):
-                try:
-                    cur.to_csv(CONSOLIDATED, index=False, encoding="utf-8")
-                    st.success(f"Écrit: {CONSOLIDATED}")
-                except Exception as e:
-                    st.error(f"Écriture: {e}")
-        with c2:
-            if st.button("⬆️ Synchroniser vers SQLite"):
-                try:
-                    n = bulk_insert_failures(cur, source=st.session_state.get("failures_src","session"))
-                    st.success(f"{n} lignes insérées dans {DB_PATH.name}")
-                except Exception as e:
-                    st.error(f"SQLite: {e}")
-        with c3:
-            if st.button("🗑️ Purge CSV + DB (irréversible)"):
-                clear_db_and_csv()
-                st.success("Consolidé effacé et table 'failures' vidée.")
-
+    st.subheader("Dataset actuel (lecture)")
+    cur = get_current_failures_df()
+    if cur.empty:
+        st.info("Aucun dataset actif.")
     else:
-        c0, c1 = st.columns([2,1])
-        with c0:
-            if CONSOLIDATED.exists():
-                st.info("Aucun jeu en session, mais un fichier consolidé existe.")
-                if st.button("Charger le consolidé en session"):
-                    try:
-                        df0 = pd.read_csv(CONSOLIDATED)
-                        _put_session(df0, src_label=str(CONSOLIDATED))
-                        st.success("Chargé en session ✅")
-                    except Exception as e:
-                        st.error(f"Lecture consolidé: {e}")
+        st.dataframe(cur.head(50), use_container_width=True, hide_index=True)
+
+        c1, c2 = st.columns(2)
         with c1:
-            if st.button("🗑️ Purge CSV + DB"):
-                clear_db_and_csv()
-                st.success("Consolidé effacé et table 'failures' vidée.")
-
-    st.divider()
-    st.subheader("Analyse rapide (organigramme + indicateurs)")
-
-    try:
-        from core.reliability.unify import compute_bundle, UnifyOptions
-        if st.button("▶️ Lancer l’analyse maintenant"):
-            src_df = st.session_state.get("failures_df")
-            bundle = compute_bundle(session_df=src_df, options=UnifyOptions(force_weibull_2p=True))
-            # export
-            out_csv = DATA_DIR / "last_metrics.csv"
-            bundle.metrics_df.to_csv(out_csv, index=False, encoding="utf-8")
-            st.success(f"Rapport synthèse → {out_csv}")
-
-            cA, cB = st.columns([2,1])
-            with cA:
-                st.dataframe(bundle.metrics_df, use_container_width=True, hide_index=True)
-            with cB:
-                st.json(bundle.pipeline_by_eq, expanded=False)
-    except Exception as e:
-        st.warning(f"Analyse rapide indisponible: {e}")
+            if st.button("⬆️ Synchroniser dataset actif vers SQLite", use_container_width=True):
+                n = bulk_insert_failures(cur, source=str(meta.get("source", "session")))
+                st.success(f"{n} lignes insérées dans {DB_PATH.name}")
+        with c2:
+            if st.button("🗑️ Purge DB (failures) uniquement", use_container_width=True):
+                clear_db()
+                st.success("Table failures vidée.")
 
 with tab_mqtt:
     st.subheader("Paramètres MQTT (pour la page Temps réel)")
@@ -251,7 +211,7 @@ with tab_mqtt:
         topic_base = st.text_input("Topic base", cfg.get("topic_base", "lab/transfo"))
         st.caption("Ex: lab/transfo/{site}/{equipement}/measures")
 
-    if st.button("💾 Enregistrer paramètres MQTT"):
+    if st.button("💾 Enregistrer paramètres MQTT", type="primary"):
         new_cfg = {"host": host, "port": int(port), "site": site,
                    "equipement": eqp, "topic_base": topic_base}
         save_mqtt(new_cfg)

@@ -1,25 +1,23 @@
+# pages/3_Optimisation.py (ou ton nom réel)
 from __future__ import annotations
 
-from pathlib import Path
 import math
 import numpy as np
 import pandas as pd
 import streamlit as st
-
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from pathlib import Path
+
+from core.security.auth import require_login
+from core.datahub import get_current_failures_df, set_current_failures_df, get_failures_meta
 
 from core.reliability.weibull import fit_weibull
 from core.reliability.policy import suggested_actions
 from core.reliability.organigram import analyze_ttf_pipeline
 from core.reliability.optimize import propose_intervals_cost_and_reliability
-from core.security.auth import require_login
 
-
-# ==========================
-# PDF export (SAFE IMPORT)
-# ==========================
 export_optimization_report_pdf = None
 _pdf_import_error = None
 try:
@@ -29,44 +27,11 @@ except Exception as e:
     _pdf_import_error = e
     export_optimization_report_pdf = None
 
-
 st.set_page_config(page_title="Optimisation maintenance", page_icon="🧠", layout="wide")
 require_login()
-
 st.title("🧠 Optimisation — Intervalles, coût & fiabilité")
 
-
-# ---------- Helpers ----------
-def _read_csv_flex(src):
-    def _try_read(s, **kw):
-        try:
-            return pd.read_csv(s, **kw)
-        except Exception:
-            return None
-
-    df = _try_read(src)
-    if df is None:
-        if hasattr(src, "seek"):
-            try:
-                src.seek(0)
-            except Exception:
-                pass
-        df = _try_read(src, engine="python", on_bad_lines="skip", sep=None)
-
-    if df is None:
-        if hasattr(src, "seek"):
-            try:
-                src.seek(0)
-            except Exception:
-                pass
-        df = _try_read(src, sep=";", engine="python", on_bad_lines="skip")
-
-    if df is None:
-        return pd.DataFrame()
-
-    df.columns = [str(c).strip() for c in df.columns]
-    return df
-
+BASE_DIR = Path(__file__).resolve().parents[1]
 
 def fnum(x, nd=2, default="—"):
     try:
@@ -79,53 +44,44 @@ def fnum(x, nd=2, default="—"):
     except Exception:
         return default
 
-
 def is_pos_number(x) -> bool:
     return isinstance(x, (int, float)) and float(x) > 0 and np.isfinite(float(x))
 
+# -------------------------
+# Dataset officiel + option upload (synchronise)
+# -------------------------
+meta0 = get_failures_meta()
+df0 = get_current_failures_df()
 
-# ==========================
-# 1) Chargement données
-# ==========================
-BASE_DIR = Path(__file__).resolve().parents[1]
-DATA_FILE = BASE_DIR / "data" / "failures_saved.csv"
+st.info(f"Dataset projet | rows={meta0.get('rows')} | hash={meta0.get('hash')} | source={meta0.get('source')}")
 
-src = st.radio("Source TTF", ["Fichier projet", "Uploader CSV"], horizontal=True)
-
-if src == "Fichier projet":
-    if not DATA_FILE.exists():
-        st.error("Aucun fichier data/failures_saved.csv — va dans « Sources de données » pour enregistrer.")
-        st.stop()
-    df = _read_csv_flex(DATA_FILE)
-else:
+with st.expander("📥 Option : remplacer le dataset du projet avec un upload (synchronise tout)", expanded=False):
     up = st.file_uploader("CSV (equipment_code, ttf_h)", type=["csv"])
-    if up is None:
-        st.stop()
-    df = _read_csv_flex(up)
+    if up is not None and st.button("✅ Synchroniser ce CSV comme dataset officiel", type="primary"):
+        try:
+            df_up = pd.read_csv(up)
+            res = set_current_failures_df(df_up, source_name=f"optimization_upload:{up.name}", persist=True)
+            if res.get("ok"):
+                st.success(f"Dataset remplacé ✅ | rows={res['rows']} | hash={res['hash']}")
+                st.rerun()
+            else:
+                st.error(res.get("msg"))
+        except Exception as e:
+            st.error(f"Upload: {e}")
+
+df = get_current_failures_df()
+meta = get_failures_meta()
 
 if df.empty:
-    st.error("CSV vide ou illisible.")
+    st.error("Aucun dataset actif. Va sur « Sources de données » et synchronise un CSV.")
     st.stop()
 
-required = {"equipment_code", "ttf_h"}
-if not required.issubset(set(df.columns)):
-    st.error("Colonnes requises: equipment_code, ttf_h")
-    st.stop()
+st.success(f"Dataset actif ✅ | rows={meta['rows']} | hash={meta['hash']} | source={meta['source']}")
 
-df["equipment_code"] = df["equipment_code"].astype(str)
-df["ttf_h"] = pd.to_numeric(df["ttf_h"], errors="coerce")
-df = df.dropna(subset=["ttf_h"])
-df = df[df["ttf_h"] > 0]
-
+# -------------------------
+# Fit Weibull
+# -------------------------
 eqs = sorted(df["equipment_code"].unique().tolist())
-if not eqs:
-    st.error("Aucun équipement valide (TTF>0).")
-    st.stop()
-
-
-# ==========================
-# 2) Fit Weibull (baseline)
-# ==========================
 fits = {}
 for eq in eqs:
     x = df.loc[df["equipment_code"] == eq, "ttf_h"].values
@@ -139,36 +95,28 @@ if not fits:
     st.error("Pas assez de TTF (≥3) pour estimer Weibull.")
     st.stop()
 
-
-# ==========================
-# 3) Paramètres utilisateur
-# ==========================
+# -------------------------
+# Paramètres
+# -------------------------
 st.markdown("### Paramètres de fiabilité et de coût")
 
 colR, colC1, colC2, colRmin = st.columns(4)
 with colR:
     R_target = st.slider("Fiabilité cible R(t)", 0.50, 0.99, 0.80, 0.01)
 with colC1:
-    C_prev = st.number_input("Coût maintenance préventive (C_prev)", min_value=0.0, value=1.0, step=0.1)
+    C_prev = st.number_input("Coût préventif (C_prev)", min_value=0.0, value=1.0, step=0.1)
 with colC2:
-    C_corr = st.number_input("Coût panne / corrective (C_corr)", min_value=0.0, value=5.0, step=0.5)
+    C_corr = st.number_input("Coût panne (C_corr)", min_value=0.0, value=5.0, step=0.5)
 with colRmin:
-    R_min_cost = st.slider("Fiabilité min. pour l’optimum coût", 0.0, 0.99, 0.70, 0.01)
-
-st.caption(
-    "Formule coût (politique âge) : "
-    "C(T) = (C_prev·R(T) + C_corr·(1−R(T))) / ∫₀ᵀ R(t)dt. "
-    "Le préventif est pondéré par R(T) (on ne paye pas si la panne survient avant T)."
-)
+    R_min_cost = st.slider("Fiabilité min. pour optimum coût", 0.0, 0.99, 0.70, 0.01)
 
 econ_enabled = (C_prev > 0) and (C_corr > 0)
 if not econ_enabled:
-    st.warning("Renseigne C_prev > 0 et C_corr > 0 pour activer l’optimisation économique (T_cost).")
+    st.warning("Renseigne C_prev > 0 et C_corr > 0 pour activer T_cost.")
 
-
-# ==========================
-# 4) Organigramme (par équipement)
-# ==========================
+# -------------------------
+# Organigramme
+# -------------------------
 org_results: dict[str, dict] = {}
 for eq in fits.keys():
     ttf = df.loc[df["equipment_code"] == eq, "ttf_h"].tolist()
@@ -177,10 +125,9 @@ for eq in fits.keys():
     except Exception:
         org_results[eq] = {}
 
-
-# ==========================
-# 5) Intervalles coût + fiabilité
-# ==========================
+# -------------------------
+# Intervalles
+# -------------------------
 res_all = {}
 if econ_enabled:
     res_all = propose_intervals_cost_and_reliability(
@@ -196,19 +143,14 @@ intervals_cost = {eq: (res_all.get(eq) or {}).get("T_cost") for eq in fits.keys(
 R_at_cost = {eq: (res_all.get(eq) or {}).get("R_at_T") for eq in fits.keys()}
 C_min_map = {eq: (res_all.get(eq) or {}).get("C_min") for eq in fits.keys()}
 
-
-# ==========================
-# 6) Recommandations
-# ==========================
 def recommend_maintenance(beta: float, model: str | None = None) -> str:
     if beta < 0.9:
-        return "Corrective + fiabilisation (pannes de jeunesse)"
+        return "Corrective + fiabilisation"
     if 0.9 <= beta <= 1.1:
-        return "Conditionnelle / inspection (pannes aléatoires)"
+        return "Conditionnelle / inspection"
     if model and "NHPP" in str(model).upper():
-        return "Préventive planifiée (bloc/inspection) — vieillissement"
-    return "Préventive planifiée (âge) — usure / vieillissement"
-
+        return "Préventive planifiée"
+    return "Préventive planifiée"
 
 def recommend_interval(beta: float, T_cost: float | None, T_R: float | None) -> float | None:
     if beta <= 1.1:
@@ -216,10 +158,9 @@ def recommend_interval(beta: float, T_cost: float | None, T_R: float | None) -> 
     vals = [v for v in [T_cost, T_R] if is_pos_number(v)]
     return float(min(vals)) if vals else None
 
-
-# ==========================
-# 7) Tableau synthèse + CSV
-# ==========================
+# -------------------------
+# Tableau synthèse
+# -------------------------
 rows = []
 for eq, ft in fits.items():
     org = org_results.get(eq, {}) or {}
@@ -229,8 +170,6 @@ for eq, ft in fits.items():
 
     itv_R = intervals_R.get(eq)
     itv_C = intervals_cost.get(eq)
-    R_cost = R_at_cost.get(eq)
-    C_min = C_min_map.get(eq)
 
     maint_type = recommend_maintenance(beta, org.get("model"))
     T_rec = recommend_interval(beta, itv_C, itv_R)
@@ -240,23 +179,33 @@ for eq, ft in fits.items():
         "beta": round(beta, 3) if np.isfinite(beta) else None,
         "eta_h": round(eta, 1) if np.isfinite(eta) else None,
         "gamma_h": round(gamma, 1) if np.isfinite(gamma) else 0.0,
-
         "T_cost_h": round(float(itv_C), 1) if is_pos_number(itv_C) else None,
-        "R(T_cost)": round(float(R_cost), 3) if is_pos_number(R_cost) else None,
-        "C_min_per_h": round(float(C_min), 4) if is_pos_number(C_min) else None,
-
         "T_R_h": round(float(itv_R), 1) if is_pos_number(itv_R) else None,
-
         "T_recommended_h": round(float(T_rec), 1) if is_pos_number(T_rec) else None,
         "maintenance_type": maint_type,
-
         "model": org.get("model", "?"),
         "distribution": org.get("distribution", "?"),
     })
 
 df_out = pd.DataFrame(rows).sort_values("equipment_code").reset_index(drop=True)
+
+st.subheader("📋 Synthèse optimisation (à synchroniser vers Maintenance)")
+st.dataframe(df_out, use_container_width=True, hide_index=True)
+
+csv_bytes = df_out.to_csv(index=False).encode("utf-8")
+st.download_button(
+    "⬇️ Télécharger CSV optimisé",
+    data=csv_bytes,
+    file_name="optimisation_intervalles.csv",
+    mime="text/csv",
+    use_container_width=True,
+)
+
+# -------------------------
+# Passerelle vers Maintenance (comme tu l’avais)
+# -------------------------
 st.divider()
-st.subheader("🔁 Passerelle → Maintenance (création/MAJ des tâches PM)")
+st.subheader("🔁 Passerelle → Maintenance (création/MAJ pm_task)")
 
 from core.maintenance.bridge import upsert_tasks_from_optimization, BridgeParams
 
@@ -282,35 +231,14 @@ if st.button("✅ Synchroniser les tâches vers Maintenance", type="primary"):
         if res.get("errors"):
             st.error("Erreurs: " + " | ".join(res["errors"]))
 
-st.subheader("📋 Synthèse optimisation (coût, fiabilité, recommandation)")
-st.dataframe(df_out, use_container_width=True, hide_index=True)
-
-csv_bytes = df_out.to_csv(index=False).encode("utf-8")
-st.download_button(
-    "⬇️ Télécharger CSV optimisé",
-    data=csv_bytes,
-    file_name="optimisation_intervalles.csv",
-    mime="text/csv",
-)
-
-
-# ==========================
-# 8) Courbes R(t) (Weibull)
-# ==========================
+# -------------------------
+# Courbe R(t) (simple)
+# -------------------------
+st.divider()
 st.subheader("📈 Courbes R(t) (Weibull)")
 
 etas = [float(getattr(ft, "eta", 1.0) or 1.0) for ft in fits.values()]
 tmax = max(etas) * 1.6 if etas else 1000.0
-
-maybe_itv = []
-for eq in fits.keys():
-    if is_pos_number(intervals_R.get(eq)):
-        maybe_itv.append(float(intervals_R[eq]))
-    if is_pos_number(intervals_cost.get(eq)):
-        maybe_itv.append(float(intervals_cost[eq]))
-if maybe_itv:
-    tmax = max(tmax, max(maybe_itv) * 1.2)
-
 t = np.linspace(0, max(tmax, 1.0), 350)
 
 fig, ax = plt.subplots()
@@ -322,7 +250,7 @@ for eq, ft in fits.items():
     y = np.ones_like(t, dtype=float)
     mask = t > gamma
     y[mask] = np.exp(-(((t[mask] - gamma) / max(eta, 1e-9)) ** max(beta, 1e-9)))
-    ax.plot(t, y, linewidth=2, label=f"{eq} (β={beta:.2f}, η={eta:.1f}, γ={gamma:.1f})")
+    ax.plot(t, y, linewidth=2, label=f"{eq} (β={beta:.2f})")
 
 ax.grid(True, alpha=.3)
 ax.set_xlabel("Temps (h)")
@@ -330,101 +258,3 @@ ax.set_ylabel("R(t)")
 ax.set_title("Fiabilité R(t)")
 ax.legend(fontsize=8)
 st.pyplot(fig, clear_figure=True)
-
-
-# ==========================
-# 9) Détails & interprétation
-# ==========================
-st.subheader("🔎 Détails & interprétation")
-
-sel_eq = st.selectbox("Équipement", options=df_out["equipment_code"].tolist())
-row = df_out[df_out["equipment_code"] == sel_eq].iloc[0].to_dict()
-ft = fits[sel_eq]
-org = (org_results.get(sel_eq, {}) or {})
-
-beta = float(getattr(ft, "beta", float("nan")))
-eta = float(getattr(ft, "eta", float("nan")))
-gamma = float(getattr(ft, "gamma", 0.0) or 0.0)
-
-itv_R = intervals_R.get(sel_eq)
-itv_C = intervals_cost.get(sel_eq)
-R_cost = R_at_cost.get(sel_eq)
-C_min = C_min_map.get(sel_eq)
-
-st.markdown(
-    f"### Résultats — **{sel_eq}**\n"
-    f"- **β (forme)** = **{fnum(beta,3)}** → tendance du taux de panne (jeunesse / aléatoire / usure)\n"
-    f"- **η (échelle)** = **{fnum(eta,1)} h** → temps caractéristique\n"
-    f"- **γ (décalage)** = **{fnum(gamma,1)} h** → délai sans panne (si modèle 3p)\n"
-    f"- **T_cost** = **{fnum(itv_C,1)} h** → optimum économique (si coûts valides)\n"
-    f"- **R(T_cost)** = **{fnum(R_cost,3)}** → fiabilité à l’optimum économique\n"
-    f"- **C_min** = **{fnum(C_min,4)} /h** → coût moyen minimal par heure\n"
-    f"- **T_R** = **{fnum(itv_R,1)} h** → seuil calendaire pour **R_target={R_target:.2f}**\n"
-    f"- **Maintenance recommandée** : **{row.get('maintenance_type','—')}**\n"
-)
-
-if is_pos_number(row.get("T_recommended_h")):
-    st.markdown(f"- **Intervalle recommandé** : **{row['T_recommended_h']:.1f} h** (compromis prudent)")
-else:
-    st.markdown("- **Intervalle recommandé** : basé sur l’état/inspection (pas de périodicité stricte)")
-
-st.caption(
-    "Note: T_cost est économique, T_R est orienté fiabilité. "
-    "Sur un équipement critique, on privilégie souvent T_R ou on impose une fiabilité minimale élevée."
-)
-
-st.write(f"Modèle global (organigramme): **{org.get('model','?')}** • Distribution: **{org.get('distribution','?')}**")
-
-st.markdown("#### Actions suggérées (selon β)")
-for a in suggested_actions(beta if np.isfinite(beta) else 1.0):
-    st.markdown(f"- {a}")
-
-
-# ==========================
-# 10) Export PDF + Download
-# ==========================
-st.divider()
-st.subheader("📄 Rapport PDF — Optimisation")
-
-if export_optimization_report_pdf is None:
-    st.info("Module `core.reliability.reporting_optimize` non détecté.")
-    if _pdf_import_error is not None:
-        st.caption(f"Détail import: {_pdf_import_error}")
-else:
-    if st.button("📄 Générer rapport optimisation (PDF)"):
-        try:
-            out_dir = str(BASE_DIR / "reports")
-
-            # intervals attendu = dict[str, dict]
-            intervals = {}
-            for eq in fits.keys():
-                intervals[eq] = {
-                    "T_R": intervals_R.get(eq),
-                    "T_cost": intervals_cost.get(eq),
-                    "R_at_T": R_at_cost.get(eq),
-                    "C_min": C_min_map.get(eq),
-                }
-
-            # ✅ organigram_by_eq obligatoire (positional ou keyword exact)
-            path = export_optimization_report_pdf(
-                df,
-                fits,
-                intervals,
-                org_results,     # <- organigram_by_eq (obligatoire)
-                out_dir=out_dir,
-            )
-
-            st.session_state["opt_pdf_path"] = path
-            st.success(f"PDF généré : {path}")
-        except Exception as e:
-            st.error(f"PDF : {e}")
-
-    pdf_path = st.session_state.get("opt_pdf_path")
-    if pdf_path and Path(pdf_path).exists():
-        with open(pdf_path, "rb") as f:
-            st.download_button(
-                "📥 Télécharger le PDF optimisation",
-                data=f,
-                file_name=Path(pdf_path).name,
-                mime="application/pdf",
-            )
