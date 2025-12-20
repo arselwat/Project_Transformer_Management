@@ -1,8 +1,9 @@
-# pages/3_Optimisation.py
+# pages/4_Optimisation.py
 from __future__ import annotations
 
 from pathlib import Path
 import math
+import hashlib
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -17,12 +18,6 @@ from core.reliability.organigram import analyze_ttf_pipeline
 from core.reliability.optimize import propose_intervals_cost_and_reliability
 from core.security.auth import require_login
 
-# ✅ NEW: DataHub (dataset unique projet)
-from core.datahub import (
-    get_current_failures_df,
-    set_current_failures_df,
-    get_failures_meta,
-)
 
 # ==========================
 # PDF export (SAFE IMPORT)
@@ -42,8 +37,8 @@ require_login()
 
 st.title("🧠 Optimisation — Intervalles, coût & fiabilité")
 st.caption(
-    "Cette page calcule des intervalles de maintenance à partir des données TTF (temps entre pannes). "
-    "Elle propose un **optimum coût (T_cost)** et un **seuil fiabilité (T_R)**, puis des **recommandations**."
+    "Cette page calcule un planning optimisé (par équipement) et peut **envoyer directement** le résultat à la page Maintenance "
+    "sans passer par une BD (utile tant que la BD n'est pas prête)."
 )
 
 # ---------- Helpers ----------
@@ -91,75 +86,38 @@ def fnum(x, nd=2, default="—"):
 
 
 def is_pos_number(x) -> bool:
-    return isinstance(x, (int, float)) and float(x) > 0 and np.isfinite(float(x))
+    try:
+        return float(x) > 0 and np.isfinite(float(x))
+    except Exception:
+        return False
+
+
+def _df_hash(df: pd.DataFrame) -> str:
+    b = df.to_csv(index=False).encode("utf-8")
+    return hashlib.md5(b).hexdigest()
 
 
 # ==========================
-# ✅ 1) Chargement données (SYNCHRO)
+# 1) Chargement données
 # ==========================
 BASE_DIR = Path(__file__).resolve().parents[1]
+DATA_FILE = BASE_DIR / "data" / "failures_saved.csv"
 
-st.markdown("### 📌 Données utilisées pour les calculs (TTF)")
-meta = get_failures_meta()
+src = st.radio("Source TTF", ["Fichier projet", "Uploader CSV"], horizontal=True)
 
-if meta.get("ok"):
-    st.success(f"Dataset projet actif ✅ | lignes={meta['rows']} | hash={meta['hash']} | source={meta['source']}")
-else:
-    st.warning("Aucun dataset projet actif. Va d’abord sur « Sources de données » pour enregistrer un dataset.")
-
-# ⚙️ On garde ton UI de choix, mais on empêche la désynchro
-src = st.radio(
-    "Source TTF",
-    ["Dataset projet (officiel)", "Uploader CSV"],
-    horizontal=True,
-    help=(
-        "Conseil: utilise le dataset projet pour rester synchronisé avec Indicateurs/Maintenance.\n"
-        "Si tu uploades un CSV, tu peux choisir de le synchroniser comme dataset officiel."
-    ),
-)
-
-df = pd.DataFrame()
-
-if src == "Dataset projet (officiel)":
-    df = get_current_failures_df()
-    if df.empty:
-        st.error("Dataset projet introuvable / vide. Va dans « Sources de données » et enregistre.")
+if src == "Fichier projet":
+    if not DATA_FILE.exists():
+        st.error("Aucun fichier data/failures_saved.csv — va dans « Sources de données » pour enregistrer.")
         st.stop()
-
+    df = _read_csv_flex(DATA_FILE)
 else:
     up = st.file_uploader("CSV (equipment_code, ttf_h)", type=["csv"])
     if up is None:
         st.stop()
+    df = _read_csv_flex(up)
 
-    df_up = _read_csv_flex(up)
-    if df_up.empty:
-        st.error("CSV vide ou illisible.")
-        st.stop()
-
-    st.dataframe(df_up.head(30), use_container_width=True, hide_index=True)
-
-    # ✅ Option: synchroniser comme dataset officiel (corrige la désynchro)
-    sync_as_official = st.checkbox(
-        "✅ Synchroniser cet upload comme dataset officiel du projet",
-        value=False,
-        help="Si coché, Indicateurs/Maintenance utiliseront aussi ce dataset après synchronisation.",
-    )
-
-    if sync_as_official:
-        if st.button("🔁 Appliquer la synchronisation maintenant", type="primary"):
-            res = set_current_failures_df(df_up, source_name=f"upload:{getattr(up,'name','csv')}", persist=True)
-            if res.get("ok"):
-                st.success(f"Dataset synchronisé ✅ | lignes={res['rows']} | hash={res['hash']}")
-                st.rerun()
-            else:
-                st.error(res.get("msg", "Synchronisation échouée."))
-
-    # Si pas synchronisé, on utilise ce DF uniquement dans cette page (temporaire)
-    df = df_up.copy()
-
-# --- validation colonnes + nettoyage (comme avant) ---
 if df.empty:
-    st.error("Dataset vide.")
+    st.error("CSV vide ou illisible.")
     st.stop()
 
 required = {"equipment_code", "ttf_h"}
@@ -176,8 +134,6 @@ eqs = sorted(df["equipment_code"].unique().tolist())
 if not eqs:
     st.error("Aucun équipement valide (TTF>0).")
     st.stop()
-
-st.caption(f"Équipements détectés: {len(eqs)} | TTF totaux: {len(df)}")
 
 
 # ==========================
@@ -275,7 +231,7 @@ def recommend_interval(beta: float, T_cost: float | None, T_R: float | None) -> 
 
 
 # ==========================
-# 7) Tableau synthèse + CSV
+# 7) Tableau synthèse + CSV + PASSERELLE
 # ==========================
 rows = []
 for eq, ft in fits.items():
@@ -314,6 +270,31 @@ for eq, ft in fits.items():
 df_out = pd.DataFrame(rows).sort_values("equipment_code").reset_index(drop=True)
 
 st.divider()
+st.subheader("🧩 Passerelle → Maintenance (SANS BD)")
+
+opt_hash = _df_hash(df_out)
+colA, colB = st.columns([1, 1])
+
+with colA:
+    if st.button("✅ Envoyer ce planning à Maintenance (session)", type="primary", use_container_width=True):
+        st.session_state["opt_df_out"] = df_out.copy()
+        st.session_state["opt_meta"] = {"hash": opt_hash, "rows": int(len(df_out)), "source": "optimisation_page"}
+        st.success(f"Envoyé ✅ | rows={len(df_out)} | hash={opt_hash}")
+
+with colB:
+    DATA_DIR = BASE_DIR / "data"
+    DATA_DIR.mkdir(exist_ok=True, parents=True)
+    FALLBACK_OPT = DATA_DIR / "last_optimization.csv"
+
+    if st.button("💾 Sauver aussi en fichier (fallback Streamlit Cloud)", use_container_width=True):
+        df_out.to_csv(FALLBACK_OPT, index=False, encoding="utf-8")
+        st.success(f"Écrit: {FALLBACK_OPT}")
+
+st.caption(
+    "Astuce Streamlit Cloud : la session peut disparaître après redémarrage. "
+    "Le fichier `data/last_optimization.csv` sert de fallback."
+)
+
 st.subheader("📋 Synthèse optimisation (coût, fiabilité, recommandation)")
 st.dataframe(df_out, use_container_width=True, hide_index=True)
 
@@ -323,38 +304,8 @@ st.download_button(
     data=csv_bytes,
     file_name="optimisation_intervalles.csv",
     mime="text/csv",
+    use_container_width=True,
 )
-
-
-# ==========================
-# 7bis) Passerelle → Maintenance (inchangé)
-# ==========================
-st.divider()
-st.subheader("🔁 Passerelle → Maintenance (création/MAJ des tâches PM)")
-
-from core.maintenance.bridge import upsert_tasks_from_optimization, BridgeParams
-
-col1, col2, col3 = st.columns(3)
-with col1:
-    only_prev = st.toggle("Créer tâches uniquement si Préventive", value=True)
-with col2:
-    min_days = st.number_input("Périodicité minimale (jours)", min_value=1, value=7, step=1)
-with col3:
-    start_dt = st.date_input("Date de départ planning", value=None)
-
-if st.button("✅ Synchroniser les tâches vers Maintenance", type="primary"):
-    cfg = BridgeParams(min_days=int(min_days), only_if_preventive=bool(only_prev))
-    res = upsert_tasks_from_optimization(
-        opt_df=df_out,
-        start_date=str(start_dt) if start_dt else None,
-        params=cfg,
-    )
-    if res.get("ok"):
-        st.success(f"Tâches synchronisées ✅ | créées={res['created']} | MAJ={res['updated']} | ignorées={res['skipped']}")
-    else:
-        st.warning(f"Synchronisation partielle | créées={res['created']} | MAJ={res['updated']} | ignorées={res['skipped']}")
-        if res.get("errors"):
-            st.error("Erreurs: " + " | ".join(res["errors"]))
 
 
 # ==========================
@@ -416,24 +367,24 @@ C_min = C_min_map.get(sel_eq)
 
 st.markdown(
     f"### Résultats — **{sel_eq}**\n"
-    f"- **β (forme)** = **{fnum(beta,3)}** → tendance du taux de panne (jeunesse / aléatoire / usure)\n"
-    f"- **η (échelle)** = **{fnum(eta,1)} h** → temps caractéristique\n"
-    f"- **γ (décalage)** = **{fnum(gamma,1)} h** → délai sans panne (si modèle 3p)\n"
-    f"- **T_cost** = **{fnum(itv_C,1)} h** → optimum économique (si coûts valides)\n"
-    f"- **R(T_cost)** = **{fnum(R_cost,3)}** → fiabilité à l’optimum économique\n"
-    f"- **C_min** = **{fnum(C_min,4)} /h** → coût moyen minimal par heure\n"
-    f"- **T_R** = **{fnum(itv_R,1)} h** → seuil calendaire pour **R_target={R_target:.2f}**\n"
+    f"- **β (forme)** = **{fnum(beta,3)}**\n"
+    f"- **η (échelle)** = **{fnum(eta,1)} h**\n"
+    f"- **γ (décalage)** = **{fnum(gamma,1)} h**\n"
+    f"- **T_cost** = **{fnum(itv_C,1)} h**\n"
+    f"- **R(T_cost)** = **{fnum(R_cost,3)}**\n"
+    f"- **C_min** = **{fnum(C_min,4)} /h**\n"
+    f"- **T_R** = **{fnum(itv_R,1)} h** (R_target={R_target:.2f})\n"
     f"- **Maintenance recommandée** : **{row.get('maintenance_type','—')}**\n"
 )
 
 if is_pos_number(row.get("T_recommended_h")):
-    st.markdown(f"- **Intervalle recommandé** : **{row['T_recommended_h']:.1f} h** (compromis prudent)")
+    st.markdown(f"- **Intervalle recommandé** : **{row['T_recommended_h']:.1f} h**")
 else:
     st.markdown("- **Intervalle recommandé** : basé sur l’état/inspection (pas de périodicité stricte)")
 
 st.caption(
     "Note: T_cost est économique, T_R est orienté fiabilité. "
-    "Sur un équipement critique, on privilégie souvent T_R ou on impose une fiabilité minimale élevée."
+    "Sur un équipement critique, on privilégie souvent T_R."
 )
 
 st.write(f"Modèle global (organigramme): **{org.get('model','?')}** • Distribution: **{org.get('distribution','?')}**")
@@ -444,7 +395,7 @@ for a in suggested_actions(beta if np.isfinite(beta) else 1.0):
 
 
 # ==========================
-# 10) Export PDF + Download (inchangé)
+# 10) Export PDF + Download
 # ==========================
 st.divider()
 st.subheader("📄 Rapport PDF — Optimisation")
@@ -471,7 +422,7 @@ else:
                 df,
                 fits,
                 intervals,
-                org_results,     # organigram_by_eq (obligatoire)
+                org_results,
                 out_dir=out_dir,
             )
 
@@ -488,4 +439,5 @@ else:
                 data=f,
                 file_name=Path(pdf_path).name,
                 mime="application/pdf",
+                use_container_width=True,
             )
