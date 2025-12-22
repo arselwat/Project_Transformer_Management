@@ -5,6 +5,7 @@ import hashlib
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional
 
+import math
 import pandas as pd
 import streamlit as st
 
@@ -21,10 +22,12 @@ def _hash_df(df: pd.DataFrame) -> str:
     b = df.to_csv(index=False).encode("utf-8")
     return hashlib.md5(b).hexdigest()
 
-def _safe_float(x, default=0.0) -> float:
+def _safe_float(x, default=None) -> Optional[float]:
     try:
+        if x is None:
+            return default
         v = float(x)
-        if pd.isna(v):
+        if pd.isna(v) or math.isinf(v) or math.isnan(v):
             return default
         return v
     except Exception:
@@ -55,10 +58,138 @@ def _pick_interval_h(row: dict) -> tuple[Optional[float], Optional[str]]:
     """
     for c in ["T_recommended_h", "T_R_h", "T_cost_h", "interval_opt_h", "interval_h"]:
         if c in row and row[c] is not None:
-            v = _safe_float(row[c], 0.0)
-            if v > 0:
+            v = _safe_float(row[c], None)
+            if v is not None and v > 0:
                 return v, c
     return None, None
+
+
+# ============================================================
+# Commentaires maintenance (β, η, intervalle optimisé)
+# ============================================================
+
+def _beta_zone(beta: Optional[float]) -> str:
+    if beta is None:
+        return "unknown"
+    if beta < 0.8:
+        return "early"      # défauts précoces
+    if beta <= 1.2:
+        return "random"     # aléatoire ~ constant
+    return "wear"           # usure
+
+def _interval_intensity(interval_h: Optional[float]) -> str:
+    """
+    Classe intervalle (en heures) en intensité simple.
+    """
+    if interval_h is None:
+        return "unknown"
+    if interval_h <= 168:   # <= 7 jours
+        return "high"
+    if interval_h <= 720:   # <= 30 jours
+        return "medium"
+    return "low"
+
+def build_maintenance_comment(
+    *,
+    beta: Optional[float],
+    eta_h: Optional[float],
+    interval_h: Optional[float],
+    interval_source: Optional[str],
+    mtype_label: str,
+) -> str:
+    """
+    Génère un commentaire clair et actionnable à partir de :
+      - β : forme (pannes précoces / aléatoire / usure)
+      - η : échelle (niveau global de vie)
+      - interval_h : intervalle optimisé
+      - interval_source : T_recommended_h / T_R_h / T_cost_h / interval_opt_h ...
+      - type de maintenance (label)
+    """
+    b = _safe_float(beta, None)
+    e = _safe_float(eta_h, None)
+    itv = _safe_float(interval_h, None)
+
+    zone = _beta_zone(b)
+    intensity = _interval_intensity(itv)
+
+    # --- Lecture rapide η vs intervalle
+    # (si eta est petit et intervalle petit => risque élevé)
+    risk_hint = ""
+    if e is not None and itv is not None:
+        ratio = itv / max(e, 1e-9)
+        if ratio > 1.0:
+            risk_hint = "Intervalle > η : risque de rater des signes avant panne, rapprocher la surveillance."
+        elif ratio > 0.5:
+            risk_hint = "Intervalle proche de η : vigilance accrue, tendance à la dégradation possible."
+        else:
+            risk_hint = "Intervalle << η : surveillance conservatrice, bon pour équipements critiques."
+
+    src_txt = f"Intervalle basé sur {interval_source}" if interval_source else "Intervalle optimisé"
+
+    # --- Commentaire principal selon β
+    if zone == "early":
+        main = (
+            "β<1 : défauts précoces probables. Priorité : contrôles de mise en service, "
+            "qualité d’installation, resserrages, inspections rapprochées et correction des causes racines."
+        )
+        actions = [
+            "Faire une inspection ciblée (connexions, échauffements, isolement).",
+            "Vérifier conditions d’exploitation (surcharge, ventilation, humidité).",
+            "Tracer chaque incident pour éliminer la cause répétitive.",
+        ]
+    elif zone == "random":
+        main = (
+            "β≈1 : pannes plutôt aléatoires. Priorité : maintenance préventive standard + surveillance CBM légère "
+            "(contrôles périodiques + seuils)."
+        )
+        actions = [
+            "Maintenir un calendrier de visite régulier.",
+            "Surveiller indicateurs clés (T°, DGA/huile si dispo, isolement).",
+            "Préparer kits minimaux pour réductions de MTTR.",
+        ]
+    else:  # wear
+        main = (
+            "β>1 : régime d’usure. Priorité : CBM + préventif ciblé + remplacements planifiés avant défaillance "
+            "(inspection renforcée, tests diélectriques, contrôle refroidissement/OLTC)."
+        )
+        actions = [
+            "Augmenter la fréquence des contrôles conditionnels (tendance).",
+            "Planifier une intervention préventive (avant seuil critique).",
+            "Vérifier huile, point chaud, refroidissement, OLTC (si présent).",
+        ]
+
+    # --- Ajuster selon intensité intervalle
+    if intensity == "high":
+        freq = "Fréquence élevée (≤ 7 jours) : recommandé pour équipement à risque / critique."
+    elif intensity == "medium":
+        freq = "Fréquence moyenne (≤ 30 jours) : bon compromis coût/risque."
+    elif intensity == "low":
+        freq = "Fréquence faible (> 30 jours) : acceptable si risque faible et indicateurs stables."
+    else:
+        freq = "Fréquence non déterminée (intervalle manquant)."
+
+    # --- Clarifier le type de maintenance
+    type_line = f"Type recommandé : {mtype_label}."
+
+    # --- Construire texte final
+    parts = [
+        type_line,
+        main,
+        f"{src_txt} : {itv:.1f} h." if itv is not None else f"{src_txt} : (non disponible).",
+        freq,
+    ]
+    if e is not None:
+        parts.append(f"η ≈ {e:.1f} h (niveau global de vie / échelle).")
+    if risk_hint:
+        parts.append(risk_hint)
+    parts.append("Actions : " + " ".join(actions))
+
+    return " ".join(parts)
+
+
+# ============================================================
+# Core builder
+# ============================================================
 
 def build_virtual_pm_plan_from_optimization(
     opt_df: pd.DataFrame,
@@ -114,10 +245,22 @@ def build_virtual_pm_plan_from_optimization(
         next_due = start_date + timedelta(days=periodicity_days)
         days_left = (next_due - start_date).days
 
+        beta = row.get("beta")
+        eta_h = row.get("eta_h", row.get("eta"))
+        comment = build_maintenance_comment(
+            beta=_safe_float(beta, None),
+            eta_h=_safe_float(eta_h, None),
+            interval_h=_safe_float(interval_h, None),
+            interval_source=src,
+            mtype_label=mtype,
+        )
+
         task = {
             "equipment_code": eq,
             "title": "Plan issu de l’optimisation",
             "maintenance_type": mtype,
+
+            "maintenance_comment": comment,
 
             "interval_source": src,
             "interval_h": float(interval_h),
@@ -125,9 +268,9 @@ def build_virtual_pm_plan_from_optimization(
             "next_due_date": next_due.isoformat(),
             "days_left": int(days_left),
 
-            # garder toutes infos optimisation utiles au PDF
-            "beta": row.get("beta"),
-            "eta_h": row.get("eta_h", row.get("eta")),
+            # garder infos optimisation utiles au PDF
+            "beta": beta,
+            "eta_h": eta_h,
             "gamma_h": row.get("gamma_h", row.get("gamma")),
             "model": row.get("model"),
             "distribution": row.get("distribution"),
@@ -201,6 +344,17 @@ st.caption(f"Colonnes réellement utilisées: {plan.get('used_cols_stats')}")
 rows_all = plan.get("rows", [])
 rows_due = plan.get("due", [])
 
+st.markdown("## 0) Commentaires maintenance (résumé)")
+if rows_all:
+    # Résumé par équipement (1 ligne)
+    df_comm = pd.DataFrame(rows_all)[
+        [c for c in ["equipment_code","maintenance_type","interval_source","interval_h","beta","eta_h","maintenance_comment"] if c in pd.DataFrame(rows_all).columns]
+    ].copy()
+    df_comm = df_comm.drop_duplicates(subset=["equipment_code"]).sort_values("equipment_code")
+    st.dataframe(df_comm, use_container_width=True, hide_index=True)
+else:
+    st.info("Pas de commentaires : aucune ligne exploitable.")
+
 st.markdown("## 1) Planning (issu de l’optimisation)")
 if not rows_all:
     st.warning("Aucune ligne exploitable (intervalles manquants ou <=0).")
@@ -212,6 +366,7 @@ else:
         "next_due_date", "days_left",
         "beta", "eta_h", "model", "distribution",
         "T_recommended_h", "T_R_h", "T_cost_h",
+        "maintenance_comment",
     ]
     cols = [c for c in cols if c in df_all.columns]
     st.dataframe(df_all[cols], use_container_width=True, hide_index=True)
@@ -227,6 +382,7 @@ else:
         "next_due_date", "days_left",
         "beta", "eta_h", "model", "distribution",
         "T_recommended_h", "T_R_h", "T_cost_h",
+        "maintenance_comment",
     ]
     cols = [c for c in cols if c in df_due.columns]
     st.dataframe(df_due[cols], use_container_width=True, hide_index=True)

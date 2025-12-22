@@ -9,6 +9,9 @@ import unicodedata
 # Imports PDF : ReportLab (préféré) + fallback FPDF
 # ============================================================
 try:
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.enums import TA_LEFT, TA_CENTER
+
     from reportlab.lib.pagesizes import A4
     from reportlab.lib import colors
     from reportlab.lib.units import mm, cm
@@ -73,16 +76,81 @@ def _title(story, styles, text: str, level: int = 3, space_after_pt: int = 6):
     story.append(Spacer(1, space_after_pt))
 
 
-def _mk_table(data, widths=None, font_size=8):
-    t = Table(data, repeatRows=1, colWidths=widths)
+
+def _mk_table(data, widths=None, font_size=8, header_font_size=None, header_center=True):
+    """
+    Améliore la lisibilité des tableaux :
+      - wrap automatique dans chaque cellule
+      - padding + leading adaptés
+      - header stylé
+    IMPORTANT: ne change PAS le contenu, seulement le rendu.
+    """
+    header_font_size = header_font_size or max(font_size, 8)
+
+    # Styles Paragraph pour wrap automatique
+    body_style = ParagraphStyle(
+        name="tbl_body",
+        fontName="Helvetica",
+        fontSize=font_size,
+        leading=max(10, int(font_size * 1.35)),
+        spaceBefore=0,
+        spaceAfter=0,
+        alignment=TA_LEFT,
+        wordWrap="CJK",        # robuste pour wrap
+        splitLongWords=True,
+    )
+
+    head_style = ParagraphStyle(
+        name="tbl_head",
+        fontName="Helvetica-Bold",
+        fontSize=header_font_size,
+        leading=max(10, int(header_font_size * 1.2)),
+        spaceBefore=0,
+        spaceAfter=0,
+        alignment=TA_CENTER if header_center else TA_LEFT,
+        wordWrap="CJK",
+        splitLongWords=True,
+    )
+
+    # Conversion en Paragraph (sauf None)
+    def to_para(x, style):
+        s = SAN(x)
+        # petit hack : remplacer les sauts de ligne par <br/>
+        s = s.replace("\n", "<br/>")
+        return Paragraph(s, style)
+
+    # data[0] = header
+    wrapped = []
+    for i, row in enumerate(data):
+        style = head_style if i == 0 else body_style
+        wrapped.append([to_para(cell, style) for cell in row])
+
+    t = Table(wrapped, repeatRows=1, colWidths=widths)
+
     t.setStyle(TableStyle([
+        # Header
         ("BACKGROUND", (0, 0), (-1, 0), colors.whitesmoke),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
+
+        # Grid + align
         ("GRID", (0, 0), (-1, -1), 0.3, colors.grey),
-        ("FONTSIZE", (0, 0), (-1, -1), font_size),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+
+        # Padding (rend les cases “respirables”)
+        ("LEFTPADDING", (0, 0), (-1, -1), 3),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+        ("TOPPADDING", (0, 0), (-1, -1), 2),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+
+        # Ligne séparatrice header + léger bold déjà via style
+        ("LINEBELOW", (0, 0), (-1, 0), 0.8, colors.grey),
+
+        # Option : centrage de certaines colonnes si tu veux ensuite
+        # ("ALIGN", (0, 0), (-1, 0), "CENTER"),
     ]))
+
     return t
+
 
 
 # ============================================================
@@ -744,7 +812,7 @@ def _add_cahier_maintenance(story, styles):
         ["", "", "Bruit transformateur", "Régulier / stable", "", "", ""],
     ]
     data = [header] + rows
-    widths7 = [1.6*cm, 2.1*cm, 3.8*cm, 3.4*cm, 2.3*cm, 1.5*cm, 2.5*cm]
+    widths7 = [1.6*cm, 2.4*cm, 4.2*cm, 4.8*cm, 2.5*cm, 1.7*cm, 2.8*cm]
     story.append(_mk_table(data, widths=widths7, font_size=6))
     story.append(Spacer(1, 6))
 
@@ -1285,17 +1353,18 @@ def _table_from_tasks_due(tasks_due: List[Dict[str, Any]]):
 
     # Largeur adaptée A4 (marges déjà prises)
     widths = [
-        2.2*cm,  # eq
-        2.4*cm,  # type
-        2.2*cm,  # interval
-        1.8*cm,  # source
-        2.2*cm,  # due
-        1.9*cm,  # days
-        2.0*cm,  # Trec
-        1.7*cm,  # TR
-        1.9*cm,  # Tcost
-        1.8*cm,  # status
-    ]
+    2.2*cm,  # eq
+    2.8*cm,  # type (un peu plus)
+    2.0*cm,  # interval
+    1.7*cm,  # source
+    2.3*cm,  # due
+    1.6*cm,  # days
+    1.9*cm,  # Trec
+    1.7*cm,  # TR
+    1.8*cm,  # Tcost
+    1.7*cm,  # status
+]
+
     return _mk_table(data, widths=widths, font_size=7.5)
 
 
