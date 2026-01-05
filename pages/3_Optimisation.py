@@ -275,13 +275,12 @@ st.divider()
 st.subheader("🧩 Passerelle → Maintenance (SANS BD)")
 
 opt_hash = _df_hash(df_out)
-colA, colB = st.columns([1, 1])
 
-with colA:
-    if st.button("✅ Envoyer ce planning à Maintenance (session)", type="primary", use_container_width=True):
-        st.session_state["opt_df_out"] = df_out.copy()
-        st.session_state["opt_meta"] = {"hash": opt_hash, "rows": int(len(df_out)), "source": "optimisation_page"}
-        st.success(f"Envoyé ✅ | rows={len(df_out)} | hash={opt_hash}")
+# ✅ Envoi automatique vers Maintenance (session) — sans bouton
+st.session_state["opt_df_out"] = df_out.copy()
+st.session_state["opt_meta"] = {"hash": opt_hash, "rows": int(len(df_out)), "source": "optimisation_page"}
+
+colB = st.columns([1])[0]
 
 with colB:
     DATA_DIR = BASE_DIR / "data"
