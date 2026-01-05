@@ -272,7 +272,7 @@ st.session_state["optimization_df"] = df_out.copy()
 st.session_state["optimization_src"] = "optimisation_page"
 
 st.divider()
-st.subheader("🧩 Passerelle → Maintenance (SANS BD)")
+st.subheader()
 
 opt_hash = _df_hash(df_out)
 
