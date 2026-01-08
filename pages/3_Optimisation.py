@@ -271,25 +271,23 @@ df_out = pd.DataFrame(rows).sort_values("equipment_code").reset_index(drop=True)
 st.session_state["optimization_df"] = df_out.copy()
 st.session_state["optimization_src"] = "optimisation_page"
 
-st.divider()
-st.subheader()
-
+# ✅ Passerelle : ENVOI AUTO vers Maintenance (session), sans bouton
 opt_hash = _df_hash(df_out)
-
-# ✅ Envoi automatique vers Maintenance (session) — sans bouton
 st.session_state["opt_df_out"] = df_out.copy()
 st.session_state["opt_meta"] = {"hash": opt_hash, "rows": int(len(df_out)), "source": "optimisation_page"}
 
-colB = st.columns([1])[0]
+st.divider()
+st.subheader("🧩 Passerelle → Maintenance (SANS BD)")
+st.success(f"Planning envoyé automatiquement ✅ | rows={len(df_out)} | hash={opt_hash}")
 
-with colB:
-    DATA_DIR = BASE_DIR / "data"
-    DATA_DIR.mkdir(exist_ok=True, parents=True)
-    FALLBACK_OPT = DATA_DIR / "last_optimization.csv"
+# fallback fichier (on garde ton bouton)
+DATA_DIR = BASE_DIR / "data"
+DATA_DIR.mkdir(exist_ok=True, parents=True)
+FALLBACK_OPT = DATA_DIR / "last_optimization.csv"
 
-    if st.button("💾 Sauver aussi en fichier (fallback Streamlit Cloud)", use_container_width=True):
-        df_out.to_csv(FALLBACK_OPT, index=False, encoding="utf-8")
-        st.success(f"Écrit: {FALLBACK_OPT}")
+if st.button("💾 Sauver aussi en fichier (fallback Streamlit Cloud)", use_container_width=True):
+    df_out.to_csv(FALLBACK_OPT, index=False, encoding="utf-8")
+    st.success(f"Écrit: {FALLBACK_OPT}")
 
 st.caption(
     "Astuce Streamlit Cloud : la session peut disparaître après redémarrage. "
