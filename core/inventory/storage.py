@@ -1,25 +1,35 @@
+# core/inventory/storage.py
 from __future__ import annotations
+
 from pathlib import Path
 from typing import List, Dict, Any
 import csv, time
+import os
 
 BASE_DIR = Path(__file__).resolve().parents[2]
-DATA_DIR = BASE_DIR / "data"
-PARTS_CSV = DATA_DIR / "inventory_parts.csv"
-MOVES_CSV = DATA_DIR / "inventory_movements.csv"
+
+DATA_DIR = Path(os.environ.get("FS_DATA_DIR", BASE_DIR / "data")).resolve()
+DATA_DIR.mkdir(exist_ok=True, parents=True)
+
+PARTS_CSV = (DATA_DIR / "inventory_parts.csv").resolve()
+MOVES_CSV = (DATA_DIR / "stock_movements.csv").resolve()  # ✅ aligné avec services.py
 
 PARTS_COLUMNS = [
     "code","nom","famille","quantite_dispo","seuil_min",
     "localisation","prix_unitaire","fournisseur"
 ]
-MOVES_COLUMNS = ["ts","type","code","qty","reason","ref","user"]
+
+# ✅ aligné (task_id)
+MOVES_COLUMNS = ["ts","type","code","qty","reason","task_id","ref","user"]
 
 def _ensure_files() -> None:
     DATA_DIR.mkdir(exist_ok=True, parents=True)
-    if not PARTS_CSV.exists():
+
+    if not PARTS_CSV.exists() or PARTS_CSV.stat().st_size == 0:
         with open(PARTS_CSV, "w", encoding="utf-8", newline="") as f:
             csv.DictWriter(f, fieldnames=PARTS_COLUMNS).writeheader()
-    if not MOVES_CSV.exists():
+
+    if not MOVES_CSV.exists() or MOVES_CSV.stat().st_size == 0:
         with open(MOVES_CSV, "w", encoding="utf-8", newline="") as f:
             csv.DictWriter(f, fieldnames=MOVES_COLUMNS).writeheader()
 
@@ -61,6 +71,7 @@ def append_movement(m: Dict[str, Any]) -> None:
         "code": str(m.get("code","")).strip(),
         "qty": float(m.get("qty") or 0),
         "reason": m.get("reason",""),
+        "task_id": str(m.get("task_id","") or ""),
         "ref": m.get("ref",""),
         "user": m.get("user",""),
     }

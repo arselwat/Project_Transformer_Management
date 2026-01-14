@@ -32,20 +32,34 @@ def _low_stock_list() -> list[dict]:
     low = inv.low_stock(threshold_factor=1.0) or []
     return [r for r in low if isinstance(r, dict)]
 
-def _send_low_stock_alert(low: list[dict]) -> None:
-    if not low or not notify_stock_alerts:
-        return
+def _send_low_stock_alert(low: list[dict], *, force: bool = False) -> tuple[bool, str]:
+    """
+    Envoi d'alerte stock.
+    - mode auto : force=False avec cooldown 10 min
+    - mode manuel : force=True possible
+    """
+    if not low:
+        return False, "Aucun article sous seuil."
+    if not notify_stock_alerts:
+        return False, "Module notify_stock_alerts indisponible."
+
     now = _t.time()
     last = float(st.session_state.get("_last_stock_alert_ts", 0.0))
-    if now - last <= 600:
-        return
+
+    if (not force) and (now - last <= 600):
+        remain = int(600 - (now - last))
+        return False, f"Cooldown actif (reste ~{remain}s)."
+
     try:
         res = notify_stock_alerts(low)
         if isinstance(res, dict) and res.get("ok"):
             st.session_state["_last_stock_alert_ts"] = now
-            st.toast("🔔 Alerte stock envoyée.")
-    except Exception:
-        pass
+            return True, "Alerte stock envoyée."
+        # si le module renvoie autre chose
+        st.session_state["_last_stock_alert_ts"] = now
+        return True, "Alerte stock envoyée (réponse non standard)."
+    except Exception as e:
+        return False, f"Erreur envoi: {e}"
 
 with tab_stock:
     st.subheader("➕ Ajouter un article (nouvelle référence)")
@@ -86,7 +100,14 @@ with tab_stock:
     st.divider()
     st.subheader("📦 Articles en stock (entrées / sorties)")
 
-    parts = inv.list_parts_as_dicts() or []
+    # ✅ Réduction de liste (par défaut ON)
+    copt1, copt2 = st.columns([1.2, 2.0])
+    with copt1:
+        active_only = st.toggle("Afficher seulement articles actifs", value=True)
+    with copt2:
+        st.caption("Actif = stock>0 OU seuil>0 OU sous seuil. Désactive pour voir tout l’inventaire.")
+
+    parts = inv.list_parts_as_dicts(active_only=active_only) or []
     parts = sorted(parts, key=lambda x: str(x.get("code", "")))
 
     q = st.text_input("Recherche (code/nom)", value="").strip().lower()
@@ -99,7 +120,10 @@ with tab_stock:
     else:
         st.success("✅ RAS — aucun article sous seuil.")
 
-    _send_low_stock_alert(low)
+    # ✅ Envoi auto (ne change pas)
+    ok_auto, msg_auto = _send_low_stock_alert(low, force=False)
+    if ok_auto:
+        st.toast("🔔 Alerte stock envoyée (auto).")
 
     if not parts:
         st.info("Aucun article trouvé. Ajoute un article ci-dessus.")
@@ -153,14 +177,32 @@ with tab_stock:
     else:
         st.caption("Aucun article sous seuil.")
 
+    # ✅ Bouton manuel en bas (nouveau)
+    st.divider()
+    st.subheader("📨 Envoi manuel des alertes (sans casser l'auto)")
+
+    cman1, cman2 = st.columns([1.2, 2.0])
+    with cman1:
+        force_send = st.toggle("Forcer l’envoi (ignorer cooldown 10 min)", value=False)
+    with cman2:
+        st.caption("Si tu viens d’envoyer en auto, Streamlit met un cooldown. Ici tu peux forcer si nécessaire.")
+
+    if st.button("📨 Envoyer alertes stock maintenant", use_container_width=True):
+        ok, msg = _send_low_stock_alert(low, force=force_send)
+        if ok:
+            st.success(msg)
+        else:
+            st.warning(msg)
+
 with tab_hist:
     st.subheader("Historique récent des mouvements")
     mv = load_movements(limit=800)
-    dmv = pd.DataFrame(mv) if mv else pd.DataFrame(columns=["ts", "type", "code", "qty", "reason", "ref", "user"])
+
+    dmv = pd.DataFrame(mv) if mv else pd.DataFrame(columns=["ts", "type", "code", "qty", "reason", "task_id", "ref", "user"])
     if not dmv.empty:
         dmv["date"] = pd.to_datetime(dmv["ts"], unit="s", errors="coerce")
         dmv = dmv.sort_values("ts", ascending=False)
-        st.dataframe(dmv[["date", "type", "code", "qty", "reason", "ref", "user"]],
-                     use_container_width=True, hide_index=True)
+        show_cols = [c for c in ["date", "type", "code", "qty", "reason", "task_id", "ref", "user"] if c in dmv.columns]
+        st.dataframe(dmv[show_cols], use_container_width=True, hide_index=True)
     else:
         st.info("Aucun mouvement enregistré.")
