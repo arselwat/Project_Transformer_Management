@@ -94,7 +94,8 @@ st.markdown(
 <div class="hero">
   <div class="logo">⚡</div>
   <div>
-    <h1>Analyse de Fiabilité & Gestion de Stock — Transformateurs</h1>
+    <h1>Analyse de Fiabilité, optimisation et aide à la décision pour la maintenance
+des transformateurs de puissance </h1>
     <p style="margin:6px 0 0 0;color:var(--muted)">
       MTBF/MTTR & Weibull • Optimisation des intervalles • Maintenance & kits pièces • Temps réel MQTT
     </p>

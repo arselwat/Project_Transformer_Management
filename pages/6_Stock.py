@@ -17,7 +17,7 @@ except Exception:
 st.set_page_config(page_title="Stock", page_icon="📦", layout="wide")
 require_login()
 
-st.title("📦 Stock (simple)")
+st.title("📦 Stock ")
 st.caption("Ici tu crées les articles, tu fais les entrées/sorties, et tu surveilles les seuils.")
 
 tab_stock, tab_hist = st.tabs(["📦 Stock & Seuils", "📑 Historique mouvements"])
