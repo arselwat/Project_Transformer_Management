@@ -167,7 +167,7 @@ with row1[2]:
         "<p>Calcul des intervalles optimisés, contraintes thermiques et génération du rapport d’optimisation.</p>",
         unsafe_allow_html=True,
     )
-    st.page_link("pages/4_Optimisation_corrected.py", label="Ouvrir l’optimisation", icon="🧠")
+    st.page_link("pages/3_Optimisation_corrected.py", label="Ouvrir l’optimisation", icon="🧠")
     st.markdown("</div>", unsafe_allow_html=True)
 
 # Ligne 2 : Temps réel / Maintenance / Résultat global
@@ -179,7 +179,7 @@ with row2[0]:
         "<p>Simulation ou acquisition MQTT : tensions, courants, températures, alertes et supervision.</p>",
         unsafe_allow_html=True,
     )
-    st.page_link("pages/4_Visualisation_temps_reel.py", label="Ouvrir le temps réel", icon="📡")
+    st.page_link("pages/9_Visualisation_temps_reel.py", label="Ouvrir le temps réel", icon="📡")
     st.markdown("</div>", unsafe_allow_html=True)
 
 with row2[1]:
@@ -215,7 +215,7 @@ with row3[0]:
         "<p>Pièces de rechange recommandées, mises à jour des quantités, alertes de seuil et lien avec la maintenance.</p>",
         unsafe_allow_html=True,
     )
-    st.page_link("pages/6_Stock.py", label="Ouvrir le stock", icon="📦")
+    st.page_link("pages/7_Stock.py", label="Ouvrir le stock", icon="📦")
     st.markdown("</div>", unsafe_allow_html=True)
 
 with row3[1]:
@@ -225,7 +225,7 @@ with row3[1]:
         "<p>Destinataires email/WhatsApp, seuils globaux et configuration des canaux.</p>",
         unsafe_allow_html=True,
     )
-    st.page_link("pages/7_Parametres_Alertes.py", label="Configurer les alertes", icon="🚨")
+    st.page_link("pages/10_Parametres_Alertes.py", label="Configurer les alertes", icon="🚨")
     st.markdown("</div>", unsafe_allow_html=True)
 
 with row3[2]:
