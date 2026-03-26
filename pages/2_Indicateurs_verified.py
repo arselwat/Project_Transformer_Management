@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 from io import BytesIO
@@ -48,6 +47,9 @@ st.caption(
 BASE_DIR = Path(__file__).resolve().parents[1]
 
 
+# ---------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------
 def fnum(x: Any, nd: int = 2, default: str = "—") -> str:
     try:
         if x is None:
@@ -68,12 +70,66 @@ def _series_to_list(s: pd.Series) -> Optional[list[float]]:
     return vals.astype(float).tolist()
 
 
+def _sanitize_thermal_config(cfg: Any) -> Optional[Dict[str, Any]]:
+    """
+    Garde uniquement les clés réellement utiles au modèle thermique.
+    Empêche l'erreur du type:
+    simulate_thermal_dynamic() got an unexpected keyword argument 'asset_id'
+    """
+    if not isinstance(cfg, dict) or not cfg:
+        return None
+
+    allowed = {
+        "sn_mva",
+        "R",
+        "delta_to_r",
+        "delta_h_r",
+        "tau_to_min",
+        "tau_w_min",
+        "n_exp",
+        "m_exp",
+        "forced_tau_to_factor",
+        "forced_delta_to_factor",
+        "forced_delta_h_factor",
+        "normal_insulation_life_h",
+        "faa_limit",
+        "lol_limit_hours",
+        "dt_hours",
+    }
+
+    out: Dict[str, Any] = {}
+    for k, v in cfg.items():
+        if k in allowed and pd.notna(v):
+            out[k] = v
+    return out or None
+
+
+def _sanitize_thermal_df(df: Any) -> Optional[pd.DataFrame]:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return None
+
+    out = df.copy()
+    out.columns = [str(c).strip() for c in out.columns]
+
+    # on supprime juste les colonnes clairement non utiles
+    for c in ["asset_id", "equipment_code"]:
+        if c in out.columns:
+            out = out.drop(columns=[c])
+
+    return out if not out.empty else None
+
+
 def _get_pipeline_bundle(eq: str) -> dict[str, Any]:
     if callable(get_pipeline_inputs):
         try:
-            return get_pipeline_inputs(asset_id=str(eq))
+            bundle = get_pipeline_inputs(asset_id=str(eq))
+            if isinstance(bundle, dict):
+                bundle["thermal_config"] = _sanitize_thermal_config(bundle.get("thermal_config"))
+                bundle["thermal_df"] = _sanitize_thermal_df(bundle.get("thermal_df"))
+                return bundle
         except Exception:
             pass
+
     return {
         "asset_id": str(eq),
         "ttf_series": [],
@@ -172,6 +228,9 @@ def _export_tables_xlsx(result_by_eq: Dict[str, Dict[str, Any]]) -> bytes:
     return buffer.getvalue()
 
 
+# ---------------------------------------------------------------------
+# Dataset actif
+# ---------------------------------------------------------------------
 meta = get_failures_meta()
 df_src = get_current_failures_df()
 
@@ -198,6 +257,10 @@ if not sel:
     st.info("Sélectionne au moins un équipement.")
     st.stop()
 
+
+# ---------------------------------------------------------------------
+# Analyse intégrée par équipement
+# ---------------------------------------------------------------------
 results_by: Dict[str, Dict[str, Any]] = {}
 summary_rows: list[dict[str, Any]] = []
 curve_ready_eqs: list[str] = []
@@ -270,7 +333,6 @@ summary_df = pd.DataFrame(summary_rows).sort_values("equipment_code").reset_inde
 detail_eq = st.selectbox("Équipement à détailler", options=list(results_by.keys()), index=0)
 detail_result = results_by[detail_eq]
 detail_tables = detail_result.get("tables", {}) or {}
-detail_rel = detail_result.get("reliability", {}) or {}
 detail_therm = detail_result.get("thermal")
 
 st.subheader("📋 Synthèse globale")
