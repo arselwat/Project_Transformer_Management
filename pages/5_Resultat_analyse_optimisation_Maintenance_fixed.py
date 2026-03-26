@@ -1,11 +1,8 @@
-
 from __future__ import annotations
 
 from pathlib import Path
 from datetime import date, timedelta
 from io import BytesIO
-import io
-import math
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -18,19 +15,12 @@ import matplotlib.pyplot as plt
 
 from core.security.auth import require_login
 from core.reliability.organigram import analyze_ttf_pipeline
-
-# Optional imports / fallbacks
-try:
-    from core.datahub import get_current_failures_df, get_failures_meta  # type: ignore
-except Exception:
-    get_current_failures_df = None
-    get_failures_meta = None
-
-try:
-    from core.datahub import get_current_project_data, get_project_meta  # type: ignore
-except Exception:
-    get_current_project_data = None
-    get_project_meta = None
+from core.datahub import (
+    get_current_failures_df,
+    get_failures_meta,
+    get_project_meta,
+    get_pipeline_inputs,
+)
 
 try:
     from core.reliability.reporting_global import export_global_analysis_report_pdf
@@ -45,51 +35,16 @@ st.set_page_config(
 )
 require_login()
 
-st.title("📊 Résultat analyse / optimisation / maintenance")
-st.caption(
-    "De la détection statistique à la décision finale : tests de tendance, dépendance, choix du processus, "
-    "ajustement, thermique, optimisation et recommandations maintenance."
-)
+st.title("📊 Résultat global")
 
+
+# -------------------------------------------------------------------
+# Helpers
+# -------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True, parents=True)
-FAILURES_CSV = DATA_DIR / "failures_saved.csv"
 OPTIM_CSV = DATA_DIR / "last_optimization.csv"
-
-
-# ---------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------
-def _read_csv_flex(src) -> pd.DataFrame:
-    def _try_read(s, **kw):
-        try:
-            return pd.read_csv(s, **kw)
-        except Exception:
-            return None
-
-    df = _try_read(src)
-    if df is None:
-        if hasattr(src, "seek"):
-            try:
-                src.seek(0)
-            except Exception:
-                pass
-        df = _try_read(src, engine="python", on_bad_lines="skip", sep=None)
-
-    if df is None:
-        if hasattr(src, "seek"):
-            try:
-                src.seek(0)
-            except Exception:
-                pass
-        df = _try_read(src, sep=";", engine="python", on_bad_lines="skip")
-
-    if df is None:
-        return pd.DataFrame()
-
-    df.columns = [str(c).strip() for c in df.columns]
-    return df
 
 
 def _safe_float(x: Any, default: Optional[float] = None) -> Optional[float]:
@@ -122,137 +77,12 @@ def _decision_badge(label: str) -> str:
     return "🟢 " + label
 
 
-def _coerce_bool01(s: pd.Series) -> pd.Series:
-    if s.dtype == bool:
-        return s.astype(int)
-    mapping = {
-        "1": 1, "0": 0, "true": 1, "false": 0,
-        "yes": 1, "no": 0, "oui": 1, "non": 0, "y": 1, "n": 0,
-    }
-    return (
-        s.astype(str)
-        .str.strip()
-        .str.lower()
-        .map(mapping)
-        .fillna(pd.to_numeric(s, errors="coerce"))
-        .fillna(0)
-        .astype(int)
-    )
-
-
-def _normalize_thermal_timeseries(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame()
-    out = df.copy()
-    out.columns = [str(c).strip() for c in out.columns]
-
-    aliases = {
-        "ambient_temp_c": "temp_amb_C",
-        "temp_ambiante_c": "temp_amb_C",
-        "temperature_ambiante": "temp_amb_C",
-        "fan_status": "etat_ventilateurs",
-        "fans_status": "etat_ventilateurs",
-        "ventilateurs": "etat_ventilateurs",
-        "load_pct": "charge_pct",
-    }
-    lower = {c.lower().strip(): c for c in out.columns}
-    ren = {}
-    for k, v in aliases.items():
-        if k in lower and v not in out.columns:
-            ren[lower[k]] = v
-    out = out.rename(columns=ren)
-
-    if "timestamp" in out.columns:
-        out["timestamp"] = pd.to_datetime(out["timestamp"], errors="coerce")
-        out = out.dropna(subset=["timestamp"])
-
-    # normalisation du facteur de charge
-    if "K" not in out.columns:
-        if "load_factor" in out.columns:
-            out["K"] = pd.to_numeric(out["load_factor"], errors="coerce")
-        elif "charge_pct" in out.columns:
-            out["K"] = pd.to_numeric(out["charge_pct"], errors="coerce") / 100.0
-        elif "load_mva" in out.columns:
-            out["K"] = pd.to_numeric(out["load_mva"], errors="coerce") / 100.0  # fallback sur 100 MVA
-
-    if "etat_ventilateurs" not in out.columns:
-        out["etat_ventilateurs"] = 0
-
-    for c in [
-        "temp_amb_C", "K", "charge_pct", "load_factor", "load_mva",
-        "etat_ventilateurs", "temp_cuve_C", "current_a",
-        "top_oil_temp_c", "hotspot_temp_c",
-    ]:
-        if c in out.columns:
-            out[c] = pd.to_numeric(out[c], errors="coerce")
-
-    out = out.reset_index(drop=True)
-    return out
-
-
-def _normalize_thermal_params(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame()
-    out = df.copy()
-    out.columns = [str(c).strip() for c in out.columns]
-
-    aliases = {
-        "delta_theta_to_r": "delta_to_r",
-        "delta_theta_h_r": "delta_h_r",
-        "tau_to_hours": "tau_to_hours",
-        "tau_h_hours": "tau_h_hours",
-        "normal_life_hours": "normal_insulation_life_h",
-        "rated_power_mva": "sn_mva",
-    }
-    lower = {c.lower().strip(): c for c in out.columns}
-    ren = {}
-    for k, v in aliases.items():
-        if k in lower and v not in out.columns:
-            ren[lower[k]] = v
-    out = out.rename(columns=ren)
-
-    for c in out.columns:
-        if c != "asset_id":
-            out[c] = pd.to_numeric(out[c], errors="ignore")
-
-    if "tau_to_hours" in out.columns and "tau_to_min" not in out.columns:
-        out["tau_to_min"] = pd.to_numeric(out["tau_to_hours"], errors="coerce") * 60.0
-    if "tau_h_hours" in out.columns and "tau_w_min" not in out.columns:
-        out["tau_w_min"] = pd.to_numeric(out["tau_h_hours"], errors="coerce") * 60.0
-
-    return out
-
-
-def _load_failures_df(uploaded_csv=None) -> pd.DataFrame:
-    if uploaded_csv is not None:
-        df = _read_csv_flex(uploaded_csv)
-    elif get_current_failures_df is not None:
-        try:
-            df = get_current_failures_df()
-        except Exception:
-            df = pd.DataFrame()
-    elif FAILURES_CSV.exists():
-        df = _read_csv_flex(FAILURES_CSV)
-    else:
-        df = pd.DataFrame()
-
-    if df is None or df.empty:
-        return pd.DataFrame()
-
-    df = df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
-    if "equipment_code" not in df.columns or "ttf_h" not in df.columns:
-        return pd.DataFrame()
-
-    df["equipment_code"] = df["equipment_code"].astype(str)
-    df["ttf_h"] = pd.to_numeric(df["ttf_h"], errors="coerce")
-    if "duree_rep_h" in df.columns:
-        df["duree_rep_h"] = pd.to_numeric(df["duree_rep_h"], errors="coerce")
-    else:
-        df["duree_rep_h"] = np.nan
-    df = df.dropna(subset=["ttf_h"])
-    df = df[df["ttf_h"] > 0]
-    return df.reset_index(drop=True)
+def _series_to_list(s: pd.Series) -> Optional[list[float]]:
+    vals = pd.to_numeric(s, errors="coerce").dropna()
+    vals = vals[vals > 0]
+    if vals.empty:
+        return None
+    return vals.astype(float).tolist()
 
 
 def _load_optimization_df() -> pd.DataFrame:
@@ -260,7 +90,10 @@ def _load_optimization_df() -> pd.DataFrame:
     if isinstance(df, pd.DataFrame) and not df.empty:
         out = df.copy()
     elif OPTIM_CSV.exists():
-        out = _read_csv_flex(OPTIM_CSV)
+        try:
+            out = pd.read_csv(OPTIM_CSV)
+        except Exception:
+            out = pd.DataFrame()
     else:
         out = pd.DataFrame()
 
@@ -268,97 +101,7 @@ def _load_optimization_df() -> pd.DataFrame:
         return out
 
     out.columns = [str(c).strip() for c in out.columns]
-    # normaliser quelques colonnes pour usage global
-    if "process_model" in out.columns and "model" not in out.columns:
-        out["model"] = out["process_model"]
-    if "beta_pipe" in out.columns and "beta" not in out.columns:
-        out["beta"] = out["beta_pipe"]
-    if "eta_pipe_h" in out.columns and "eta_h" not in out.columns:
-        out["eta_h"] = out["eta_pipe_h"]
-    if "gamma_pipe_h" in out.columns and "gamma_h" not in out.columns:
-        out["gamma_h"] = out["gamma_pipe_h"]
-
-    for c in ["T_recommended_h", "T_R_h", "T_cost_h", "days_left", "beta", "eta_h", "gamma_h"]:
-        if c in out.columns:
-            out[c] = pd.to_numeric(out[c], errors="coerce")
     return out
-
-
-def _load_project_context(uploaded_xlsx=None) -> Dict[str, pd.DataFrame]:
-    # 1) upload manuel prioritaire
-    if uploaded_xlsx is not None:
-        try:
-            raw = uploaded_xlsx.read()
-            bio = io.BytesIO(raw)
-            xls = pd.ExcelFile(bio)
-            sheets = {sheet: pd.read_excel(io.BytesIO(raw), sheet_name=sheet) for sheet in xls.sheet_names}
-        except Exception:
-            sheets = {}
-    # 2) projet actif dans datahub
-    elif callable(get_current_project_data):
-        try:
-            sheets = get_current_project_data() or {}
-        except Exception:
-            sheets = {}
-    else:
-        sheets = {}
-
-    out: Dict[str, pd.DataFrame] = {}
-    for k, v in sheets.items():
-        if isinstance(v, pd.DataFrame):
-            out[str(k).strip()] = v.copy()
-
-    if "thermal_timeseries" in out:
-        out["thermal_timeseries"] = _normalize_thermal_timeseries(out["thermal_timeseries"])
-    if "thermal_params" in out:
-        out["thermal_params"] = _normalize_thermal_params(out["thermal_params"])
-
-    return out
-
-
-def _extract_thermal_for_eq(
-    sheets: Dict[str, pd.DataFrame],
-    equipment_code: str,
-) -> Tuple[Optional[pd.DataFrame], Optional[Dict[str, Any]]]:
-    if not sheets:
-        return None, None
-
-    thermal_df = None
-    thermal_cfg = None
-
-    ts = sheets.get("thermal_timeseries")
-    if isinstance(ts, pd.DataFrame) and not ts.empty:
-        tmp = ts.copy()
-        asset_col = "asset_id" if "asset_id" in tmp.columns else "equipment_code" if "equipment_code" in tmp.columns else None
-        if asset_col:
-            tmp = tmp[tmp[asset_col].astype(str) == str(equipment_code)]
-        if not tmp.empty:
-            thermal_df = tmp.reset_index(drop=True)
-
-    params = sheets.get("thermal_params")
-    if isinstance(params, pd.DataFrame) and not params.empty:
-        tmp = params.copy()
-        asset_col = "asset_id" if "asset_id" in tmp.columns else "equipment_code" if "equipment_code" in tmp.columns else None
-        if asset_col:
-            tmp = tmp[tmp[asset_col].astype(str) == str(equipment_code)]
-        if not tmp.empty:
-            r = tmp.iloc[0].to_dict()
-            thermal_cfg = {
-                "sn_mva": _safe_float(r.get("sn_mva"), 100.0) or 100.0,
-                "R": _safe_float(r.get("R"), 5.0) or 5.0,
-                "delta_to_r": _safe_float(r.get("delta_to_r"), 55.0) or 55.0,
-                "delta_h_r": _safe_float(r.get("delta_h_r"), 30.0) or 30.0,
-                "tau_to_min": _safe_float(r.get("tau_to_min"), 180.0) or 180.0,
-                "tau_w_min": _safe_float(r.get("tau_w_min"), 10.0) or 10.0,
-                "n_exp": _safe_float(r.get("n_exp"), 0.8) or 0.8,
-                "m_exp": _safe_float(r.get("m_exp"), 0.8) or 0.8,
-                "forced_tau_to_factor": _safe_float(r.get("forced_tau_to_factor"), 0.75) or 0.75,
-                "forced_delta_to_factor": _safe_float(r.get("forced_delta_to_factor"), 0.92) or 0.92,
-                "forced_delta_h_factor": _safe_float(r.get("forced_delta_h_factor"), 0.92) or 0.92,
-                "normal_insulation_life_h": _safe_float(r.get("normal_insulation_life_h"), 180000.0) or 180000.0,
-            }
-
-    return thermal_df, thermal_cfg
 
 
 def _build_virtual_pm_plan_from_optimization(
@@ -390,6 +133,7 @@ def _build_virtual_pm_plan_from_optimization(
         periodicity_days = max(1, int(round(interval_h / 24.0)))
         next_due = start_date + timedelta(days=periodicity_days)
         days_left = int((next_due - start_date).days)
+
         rows.append(
             {
                 "equipment_code": eq,
@@ -405,13 +149,14 @@ def _build_virtual_pm_plan_from_optimization(
                 "model": r.get("model"),
                 "distribution": r.get("distribution"),
                 "beta": r.get("beta"),
-                "eta_h": r.get("eta_h", r.get("eta")),
+                "eta_h": r.get("eta_h"),
             }
         )
 
     all_df = pd.DataFrame(rows)
     if all_df.empty:
         return all_df, all_df
+
     due_df = all_df[all_df["days_left"] <= int(within_days)].copy()
     return (
         all_df.sort_values(["days_left", "equipment_code"]).reset_index(drop=True),
@@ -450,6 +195,7 @@ def _final_decision_row(row: pd.Series) -> Tuple[str, str, int]:
     days_left = _safe_float(row.get("days_left"), None)
 
     score += _process_score(model)
+
     if beta is not None:
         if beta > 1.2:
             score += 3
@@ -457,10 +203,12 @@ def _final_decision_row(row: pd.Series) -> Tuple[str, str, int]:
             score += 2
         elif beta < 0.8:
             score += 1
+
     if thermal_status == "Critique":
         score += 4
     elif thermal_status == "Alerte":
         score += 2
+
     if days_left is not None:
         if days_left <= 7:
             score += 3
@@ -474,21 +222,18 @@ def _final_decision_row(row: pd.Series) -> Tuple[str, str, int]:
     if score >= 10:
         decision = "Intervention prioritaire"
         reason = (
-            f"Processus {model}, vieillissement/statut thermique défavorable et échéance proche. "
+            f"Processus {model}, état défavorable et échéance proche. "
             f"Type recommandé : {maint_type or 'maintenance ciblée'}."
         )
     elif score >= 7:
         decision = "Préventif renforcé"
-        reason = (
-            "Risque significatif détecté. Renforcer la surveillance conditionnelle et planifier une "
-            "intervention avant l’intervalle critique."
-        )
+        reason = "Risque significatif détecté. Renforcer la surveillance et planifier une intervention."
     elif score >= 4:
         decision = "Surveillance active"
-        reason = "Situation intermédiaire : conserver le plan optimisé, surveiller les tendances et les dérives thermiques."
+        reason = "Situation intermédiaire : conserver le plan optimisé et surveiller les dérives."
     else:
         decision = "Suivi nominal"
-        reason = "Pas de signal critique immédiat : appliquer le calendrier recommandé et une surveillance standard."
+        reason = "Pas de signal critique immédiat : appliquer le calendrier recommandé."
 
     return decision, reason, int(score)
 
@@ -516,6 +261,7 @@ def _xlsx_bytes(global_tables: Dict[str, pd.DataFrame], detail_tables: Dict[str,
         for name, df in global_tables.items():
             if isinstance(df, pd.DataFrame) and not df.empty:
                 df.to_excel(writer, sheet_name=name[:31], index=False)
+
         for eq, tables in detail_tables.items():
             for tname, df in tables.items():
                 if isinstance(df, pd.DataFrame) and not df.empty:
@@ -528,46 +274,96 @@ def _xlsx_bytes(global_tables: Dict[str, pd.DataFrame], detail_tables: Dict[str,
     return buff.getvalue()
 
 
-# ---------------------------------------------------------------------
-# Sidebar / sources
-# ---------------------------------------------------------------------
-with st.sidebar:
-    st.header("Sources & options")
-    up_fail = st.file_uploader("TTF CSV optionnel", type=["csv"], help="Fallback si le dataset actif n’est pas chargé.")
-    up_project = st.file_uploader(
-        "Fichier projet Excel optionnel",
-        type=["xlsx"],
-        help="Pour enrichir la page avec la thermique (feuilles thermal_timeseries / thermal_params).",
+def _explain_trend(eq_res: Dict[str, Any]) -> str:
+    tests = (eq_res.get("reliability", {}) or {}).get("tests", {}) or {}
+    mk = tests.get("trend_mk", {}) or {}
+    lap = tests.get("trend_laplace", {}) or {}
+
+    mk_p = _safe_float(mk.get("p"), None)
+    lap_p = _safe_float(lap.get("p"), None)
+    mk_dir = mk.get("direction", "none")
+    lap_dir = lap.get("direction", "none")
+
+    if mk.get("has_trend") or lap.get("has_trend"):
+        return (
+            f"Tendance détectée. MK p={_fmt(mk_p,3)} ({mk_dir}) ; "
+            f"Laplace p={_fmt(lap_p,3)} ({lap_dir})."
+        )
+    return (
+        f"Pas de tendance significative. MK p={_fmt(mk_p,3)} ; "
+        f"Laplace p={_fmt(lap_p,3)}."
     )
+
+
+def _explain_dependence(eq_res: Dict[str, Any]) -> str:
+    tests = (eq_res.get("reliability", {}) or {}).get("tests", {}) or {}
+    dep = tests.get("dependence", {}) or {}
+    r = _safe_float(dep.get("spearman_r"), None)
+    p = _safe_float(dep.get("spearman_p"), None)
+
+    if dep.get("has_dep"):
+        return f"Dépendance détectée entre événements. Spearman r={_fmt(r,3)}, p={_fmt(p,3)}."
+    return f"Pas de dépendance significative. Spearman r={_fmt(r,3)}, p={_fmt(p,3)}."
+
+
+def _explain_process(eq_res: Dict[str, Any]) -> str:
+    rel = eq_res.get("reliability", {}) or {}
+    model = rel.get("model", "—")
+    dist = rel.get("distribution", "—")
+    reason = (rel.get("decision", {}) or {}).get("reason", "—")
+    return f"Processus retenu : {model}. Distribution retenue : {dist}. Motif : {reason}"
+
+
+def _explain_optimization(row: dict) -> str:
+    return (
+        f"T_recommended={_fmt(row.get('T_recommended_h'),1)} h ; "
+        f"T_R={_fmt(row.get('T_R_h'),1)} h ; "
+        f"T_cost={_fmt(row.get('T_cost_h'),1)} h ; "
+        f"Maintenance={row.get('maintenance_type','—')}."
+    )
+
+
+def _explain_final(row: dict) -> str:
+    return (
+        f"Décision finale : {row.get('decision_finale','—')} | "
+        f"Priorité {row.get('priorite','—')} | "
+        f"Score {row.get('priority_score','—')}."
+    )
+
+
+# -------------------------------------------------------------------
+# Sidebar
+# -------------------------------------------------------------------
+with st.sidebar:
+    st.header("Options")
     alpha = st.slider("Seuil alpha", 0.01, 0.10, 0.05, 0.01)
     within_days = st.slider("Fenêtre maintenance (jours)", 7, 365, 30, 1)
-    start_dt = st.date_input("Date de référence maintenance", value=date.today())
+    start_dt = st.date_input("Date de référence", value=date.today())
 
 
-# ---------------------------------------------------------------------
+# -------------------------------------------------------------------
 # Load data
-# ---------------------------------------------------------------------
-df_fail = _load_failures_df(uploaded_csv=up_fail)
+# -------------------------------------------------------------------
+meta_fail = get_failures_meta()
+meta_proj = get_project_meta()
+df_fail = get_current_failures_df()
+
 if df_fail.empty:
-    st.error("Aucun dataset TTF disponible. Charge d’abord les sources ou importe un CSV equipment_code, ttf_h[, duree_rep_h].")
+    st.error("Aucun dataset TTF disponible. Charge d’abord les sources.")
     st.stop()
 
-project_sheets = _load_project_context(up_project)
+df_fail = df_fail.copy()
+df_fail.columns = [str(c).strip() for c in df_fail.columns]
+df_fail["equipment_code"] = df_fail["equipment_code"].astype(str)
+df_fail["ttf_h"] = pd.to_numeric(df_fail["ttf_h"], errors="coerce")
+if "duree_rep_h" in df_fail.columns:
+    df_fail["duree_rep_h"] = pd.to_numeric(df_fail["duree_rep_h"], errors="coerce")
+else:
+    df_fail["duree_rep_h"] = np.nan
+df_fail = df_fail.dropna(subset=["ttf_h"])
+df_fail = df_fail[df_fail["ttf_h"] > 0].reset_index(drop=True)
+
 opt_df = _load_optimization_df()
-
-meta_fail = {}
-if callable(get_failures_meta):
-    try:
-        meta_fail = get_failures_meta() or {}
-    except Exception:
-        meta_fail = {}
-
-meta_project = {}
-if callable(get_project_meta):
-    try:
-        meta_project = get_project_meta() or {}
-    except Exception:
-        meta_project = {}
 
 pm_all = st.session_state.get("pm_virtual_all")
 pm_due = st.session_state.get("pm_virtual_due")
@@ -577,18 +373,24 @@ else:
     pm_all_df = pd.DataFrame(pm_all)
     pm_due_df = pd.DataFrame(pm_due)
 
-# small source strip
 s1, s2, s3 = st.columns(3)
 with s1:
-    st.info(f"TTF actifs : {len(df_fail)} lignes")
+    st.success(f"Dataset actif | rows={meta_fail.get('rows')} | hash={meta_fail.get('hash')}")
 with s2:
-    st.info(f"Projet thermique : {'chargé' if bool(project_sheets) else 'non chargé'}")
+    if meta_proj.get("ok"):
+        st.success(f"Projet actif | hash={meta_proj.get('hash', '')}")
+    else:
+        st.info("Projet non disponible")
 with s3:
-    st.info(f"Optimisation : {'disponible' if isinstance(opt_df, pd.DataFrame) and not opt_df.empty else 'non disponible'}")
+    if isinstance(opt_df, pd.DataFrame) and not opt_df.empty:
+        st.success(f"Optimisation dispo | rows={len(opt_df)}")
+    else:
+        st.info("Optimisation non disponible")
 
-# ---------------------------------------------------------------------
+
+# -------------------------------------------------------------------
 # Main analysis
-# ---------------------------------------------------------------------
+# -------------------------------------------------------------------
 with st.spinner("Analyse globale en cours..."):
     results_by_eq: Dict[str, Dict[str, Any]] = {}
     detail_tables_by_eq: Dict[str, Dict[str, pd.DataFrame]] = {}
@@ -597,15 +399,19 @@ with st.spinner("Analyse globale en cours..."):
     eqs = sorted(df_fail["equipment_code"].astype(str).unique().tolist())
 
     for eq in eqs:
-        g = df_fail[df_fail["equipment_code"].astype(str) == str(eq)].copy()
-        ttf_series = g["ttf_h"].dropna().astype(float).tolist()
-        if len(ttf_series) < 3:
+        g = df_fail[df_fail["equipment_code"] == eq].copy()
+        ttf_series = _series_to_list(g["ttf_h"])
+        if not ttf_series or len(ttf_series) < 3:
             continue
 
-        rr = pd.to_numeric(g.get("duree_rep_h"), errors="coerce").dropna().tolist() if "duree_rep_h" in g.columns else []
-        repair_series = rr if rr else None
+        repair_series = None
+        rr = _series_to_list(g["duree_rep_h"]) if "duree_rep_h" in g.columns else None
+        if rr:
+            repair_series = rr
 
-        thermal_df_eq, thermal_cfg_eq = _extract_thermal_for_eq(project_sheets, eq)
+        bundle = get_pipeline_inputs(asset_id=str(eq))
+        thermal_df_eq = bundle.get("thermal_df")
+        thermal_cfg_eq = bundle.get("thermal_config")
 
         try:
             res = analyze_ttf_pipeline(
@@ -620,13 +426,13 @@ with st.spinner("Analyse globale en cours..."):
             continue
 
         results_by_eq[eq] = res
-        tables = res.get("tables", {}) or {}
-        detail_tables_by_eq[eq] = tables
+        eq_tables = res.get("tables", {}) or {}
+        detail_tables_by_eq[eq] = eq_tables
 
-        reliability = res.get("reliability", {}) or {}
-        indicators = reliability.get("indicators", {}) or {}
-        params = reliability.get("params", {}) or {}
-        tests = reliability.get("tests", {}) or {}
+        rel = res.get("reliability", {}) or {}
+        indicators = rel.get("indicators", {}) or {}
+        params = rel.get("params", {}) or {}
+        tests = rel.get("tests", {}) or {}
         thermal = res.get("thermal") or {}
         thermal_summary = (thermal.get("summary") or {}) if isinstance(thermal, dict) else {}
 
@@ -642,32 +448,25 @@ with st.spinner("Analyse globale en cours..."):
             if not match_pm.empty:
                 pm_row = match_pm.iloc[0].to_dict()
 
-        trend_mk = tests.get("trend_mk", {}) or {}
-        trend_lap = tests.get("trend_laplace", {}) or {}
+        mk = tests.get("trend_mk", {}) or {}
+        lap = tests.get("trend_laplace", {}) or {}
         dep = tests.get("dependence", {}) or {}
-        direction = trend_mk.get("direction") or trend_lap.get("direction")
 
-        beta_pref = params.get("beta")
-        if beta_pref is None:
-            beta_pref = opt_row.get("beta")
-        eta_pref = params.get("eta")
-        if eta_pref is None:
-            eta_pref = opt_row.get("eta_h", opt_row.get("eta"))
-        gamma_pref = params.get("gamma")
-        if gamma_pref is None:
-            gamma_pref = opt_row.get("gamma_h")
+        beta_main = params.get("beta", opt_row.get("beta"))
+        eta_main = params.get("eta", opt_row.get("eta_h"))
+        gamma_main = params.get("gamma", opt_row.get("gamma_h"))
 
         row = {
             "equipment_code": eq,
             "n_ttf": len(ttf_series),
-            "trend_detected": "Oui" if (trend_mk.get("has_trend") or trend_lap.get("has_trend")) else "Non",
-            "trend_direction": direction,
+            "trend_detected": "Oui" if (mk.get("has_trend") or lap.get("has_trend")) else "Non",
+            "trend_direction": mk.get("direction") or lap.get("direction"),
             "dependence_detected": "Oui" if dep.get("has_dep") else "Non",
-            "model": reliability.get("model"),
-            "distribution": reliability.get("distribution"),
-            "beta": beta_pref,
-            "eta_h": eta_pref,
-            "gamma_h": gamma_pref,
+            "model": rel.get("model"),
+            "distribution": rel.get("distribution"),
+            "beta": beta_main,
+            "eta_h": eta_main,
+            "gamma_h": gamma_main,
             "mtbf_h": indicators.get("mtbf_h"),
             "mttr_h": indicators.get("mttr_h"),
             "availability_pct": None if indicators.get("availability_intrinsic") is None else 100.0 * float(indicators.get("availability_intrinsic")),
@@ -705,9 +504,6 @@ summary_df["priorite"] = pd.cut(
 )
 summary_df = summary_df.sort_values(["priority_score", "equipment_code"], ascending=[False, True]).reset_index(drop=True)
 
-# ---------------------------------------------------------------------
-# Global tables for exports
-# ---------------------------------------------------------------------
 trend_overview = summary_df[[
     "equipment_code", "n_ttf", "trend_detected", "trend_direction", "dependence_detected", "model", "distribution"
 ]].copy()
@@ -718,13 +514,13 @@ risk_overview = summary_df[[
 ]].copy()
 
 optimization_overview = summary_df[[
-    "equipment_code", "maintenance_type", "T_recommended_h", "T_R_h", "T_cost_h", "R(T_cost)",
-    "C_min_per_h", "next_due_date", "days_left"
+    "equipment_code", "maintenance_type", "T_recommended_h", "T_R_h", "T_cost_h",
+    "R(T_cost)", "C_min_per_h", "next_due_date", "days_left"
 ]].copy()
 
 final_decision_df = summary_df[[
-    "equipment_code", "model", "distribution", "thermal_status", "maintenance_type", "days_left",
-    "priority_score", "priorite", "decision_finale", "motif_decision"
+    "equipment_code", "model", "distribution", "thermal_status", "maintenance_type",
+    "days_left", "priority_score", "priorite", "decision_finale", "motif_decision"
 ]].copy()
 
 if not pm_due_df.empty:
@@ -741,9 +537,9 @@ global_tables = {
     "final_decision": final_decision_df,
 }
 
-# ---------------------------------------------------------------------
-# KPI cards
-# ---------------------------------------------------------------------
+# -------------------------------------------------------------------
+# KPI
+# -------------------------------------------------------------------
 critical_count = int((summary_df["priorite"].astype(str) == "Critique").sum())
 due_count = int(len(due_tasks_df))
 thermal_critical = int((summary_df["thermal_status"] == "Critique").sum())
@@ -758,25 +554,23 @@ c5.metric("NHPP détectés", nhpp_count)
 
 st.divider()
 
-# ---------------------------------------------------------------------
-# Tabs
-# ---------------------------------------------------------------------
-view_tab, tests_tab, thermal_tab, opt_tab, decision_tab = st.tabs(
+tabs = st.tabs(
     [
-        "🌍 Vue globale",
-        "🧪 Tests & modèles",
-        "🌡️ Thermique",
-        "🧠 Optimisation & maintenance",
-        "✅ Décision finale",
+        "Vue globale",
+        "Traçabilité",
+        "Thermique",
+        "Optimisation & maintenance",
+        "Décision finale",
+        "Exports",
     ]
 )
 
-with view_tab:
+with tabs[0]:
     st.subheader("Tableau de synthèse global")
     st.dataframe(summary_df, use_container_width=True, hide_index=True)
 
-    col_a, col_b = st.columns(2)
-    with col_a:
+    ca, cb = st.columns(2)
+    with ca:
         fig, ax = plt.subplots(figsize=(8, 4))
         proc = summary_df["model"].astype(str).value_counts()
         ax.bar(proc.index.tolist(), proc.values.tolist())
@@ -786,7 +580,7 @@ with view_tab:
         ax.grid(True, alpha=0.25)
         st.pyplot(fig, clear_figure=True)
 
-    with col_b:
+    with cb:
         fig, ax = plt.subplots(figsize=(8, 4))
         dplot = summary_df[["equipment_code", "priority_score"]].sort_values("priority_score", ascending=True)
         ax.barh(dplot["equipment_code"], dplot["priority_score"])
@@ -796,50 +590,55 @@ with view_tab:
         ax.grid(True, alpha=0.25)
         st.pyplot(fig, clear_figure=True)
 
-    st.markdown("### Lecture rapide")
-    st.markdown(
-        "- **trend_detected** indique si les TTF évoluent significativement dans le temps.\n"
-        "- **dependence_detected** indique si les pannes successives restent corrélées.\n"
-        "- **thermal_status** synthétise θHS, FAA et perte de vie.\n"
-        "- **priority_score / priorite** hiérarchise les actions."
-    )
-
-with tests_tab:
-    eq = st.selectbox("Équipement", options=summary_df["equipment_code"].tolist(), key="global_eq_tests")
+with tabs[1]:
+    eq = st.selectbox("Équipement", options=summary_df["equipment_code"].tolist(), key="global_trace_eq")
     eq_res = results_by_eq[eq]
     eq_tables = detail_tables_by_eq[eq]
-    st.markdown(f"### Parcours d’analyse — {eq}")
+    row = summary_df[summary_df["equipment_code"] == eq].iloc[0].to_dict()
+
+    st.markdown(f"### Traçabilité de calcul — {eq}")
+
+    st.markdown("#### 1. Tendance")
     st.dataframe(eq_tables.get("trend_results", pd.DataFrame()), use_container_width=True, hide_index=True)
+    st.info(_explain_trend(eq_res))
+
+    st.markdown("#### 2. Dépendance")
     st.dataframe(eq_tables.get("dependence_results", pd.DataFrame()), use_container_width=True, hide_index=True)
+    st.info(_explain_dependence(eq_res))
+
+    st.markdown("#### 3. Choix du processus")
     st.dataframe(eq_tables.get("process_choice", pd.DataFrame()), use_container_width=True, hide_index=True)
+    st.info(_explain_process(eq_res))
+
+    st.markdown("#### 4. Ajustement / fiabilité")
     st.dataframe(eq_tables.get("fit_candidates", pd.DataFrame()), use_container_width=True, hide_index=True)
     st.dataframe(eq_tables.get("reliability_summary", pd.DataFrame()), use_container_width=True, hide_index=True)
 
-    rel = eq_res.get("reliability", {})
-    ind = rel.get("indicators", {}) or {}
-    avail = None if ind.get("availability_intrinsic") is None else 100 * float(ind.get("availability_intrinsic"))
-    st.info(
-        f"Équipement {eq} → Processus **{rel.get('model', '—')}**, loi **{rel.get('distribution', '—')}**, "
-        f"MTBF={_fmt(ind.get('mtbf_h'),1)} h, MTTR={_fmt(ind.get('mttr_h'),1)} h, disponibilité={_fmt(avail,1)} %."
-    )
+    st.markdown("#### 5. Optimisation / maintenance")
+    st.write(_explain_optimization(row))
 
-with thermal_tab:
+    st.markdown("#### 6. Décision finale")
+    st.write(_explain_final(row))
+    st.info(row.get("motif_decision", "Aucun motif disponible."))
+
+with tabs[2]:
     eq = st.selectbox("Équipement thermique", options=summary_df["equipment_code"].tolist(), key="global_eq_thermal")
     eq_res = results_by_eq[eq]
     eq_tables = detail_tables_by_eq[eq]
     thermal = eq_res.get("thermal")
 
     if not thermal:
-        st.warning("Aucune donnée thermique disponible pour cet équipement. Charge le fichier projet Excel ou un projet actif depuis Sources.")
+        st.warning("Aucune donnée thermique disponible pour cet équipement.")
     else:
-        st.dataframe(eq_tables.get("thermal_table_dataset", pd.DataFrame()), use_container_width=True, hide_index=True)
-        st.dataframe(eq_tables.get("thermal_table_params", pd.DataFrame()), use_container_width=True, hide_index=True)
-        st.dataframe(eq_tables.get("thermal_table_indicators", pd.DataFrame()), use_container_width=True, hide_index=True)
+        for key in ["thermal_table_dataset", "thermal_table_params", "thermal_table_indicators", "thermal_summary", "thermal_top5_days"]:
+            dfx = eq_tables.get(key, pd.DataFrame())
+            if isinstance(dfx, pd.DataFrame) and not dfx.empty:
+                st.dataframe(dfx, use_container_width=True, hide_index=True)
 
         ts = thermal.get("timeseries")
         if isinstance(ts, pd.DataFrame) and not ts.empty:
-            col1, col2 = st.columns(2)
-            with col1:
+            c1, c2 = st.columns(2)
+            with c1:
                 fig, ax = plt.subplots(figsize=(8, 4))
                 ax.plot(pd.to_datetime(ts["timestamp"]), ts["theta_HS_est_C"])
                 ax.set_title(f"θHS estimée — {eq}")
@@ -847,7 +646,7 @@ with thermal_tab:
                 ax.set_ylabel("°C")
                 ax.grid(True, alpha=0.25)
                 st.pyplot(fig, clear_figure=True)
-            with col2:
+            with c2:
                 fig, ax = plt.subplots(figsize=(8, 4))
                 ax.plot(pd.to_datetime(ts["timestamp"]), ts["FAA"])
                 ax.set_title(f"FAA — {eq}")
@@ -856,14 +655,10 @@ with thermal_tab:
                 ax.grid(True, alpha=0.25)
                 st.pyplot(fig, clear_figure=True)
 
-        st.markdown("### Synthèses complémentaires")
-        st.dataframe(eq_tables.get("thermal_summary", pd.DataFrame()), use_container_width=True, hide_index=True)
-        st.dataframe(eq_tables.get("thermal_top5_days", pd.DataFrame()), use_container_width=True, hide_index=True)
-
-with opt_tab:
-    st.subheader("Synthèse optimisation")
+with tabs[3]:
+    st.subheader("Optimisation")
     if opt_df.empty:
-        st.info("Aucune optimisation disponible pour le moment. Passe d’abord par la page Optimisation.")
+        st.info("Aucune optimisation disponible pour le moment.")
     else:
         st.dataframe(optimization_overview, use_container_width=True, hide_index=True)
 
@@ -886,7 +681,7 @@ with opt_tab:
             ax.grid(True, alpha=0.25)
             st.pyplot(fig, clear_figure=True)
 
-with decision_tab:
+with tabs[4]:
     st.subheader("Décision finale hiérarchisée")
     st.dataframe(_style_decision_df(final_decision_df), use_container_width=True, hide_index=True)
 
@@ -897,74 +692,70 @@ with decision_tab:
     st.markdown(
         f"**Processus retenu** : {row.get('model','—')}  \n"
         f"**Distribution** : {row.get('distribution','—')}  \n"
-        f"**Beta / Eta** : {_fmt(row.get('beta'),2)} / {_fmt(row.get('eta_h'),1)} h  \n"
+        f"**Beta / Eta / Gamma** : {_fmt(row.get('beta'),2)} / {_fmt(row.get('eta_h'),1)} h / {_fmt(row.get('gamma_h'),1)} h  \n"
         f"**Statut thermique** : {row.get('thermal_status','—')}  \n"
         f"**Maintenance recommandée** : {row.get('maintenance_type','—')}  \n"
         f"**Échéance** : {row.get('next_due_date','—')} (J-{row.get('days_left','—')})  \n"
-        f"**Score de priorité** : {row.get('priority_score','—')} ({row.get('priorite','—')})"
+        f"**Score** : {row.get('priority_score','—')} ({row.get('priorite','—')})"
     )
     st.info(row.get("motif_decision", "Aucun motif disponible."))
 
     st.markdown("#### Chemin de décision")
     st.markdown(
-        f"1. **Test de tendance** → {row.get('trend_detected','—')} ({row.get('trend_direction','—')})\n"
-        f"2. **Test de dépendance** → {row.get('dependence_detected','—')}\n"
+        f"1. **Tendance** → {row.get('trend_detected','—')} ({row.get('trend_direction','—')})\n"
+        f"2. **Dépendance** → {row.get('dependence_detected','—')}\n"
         f"3. **Processus** → {row.get('model','—')}\n"
-        f"4. **Modèle retenu** → {row.get('distribution','—')}\n"
+        f"4. **Distribution** → {row.get('distribution','—')}\n"
         f"5. **Thermique** → {row.get('thermal_status','—')}\n"
         f"6. **Optimisation / maintenance** → {row.get('maintenance_type','—')} / T_recommended={_fmt(row.get('T_recommended_h'),1)} h\n"
         f"7. **Décision finale** → {row.get('decision_finale','—')}"
     )
 
+with tabs[5]:
+    st.subheader("Exports")
 
-# ---------------------------------------------------------------------
-# Exports
-# ---------------------------------------------------------------------
-st.divider()
-st.subheader("📦 Exports")
+    excel_bytes = _xlsx_bytes(global_tables=global_tables, detail_tables=detail_tables_by_eq)
+    st.download_button(
+        "Télécharger le pack Excel global",
+        data=excel_bytes,
+        file_name="resultat_analyse_optimisation_maintenance.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
 
-excel_bytes = _xlsx_bytes(global_tables=global_tables, detail_tables=detail_tables_by_eq)
-st.download_button(
-    "⬇️ Télécharger le pack Excel global",
-    data=excel_bytes,
-    file_name="resultat_analyse_optimisation_maintenance.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    use_container_width=True,
-)
+    if export_global_analysis_report_pdf is None:
+        st.info("Module PDF global non détecté.")
+    else:
+        if st.button("Générer le rapport PDF global", use_container_width=True):
+            try:
+                pdf_path = export_global_analysis_report_pdf(
+                    summary_df=summary_df,
+                    global_tables=global_tables,
+                    detail_tables_by_eq=detail_tables_by_eq,
+                    out_dir=str(BASE_DIR / "reports"),
+                    title="Résultat analyse / optimisation / maintenance",
+                    meta={
+                        "alpha": alpha,
+                        "window_days": within_days,
+                        "start_date": str(start_dt),
+                        "n_equipment": len(summary_df),
+                        "source_rows": len(df_fail),
+                        "source_hash": meta_fail.get("hash", ""),
+                        "project_hash": meta_proj.get("hash", ""),
+                    },
+                )
+                st.session_state["global_pdf_path"] = pdf_path
+                st.success(f"PDF généré : {pdf_path}")
+            except Exception as e:
+                st.error(f"PDF : {e}")
 
-if export_global_analysis_report_pdf is None:
-    st.info("Module PDF global non détecté. Ajoute `core.reliability.reporting_global.py` pour le téléchargement PDF.")
-else:
-    if st.button("📄 Générer le rapport PDF global", use_container_width=True):
-        try:
-            pdf_path = export_global_analysis_report_pdf(
-                summary_df=summary_df,
-                global_tables=global_tables,
-                detail_tables_by_eq=detail_tables_by_eq,
-                out_dir=str(BASE_DIR / "reports"),
-                title="Résultat analyse / optimisation / maintenance",
-                meta={
-                    "alpha": alpha,
-                    "window_days": within_days,
-                    "start_date": str(start_dt),
-                    "n_equipment": len(summary_df),
-                    "source_rows": len(df_fail),
-                    "source_hash": meta_fail.get("hash", "") if isinstance(meta_fail, dict) else "",
-                    "project_hash": meta_project.get("hash", "") if isinstance(meta_project, dict) else "",
-                },
-            )
-            st.session_state["global_pdf_path"] = pdf_path
-            st.success(f"PDF généré : {pdf_path}")
-        except Exception as e:
-            st.error(f"PDF : {e}")
-
-    pdf_path = st.session_state.get("global_pdf_path")
-    if pdf_path and Path(pdf_path).exists():
-        with open(pdf_path, "rb") as f:
-            st.download_button(
-                "📥 Télécharger le PDF global",
-                data=f,
-                file_name=Path(pdf_path).name,
-                mime="application/pdf",
-                use_container_width=True,
-            )
+        pdf_path = st.session_state.get("global_pdf_path")
+        if pdf_path and Path(pdf_path).exists():
+            with open(pdf_path, "rb") as f:
+                st.download_button(
+                    "Télécharger le PDF global",
+                    data=f,
+                    file_name=Path(pdf_path).name,
+                    mime="application/pdf",
+                    use_container_width=True,
+                )

@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import hashlib
@@ -21,11 +20,13 @@ else:
     _PM_REPORT_ERR = None
 
 
+# -------------------------------------------------------------------
+# Helpers
+# -------------------------------------------------------------------
 def _hash_df(df: pd.DataFrame) -> str:
     if df is None or df.empty:
         return "empty"
-    b = df.to_csv(index=False).encode("utf-8")
-    return hashlib.md5(b).hexdigest()
+    return hashlib.md5(df.to_csv(index=False).encode("utf-8")).hexdigest()
 
 
 def _safe_float(x: Any, default: Optional[float] = None) -> Optional[float]:
@@ -111,61 +112,61 @@ def build_maintenance_comment(
     if e is not None and itv is not None:
         ratio = itv / max(e, 1e-9)
         if ratio > 1.0:
-            risk_hint = "Intervalle > η : risque de rater des signes avant panne, rapprocher la surveillance."
+            risk_hint = "Intervalle > η : risque de dépasser la zone sûre, rapprocher la surveillance."
         elif ratio > 0.5:
-            risk_hint = "Intervalle proche de η : vigilance accrue, tendance à la dégradation possible."
+            risk_hint = "Intervalle proche de η : vigilance accrue recommandée."
         else:
-            risk_hint = "Intervalle << η : surveillance conservatrice, bon choix pour équipement critique."
+            risk_hint = "Intervalle inférieur à η : stratégie conservatrice."
 
     if zone == "early":
         main = (
-            "β<1 : défauts précoces probables. Priorité aux contrôles de mise en service, "
-            "à la correction des causes racines et aux inspections rapprochées."
+            "β<1 : défauts précoces probables. Priorité aux contrôles de mise en service "
+            "et à la correction des causes racines."
         )
         actions = [
             "Vérifier montage, connexions, serrages et isolement.",
-            "Tracer les incidents récurrents et corriger la cause racine.",
-            "Maintenir une surveillance rapprochée à court terme.",
+            "Tracer les incidents récurrents.",
+            "Maintenir une surveillance rapprochée.",
         ]
     elif zone == "random":
         main = (
-            "β≈1 : régime plutôt aléatoire. Priorité à une maintenance préventive standard "
+            "β≈1 : régime aléatoire. Priorité à une maintenance standard "
             "avec surveillance conditionnelle légère."
         )
         actions = [
-            "Conserver un calendrier de visites périodiques.",
+            "Conserver des visites périodiques.",
             "Surveiller température, isolement et signes faibles.",
-            "Préparer les kits et consommables pour réduire le MTTR.",
+            "Préparer les consommables pour réduire le MTTR.",
         ]
     else:
         main = (
-            "β>1 : régime d’usure. Priorité à une maintenance préventive ciblée, "
-            "des inspections conditionnelles renforcées et des remplacements planifiés."
+            "β>1 : régime d’usure. Priorité à une maintenance préventive ciblée "
+            "et à des remplacements planifiés."
         )
         actions = [
-            "Renforcer la fréquence des contrôles conditionnels.",
+            "Renforcer les contrôles conditionnels.",
             "Planifier l’intervention avant le seuil critique.",
-            "Vérifier refroidissement, huile, point chaud et organes sollicités.",
+            "Vérifier refroidissement, huile et point chaud.",
         ]
 
     if "NHPP" in model_s:
         main += " Le processus global signale aussi une tendance de vieillissement."
-    elif "BPP" in model_s:
-        main += " Le processus global suggère une dépendance entre événements : vérifier causes communes et enchaînements."
+    elif "BPP" in model_s or "HAWKES" in model_s:
+        main += " Le processus global suggère une dépendance entre événements."
 
     if thermal_status and "alerte" in thermal_status.lower():
-        actions.insert(0, "Contrôler immédiatement l’échauffement et le système de refroidissement.")
+        actions.insert(0, "Contrôler immédiatement l’échauffement et le refroidissement.")
     elif thermal_status and "conforme" in thermal_status.lower():
         actions.insert(0, "Conserver la surveillance thermique actuelle.")
 
     if intensity == "high":
-        freq = "Fréquence élevée (≤ 7 jours) : recommandée pour équipement à risque / critique."
+        freq = "Fréquence élevée : équipement à risque ou critique."
     elif intensity == "medium":
-        freq = "Fréquence moyenne (≤ 30 jours) : compromis coût / risque généralement acceptable."
+        freq = "Fréquence moyenne : compromis coût / risque acceptable."
     elif intensity == "low":
-        freq = "Fréquence faible (> 30 jours) : acceptable si le risque reste faible et la thermique stable."
+        freq = "Fréquence faible : acceptable si le risque reste bas."
     else:
-        freq = "Fréquence non déterminée (intervalle manquant)."
+        freq = "Fréquence non déterminée."
 
     parts = [
         f"Type recommandé : {mtype_label}.",
@@ -216,9 +217,6 @@ def build_virtual_pm_plan_from_optimization(
     if "equipment_code" not in df.columns:
         return {"ok": False, "msg": "Colonne equipment_code absente", "rows": [], "due": []}
 
-    within_days = int(within_days or 0)
-    within_days = max(within_days, 0)
-
     rows: List[Dict[str, Any]] = []
     used_cols = {"T_recommended_h": 0, "T_R_h": 0, "T_cost_h": 0, "interval_opt_h": 0, "interval_h": 0, "none": 0}
 
@@ -248,12 +246,8 @@ def build_virtual_pm_plan_from_optimization(
         next_due = start_date + timedelta(days=periodicity_days)
         days_left = (next_due - start_date).days
 
-        beta = _safe_float(row.get("beta_pipe"), None)
-        if beta is None:
-            beta = _safe_float(row.get("beta_opt"), None)
-        eta_h = _safe_float(row.get("eta_pipe_h"), None)
-        if eta_h is None:
-            eta_h = _safe_float(row.get("eta_opt_h"), None)
+        beta = _safe_float(row.get("beta"), None)
+        eta_h = _safe_float(row.get("eta_h"), None)
 
         comment = build_maintenance_comment(
             beta=beta,
@@ -261,7 +255,7 @@ def build_virtual_pm_plan_from_optimization(
             interval_h=_safe_float(interval_h, None),
             interval_source=src,
             mtype_label=mtype,
-            process_model=str(row.get("process_model") or row.get("model") or ""),
+            process_model=str(row.get("model") or ""),
             thermal_status=str(row.get("thermal_status") or ""),
             thermal_faa_max=_safe_float(row.get("FAA_max"), None),
             thermal_lol_pct=_safe_float(row.get("loss_of_life_pct"), None),
@@ -279,14 +273,14 @@ def build_virtual_pm_plan_from_optimization(
             "days_left": int(days_left),
             "beta": beta,
             "eta_h": eta_h,
-            "gamma_h": row.get("gamma_pipe_h", row.get("gamma_opt_h")),
-            "model": row.get("process_model", row.get("model")),
+            "gamma_h": row.get("gamma_h"),
+            "model": row.get("model"),
             "distribution": row.get("distribution"),
             "T_recommended_h": row.get("T_recommended_h"),
             "T_R_h": row.get("T_R_h"),
             "T_cost_h": row.get("T_cost_h"),
-            "R_at_T": row.get("R_at_T", row.get("R(T_cost)")),
-            "C_min_per_h": row.get("C_min_per_h", row.get("C_min")),
+            "R_at_T": row.get("R(T_cost)"),
+            "C_min_per_h": row.get("C_min_per_h"),
             "FAA_max": row.get("FAA_max"),
             "loss_of_life_pct": row.get("loss_of_life_pct"),
             "thermal_status": row.get("thermal_status"),
@@ -311,33 +305,35 @@ def build_virtual_pm_plan_from_optimization(
     }
 
 
+# -------------------------------------------------------------------
+# UI
+# -------------------------------------------------------------------
 st.set_page_config(page_title="Maintenance", page_icon="🛠️", layout="wide")
 require_login()
 
-st.title("🛠️ Maintenance (basée sur l’optimisation)")
-st.caption("Plan PM virtuel + recommandations + export PDF. Fonctionne avec la session Streamlit ou le fallback fichier.")
+st.title("🛠️ Maintenance")
 
 df_opt = st.session_state.get("optimization_df")
 if not isinstance(df_opt, pd.DataFrame) or df_opt.empty:
     df_opt = _load_optimization_fallback()
 
 if not isinstance(df_opt, pd.DataFrame) or df_opt.empty:
-    st.info("Aucune optimisation disponible. Va d’abord sur la page Optimisation, puis reviens ici.")
+    st.info("Aucune optimisation disponible. Va d’abord dans Optimisation.")
     st.stop()
 
 df_opt = df_opt.copy()
 df_opt.columns = [str(c).strip() for c in df_opt.columns]
 
 h = _hash_df(df_opt)
-st.success(f"Dataset optimisation synchronisé ✅ | rows={len(df_opt)} | hash={h}")
+st.success(f"Optimisation synchronisée | rows={len(df_opt)} | hash={h}")
 
-c1, c2, c3, c4, c5 = st.columns([1, 1, 1, 1, 1])
+c1, c2, c3, c4, c5 = st.columns(5)
 with c1:
-    within = st.slider("Fenêtre (jours) — tâches dues", 7, 365, 14, 1)
+    within = st.slider("Fenêtre tâches dues (jours)", 7, 365, 14, 1)
 with c2:
-    show_all = st.toggle("Afficher tout le planning", value=True)
+    show_all = st.toggle("Afficher tout", value=True)
 with c3:
-    only_prev = st.toggle("Seulement Préventive", value=False)
+    only_prev = st.toggle("Seulement préventive", value=False)
 with c4:
     only_admissible = st.toggle("Seulement admissible", value=False)
 with c5:
@@ -357,130 +353,182 @@ if not plan.get("ok"):
     st.error(plan.get("msg", "Erreur plan"))
     st.stop()
 
-st.caption(f"Priorité intervalles : {', '.join(plan.get('interval_priority', []))}")
-st.caption(f"Colonnes réellement utilisées : {plan.get('used_cols_stats')}")
-
 rows_all = plan.get("rows", [])
 rows_due = plan.get("due", [])
 
-colk1, colk2, colk3, colk4 = st.columns(4)
-with colk1:
+st.caption(f"Priorité intervalles : {', '.join(plan.get('interval_priority', []))}")
+st.caption(f"Colonnes utilisées : {plan.get('used_cols_stats')}")
+
+k1, k2, k3, k4 = st.columns(4)
+with k1:
     st.metric("Équipements planifiés", len(rows_all))
-with colk2:
+with k2:
     st.metric("Tâches dues", len(rows_due))
-with colk3:
+with k3:
     admissibles = int(pd.Series([r.get("admissible_global") for r in rows_all]).fillna(False).astype(bool).sum()) if rows_all else 0
     st.metric("Plans admissibles", admissibles)
-with colk4:
+with k4:
     preventive = int(sum(1 for r in rows_all if "Préventive" in str(r.get("maintenance_type", ""))))
     st.metric("Préventives", preventive)
 
-st.markdown("## 0) Commentaires maintenance (résumé)")
-if rows_all:
-    df_comm = pd.DataFrame(rows_all)[
-        [c for c in [
-            "equipment_code", "maintenance_type", "interval_source", "interval_h",
-            "beta", "eta_h", "thermal_status", "maintenance_comment",
-        ] if c in pd.DataFrame(rows_all).columns]
-    ].copy()
-    df_comm = df_comm.drop_duplicates(subset=["equipment_code"]).sort_values("equipment_code")
-    st.dataframe(df_comm, use_container_width=True, hide_index=True)
-else:
-    st.info("Aucun commentaire : aucune ligne exploitable.")
+tabs = st.tabs([
+    "Commentaires",
+    "Planning",
+    "Tâches dues",
+    "Priorité finale",
+    "Exports",
+])
 
-st.markdown("## 1) Planning (issu de l’optimisation)")
-if not rows_all:
-    st.warning("Aucune ligne exploitable (intervalles manquants ou <=0).")
-else:
-    df_all = pd.DataFrame(rows_all)
-    cols = [
-        "equipment_code", "maintenance_type", "interval_source", "interval_h", "periodicity_days",
-        "next_due_date", "days_left", "beta", "eta_h", "model", "distribution", "FAA_max",
-        "loss_of_life_pct", "thermal_status", "admissible_global", "T_recommended_h", "T_R_h",
-        "T_cost_h", "maintenance_comment",
-    ]
-    cols = [c for c in cols if c in df_all.columns]
-    st.dataframe(df_all[cols], use_container_width=True, hide_index=True)
+with tabs[0]:
+    st.subheader("Commentaires maintenance")
+    if rows_all:
+        df_comm = pd.DataFrame(rows_all)[
+            [c for c in [
+                "equipment_code",
+                "maintenance_type",
+                "interval_source",
+                "interval_h",
+                "beta",
+                "eta_h",
+                "thermal_status",
+                "maintenance_comment",
+            ] if c in pd.DataFrame(rows_all).columns]
+        ].copy()
+        df_comm = df_comm.drop_duplicates(subset=["equipment_code"]).sort_values("equipment_code")
+        st.dataframe(df_comm, use_container_width=True, hide_index=True)
+    else:
+        st.info("Aucun commentaire disponible.")
 
-st.markdown("## 2) Tâches dues (dans la fenêtre)")
-if not rows_due:
-    st.info("Aucune tâche due dans la fenêtre. Augmente la fenêtre ou change la date de départ.")
-else:
-    df_due = pd.DataFrame(rows_due)
-    cols = [
-        "equipment_code", "maintenance_type", "interval_source", "interval_h",
-        "next_due_date", "days_left", "beta", "eta_h", "model", "distribution", "FAA_max",
-        "loss_of_life_pct", "thermal_status", "admissible_global", "T_recommended_h", "T_R_h",
-        "T_cost_h", "maintenance_comment",
-    ]
-    cols = [c for c in cols if c in df_due.columns]
-    st.dataframe(df_due[cols], use_container_width=True, hide_index=True)
+with tabs[1]:
+    st.subheader("Planning complet")
+    if not rows_all:
+        st.warning("Aucune ligne exploitable.")
+    else:
+        df_all = pd.DataFrame(rows_all)
+        cols = [
+            "equipment_code",
+            "maintenance_type",
+            "interval_source",
+            "interval_h",
+            "periodicity_days",
+            "next_due_date",
+            "days_left",
+            "beta",
+            "eta_h",
+            "model",
+            "distribution",
+            "FAA_max",
+            "loss_of_life_pct",
+            "thermal_status",
+            "admissible_global",
+            "T_recommended_h",
+            "T_R_h",
+            "T_cost_h",
+            "maintenance_comment",
+        ]
+        cols = [c for c in cols if c in df_all.columns]
+        st.dataframe(df_all[cols], use_container_width=True, hide_index=True)
 
-st.markdown("## 3) Recommandation finale")
-if rows_all:
-    df_rank = pd.DataFrame(rows_all).copy()
-    if "admissible_global" in df_rank.columns:
-        df_rank["admissible_global"] = df_rank["admissible_global"].fillna(False).astype(bool)
-    if "days_left" in df_rank.columns:
-        df_rank["days_left"] = pd.to_numeric(df_rank["days_left"], errors="coerce").fillna(999999)
-    if "C_min_per_h" in df_rank.columns:
-        df_rank["C_min_per_h"] = pd.to_numeric(df_rank["C_min_per_h"], errors="coerce")
+with tabs[2]:
+    st.subheader("Tâches dues dans la fenêtre")
+    if not rows_due:
+        st.info("Aucune tâche due dans la fenêtre choisie.")
+    else:
+        df_due = pd.DataFrame(rows_due)
+        cols = [
+            "equipment_code",
+            "maintenance_type",
+            "interval_source",
+            "interval_h",
+            "next_due_date",
+            "days_left",
+            "beta",
+            "eta_h",
+            "model",
+            "distribution",
+            "FAA_max",
+            "loss_of_life_pct",
+            "thermal_status",
+            "admissible_global",
+            "T_recommended_h",
+            "T_R_h",
+            "T_cost_h",
+            "maintenance_comment",
+        ]
+        cols = [c for c in cols if c in df_due.columns]
+        st.dataframe(df_due[cols], use_container_width=True, hide_index=True)
 
-    sort_cols = [c for c in ["admissible_global", "days_left", "C_min_per_h"] if c in df_rank.columns]
-    ascending = [False if c == "admissible_global" else True for c in sort_cols]
-    if sort_cols:
-        df_rank = df_rank.sort_values(sort_cols, ascending=ascending)
+with tabs[3]:
+    st.subheader("Recommandation finale")
+    if rows_all:
+        df_rank = pd.DataFrame(rows_all).copy()
+        if "admissible_global" in df_rank.columns:
+            df_rank["admissible_global"] = df_rank["admissible_global"].fillna(False).astype(bool)
+        if "days_left" in df_rank.columns:
+            df_rank["days_left"] = pd.to_numeric(df_rank["days_left"], errors="coerce").fillna(999999)
+        if "C_min_per_h" in df_rank.columns:
+            df_rank["C_min_per_h"] = pd.to_numeric(df_rank["C_min_per_h"], errors="coerce")
 
-    best = df_rank.iloc[0].to_dict()
-    st.success(
-        f"Équipement prioritaire : {best.get('equipment_code', '—')} | "
-        f"{best.get('maintenance_type', '—')} | échéance {best.get('next_due_date', '—')}"
-    )
-    st.write(best.get("maintenance_comment", "—"))
+        sort_cols = [c for c in ["admissible_global", "days_left", "C_min_per_h"] if c in df_rank.columns]
+        ascending = [False if c == "admissible_global" else True for c in sort_cols]
 
-st.session_state["pm_virtual_all"] = rows_all
-st.session_state["pm_virtual_due"] = rows_due
+        if sort_cols:
+            df_rank = df_rank.sort_values(sort_cols, ascending=ascending)
 
-st.markdown("## 4) Exports")
-if rows_all:
-    df_all = pd.DataFrame(rows_all)
-    csv_all = df_all.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "⬇️ Télécharger le planning CSV",
-        data=csv_all,
-        file_name="maintenance_virtual_plan.csv",
-        mime="text/csv",
-        use_container_width=True,
-    )
+        best = df_rank.iloc[0].to_dict()
+        st.success(
+            f"Équipement prioritaire : {best.get('equipment_code', '—')} | "
+            f"{best.get('maintenance_type', '—')} | échéance {best.get('next_due_date', '—')}"
+        )
+        st.write(best.get("maintenance_comment", "—"))
+    else:
+        st.info("Aucune recommandation disponible.")
 
-include_all_in_pdf = st.toggle("Inclure tout le planning dans le PDF (sinon seulement les tâches dues)", value=False)
+with tabs[4]:
+    st.subheader("Exports")
 
-if export_pm_plan_with_kits_pdf is None:
-    st.info("Module PDF maintenance indisponible ou incompatible.")
-    if _PM_REPORT_ERR:
-        st.caption(f"Détail import: {_PM_REPORT_ERR}")
-else:
-    if st.button("📄 Générer PDF (plan issu optimisation)", use_container_width=True):
-        tasks_for_pdf = rows_all if include_all_in_pdf else rows_due
-        metrics_table = df_opt.to_dict("records")
-        try:
-            out = export_pm_plan_with_kits_pdf(
-                tasks_due=tasks_for_pdf,
-                kits_by_eq={},
-                metrics_table=metrics_table,
-                out_dir="reports",
-                title="Plan de maintenance — issu de l’optimisation",
-                include_kits=False,
-                tools_checklist=None,
-            )
-            st.success("PDF généré.")
-            with open(out, "rb") as f:
-                st.download_button(
-                    "⬇️ Télécharger le PDF",
-                    f,
-                    file_name=Path(out).name,
-                    mime="application/pdf",
-                    use_container_width=True,
+    st.session_state["pm_virtual_all"] = rows_all
+    st.session_state["pm_virtual_due"] = rows_due
+
+    if rows_all:
+        df_all = pd.DataFrame(rows_all)
+        csv_all = df_all.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Télécharger le planning CSV",
+            data=csv_all,
+            file_name="maintenance_virtual_plan.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+    include_all_in_pdf = st.toggle("Inclure tout le planning dans le PDF", value=False)
+
+    if export_pm_plan_with_kits_pdf is None:
+        st.info("Module PDF maintenance indisponible.")
+        if _PM_REPORT_ERR:
+            st.caption(_PM_REPORT_ERR)
+    else:
+        if st.button("Générer le PDF maintenance", use_container_width=True):
+            tasks_for_pdf = rows_all if include_all_in_pdf else rows_due
+            metrics_table = df_opt.to_dict("records")
+            try:
+                out = export_pm_plan_with_kits_pdf(
+                    tasks_due=tasks_for_pdf,
+                    kits_by_eq={},
+                    metrics_table=metrics_table,
+                    out_dir="reports",
+                    title="Plan de maintenance — issu de l’optimisation",
+                    include_kits=False,
+                    tools_checklist=None,
                 )
-        except Exception as e:
-            st.error(f"PDF : {e}")
+                st.success("PDF généré.")
+                with open(out, "rb") as f:
+                    st.download_button(
+                        "Télécharger le PDF",
+                        data=f,
+                        file_name=Path(out).name,
+                        mime="application/pdf",
+                        use_container_width=True,
+                    )
+            except Exception as e:
+                st.error(f"PDF : {e}")
