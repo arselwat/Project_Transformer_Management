@@ -80,22 +80,20 @@ def _sanitize_thermal_config(cfg: Any) -> Optional[Dict[str, Any]]:
         return None
 
     allowed = {
-        "sn_mva",
-        "R",
-        "delta_to_r",
-        "delta_h_r",
-        "tau_to_min",
-        "tau_w_min",
-        "n_exp",
-        "m_exp",
-        "forced_tau_to_factor",
-        "forced_delta_to_factor",
-        "forced_delta_h_factor",
-        "normal_insulation_life_h",
-        "faa_limit",
-        "lol_limit_hours",
-        "dt_hours",
-    }
+    "sn_mva",
+    "R",
+    "delta_to_r",
+    "delta_h_r",
+    "tau_to_min",
+    "tau_w_min",
+    "n_exp",
+    "m_exp",
+    "forced_tau_to_factor",
+    "forced_delta_to_factor",
+    "forced_delta_h_factor",
+    "normal_insulation_life_h",
+    "dt_hours",
+}
 
     out: Dict[str, Any] = {}
     for k, v in cfg.items():
