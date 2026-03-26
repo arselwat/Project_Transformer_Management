@@ -1,30 +1,73 @@
 from __future__ import annotations
+
 from pathlib import Path
 import pandas as pd
 import streamlit as st
+
 from core.security.auth import login_form
+from core.datahub import (
+    get_current_failures_df,
+    get_failures_meta,
+    get_project_meta,
+)
 
 st.set_page_config(
-    page_title="Fiabilité & Gestion de stock— Transformateurs",
+    page_title="Fiabilité & Gestion de stock — Transformateurs",
     page_icon="🛠️",
     layout="wide",
 )
 
+# =========================================================
+# AUTH
+# =========================================================
 if "auth_ok" not in st.session_state:
     st.session_state["auth_ok"] = False
+
 if not st.session_state["auth_ok"]:
     login_form()
     st.stop()
 
-# =========================
-# THÈME + LOGO (sidebar)
-# =========================
+# =========================================================
+# PATHS
+# =========================================================
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 ASSETS_DIR = BASE_DIR / "assets"
 DATA_DIR.mkdir(exist_ok=True, parents=True)
 ASSETS_DIR.mkdir(exist_ok=True, parents=True)
 
+# =========================================================
+# HELPERS
+# =========================================================
+def _file_exists(rel_path: str) -> bool:
+    return (BASE_DIR / rel_path).exists()
+
+def _metric_fmt(v, nd: int = 2, fallback: str = "n/a") -> str:
+    try:
+        if v is None:
+            return fallback
+        x = float(v)
+        if pd.isna(x):
+            return fallback
+        return f"{x:.{nd}f}"
+    except Exception:
+        return fallback
+
+def _render_nav_card(title: str, desc: str, rel_path: str, icon: str, compact: bool = False):
+    exists = _file_exists(rel_path)
+    size_class = "card-compact" if compact else "card-panel"
+    st.markdown(f'<div class="{size_class}">', unsafe_allow_html=True)
+    st.markdown(f"#### {icon} {title}")
+    st.markdown(f"<p>{desc}</p>", unsafe_allow_html=True)
+    if exists:
+        st.page_link(rel_path, label="Ouvrir", icon=icon)
+    else:
+        st.warning(f"Fichier introuvable : {rel_path}")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# =========================================================
+# SIDEBAR
+# =========================================================
 with st.sidebar:
     st.markdown("### 🎨 Apparence")
     theme = st.radio(
@@ -37,210 +80,379 @@ with st.sidebar:
 
 LIGHT = """
 :root{
-  --bg:#ffffff;--bg2:#f5f7fb;--text:#0b1221;--muted:#63708a;
-  --card:#ffffff;--ring:rgba(31,119,180,.18);--primary:#1f77b4;
+  --bg:#ffffff;
+  --bg2:#f6f8fc;
+  --text:#0b1221;
+  --muted:#60708b;
+  --card:#ffffff;
+  --ring:rgba(31,119,180,.16);
+  --primary:#1f77b4;
+  --accent:#eaf3ff;
+  --shadow:0 10px 28px -18px rgba(31,119,180,.22);
 }
 """
+
 DARK = """
 :root{
-  --bg:#0f1420;--bg2:#141b2c;--text:#e8eef8;--muted:#a8b2c2;
-  --card:#0e1525;--ring:rgba(74,163,255,.22);--primary:#4aa3ff;
+  --bg:#0f1420;
+  --bg2:#141b2c;
+  --text:#e8eef8;
+  --muted:#a8b2c2;
+  --card:#111a2c;
+  --ring:rgba(74,163,255,.18);
+  --primary:#4aa3ff;
+  --accent:#13233b;
+  --shadow:0 12px 28px -18px rgba(74,163,255,.18);
 }
 """
+
 BASE = """
-html,body,[class*="css"]{background:var(--bg);color:var(--text);font-size:17px}
-.block-container{padding-top:1.1rem}
-h1{font-size:2.0rem} h2{font-size:1.55rem} h3{font-size:1.2rem}
+html, body, [class*="css"]{
+  background:var(--bg);
+  color:var(--text);
+  font-size:16px;
+}
+
+.block-container{
+  padding-top:0.95rem;
+  padding-bottom:1.5rem;
+  max-width: 1320px;
+}
+
+h1{font-size:1.85rem}
+h2{font-size:1.35rem}
+h3{font-size:1.08rem}
+
 .hero{
-  display:flex;gap:18px;align-items:center;
+  display:flex;
+  gap:16px;
+  align-items:center;
   background:linear-gradient(180deg,var(--bg2),var(--bg));
-  border:1px solid var(--ring);padding:18px;border-radius:18px;
-  box-shadow:0 10px 32px -14px var(--ring)
+  border:1px solid var(--ring);
+  padding:16px 18px;
+  border-radius:18px;
+  box-shadow:var(--shadow);
+  margin-bottom:.35rem;
 }
+
 .logo{
-  width:64px;height:64px;border-radius:14px;border:1px solid var(--ring);
-  background:var(--card);display:flex;align-items:center;
-  justify-content:center;font-size:32px
+  width:58px;
+  height:58px;
+  border-radius:14px;
+  border:1px solid var(--ring);
+  background:var(--card);
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  font-size:28px;
+  flex-shrink:0;
 }
+
+.kpi-wrap{
+  background:var(--card);
+  border:1px solid var(--ring);
+  border-radius:16px;
+  padding:10px 12px;
+  box-shadow:var(--shadow);
+}
+
+.card-panel, .card-compact{
+  background:var(--card);
+  border-radius:14px;
+  border:1px solid var(--ring);
+  box-shadow:var(--shadow);
+  height:100%;
+}
+
 .card-panel{
-  background:var(--card);border-radius:16px;border:1px solid var(--ring);
-  padding:14px 14px 10px 14px;margin-bottom:12px;
-  box-shadow:0 8px 22px -14px var(--ring);
+  padding:12px 12px 8px 12px;
+  min-height:150px;
 }
-.card-panel h3{margin:0 0 4px 0;font-size:1.05rem}
-.card-panel p{margin:0 0 6px 0;color:var(--muted);font-size:0.9rem}
+
+.card-compact{
+  padding:10px 10px 6px 10px;
+  min-height:128px;
+}
+
+.card-panel h4, .card-compact h4{
+  margin:0 0 6px 0;
+}
+
+.card-panel p, .card-compact p{
+  margin:0 0 8px 0;
+  color:var(--muted);
+  font-size:0.88rem;
+  line-height:1.35;
+}
+
+.section-title{
+  font-size:1.08rem;
+  font-weight:700;
+  margin: .35rem 0 .55rem 0;
+}
+
+.hr-soft{
+  height:1px;
+  background:linear-gradient(90deg, transparent, var(--ring), transparent);
+  margin: .75rem 0 1rem 0;
+}
+
 .stButton>button{
-  background:var(--primary)!important;color:#fff!important;border-radius:10px!important;
-  border:none!important;padding:.35rem .8rem!important;font-size:0.85rem!important;
+  background:var(--primary)!important;
+  color:#fff!important;
+  border-radius:9px!important;
+  border:none!important;
+  padding:.28rem .72rem!important;
+  font-size:.82rem!important;
+  box-shadow:none!important;
 }
-[data-testid="stMetricValue"]{font-size:1.6rem!important}
-.footer{color:var(--muted);text-align:center;margin-top:24px;font-size:0.85rem}
+
+[data-testid="stMetricValue"]{
+  font-size:1.35rem!important;
+}
+
+[data-testid="stMetricLabel"]{
+  font-size:.84rem!important;
+}
+
+.quick-menu{
+  background:var(--card);
+  border:1px solid var(--ring);
+  border-radius:14px;
+  padding:10px 10px 6px 10px;
+  margin-top:8px;
+}
+
+.quick-menu h4{
+  margin:0 0 8px 0;
+  font-size:.98rem;
+}
+
+.sidebar-note{
+  color:var(--muted);
+  font-size:.82rem;
+  line-height:1.35;
+}
+
+.footer{
+  color:var(--muted);
+  text-align:center;
+  margin-top:22px;
+  font-size:.82rem;
+}
 """
-st.markdown(f"<style>{(DARK if theme=='Sombre' else LIGHT)+BASE}</style>", unsafe_allow_html=True)
 
-# =========================
-# HÉRO
-# =========================
-st.markdown(
-    """
-<div class="hero">
-  <div class="logo">⚡</div>
-  <div>
-    <h1>Analyse de Fiabilité, optimisation et aide à la décision pour la maintenance
-    des transformateurs de puissance</h1>
-    <p style="margin:6px 0 0 0;color:var(--muted)">
-      MTBF/MTTR • Weibull • Organigramme RP/NHPP/BPP • Thermique • Optimisation • Maintenance • Temps réel
-    </p>
-  </div>
-</div>
-""",
-    unsafe_allow_html=True,
-)
+st.markdown(f"<style>{(DARK if theme == 'Sombre' else LIGHT) + BASE}</style>", unsafe_allow_html=True)
 
-# =========================
-# MÉTRIQUES RAPIDES
-# =========================
-df = st.session_state.get("failures_df")
-if not isinstance(df, pd.DataFrame):
-    file_conso = DATA_DIR / "failures_saved.csv"
-    if file_conso.exists():
-        try:
-            df = pd.read_csv(file_conso)
-        except Exception:
-            df = None
+# =========================================================
+# DATA SUMMARY
+# =========================================================
+failures_df = get_current_failures_df()
+fail_meta = get_failures_meta()
+proj_meta = get_project_meta()
 
-total_pannes = 0 if df is None else len(df)
-nb_eq = 0 if df is None or "equipment_code" not in df.columns else df["equipment_code"].nunique()
+total_pannes = 0 if failures_df.empty else len(failures_df)
+nb_eq = 0 if failures_df.empty or "equipment_code" not in failures_df.columns else failures_df["equipment_code"].nunique()
 
 mtbf = None
 mttr = None
-if isinstance(df, pd.DataFrame) and "ttf_h" in df.columns:
-    vals = pd.to_numeric(df["ttf_h"], errors="coerce").dropna()
+if isinstance(failures_df, pd.DataFrame) and not failures_df.empty and "ttf_h" in failures_df.columns:
+    vals = pd.to_numeric(failures_df["ttf_h"], errors="coerce").dropna()
     mtbf = float(vals.mean()) if len(vals) else None
-if isinstance(df, pd.DataFrame) and "duree_rep_h" in df.columns:
-    vals = pd.to_numeric(df["duree_rep_h"], errors="coerce").dropna()
+
+if isinstance(failures_df, pd.DataFrame) and not failures_df.empty and "duree_rep_h" in failures_df.columns:
+    vals = pd.to_numeric(failures_df["duree_rep_h"], errors="coerce").dropna()
     mttr = float(vals.mean()) if len(vals) else None
 
-c1, c2, c3, c4 = st.columns(4)
-with c1:
+project_loaded = "Oui" if proj_meta.get("ok") else "Non"
+
+# =========================================================
+# CUSTOM SIDEBAR MENU
+# =========================================================
+with st.sidebar:
+    st.markdown('<div class="quick-menu">', unsafe_allow_html=True)
+    st.markdown("#### 🧭 Accès rapide")
+    if _file_exists("pages/1_Sources_fully_linked.py"):
+        st.page_link("pages/1_Sources_fully_linked.py", label="Sources", icon="📥")
+    if _file_exists("pages/2_Indicateurs_corrected.py"):
+        st.page_link("pages/2_Indicateurs_corrected.py", label="Indicateurs", icon="📊")
+    if _file_exists("pages/4_Optimisation_corrected.py"):
+        st.page_link("pages/4_Optimisation_corrected.py", label="Optimisation", icon="🧠")
+    if _file_exists("pages/5_Maintenance_corrected.py"):
+        st.page_link("pages/5_Maintenance_corrected.py", label="Maintenance", icon="🛠️")
+    if _file_exists("pages/6_Resultat_analyse_optimisation_Maintenance.py"):
+        st.page_link("pages/6_Resultat_analyse_optimisation_Maintenance.py", label="Résultat global", icon="📋")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown(
+        '<p class="sidebar-note">Pour garder le menu automatique de Streamlit bien rangé, '
+        'renomme les fichiers avec des préfixes 01, 02, 03... '
+        'Le désordre du menu latéral vient surtout de l’ordre des noms de fichiers.</p>',
+        unsafe_allow_html=True,
+    )
+
+# =========================================================
+# HERO
+# =========================================================
+st.markdown(
+    """
+    <div class="hero">
+      <div class="logo">⚡</div>
+      <div>
+        <h1>Analyse de fiabilité, optimisation et aide à la décision pour la maintenance des transformateurs de puissance</h1>
+        <p style="margin:6px 0 0 0;color:var(--muted)">
+          TTF / MTBF / MTTR • Weibull • RP / NHPP / BPP • Thermique • Optimisation • Maintenance • Résultat global
+        </p>
+      </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.markdown('<div class="hr-soft"></div>', unsafe_allow_html=True)
+
+# =========================================================
+# KPI
+# =========================================================
+k1, k2, k3, k4, k5 = st.columns(5)
+with k1:
     st.metric("📄 Pannes", f"{total_pannes}")
-with c2:
+with k2:
     st.metric("🔧 Équipements", f"{nb_eq}")
-with c3:
-    st.metric("⏳ MTBF (h)", f"{mtbf:.2f}" if mtbf else "n/a")
-with c4:
-    st.metric("🛠️ MTTR (h)", f"{mttr:.2f}" if mttr else "n/a")
+with k3:
+    st.metric("⏳ MTBF (h)", _metric_fmt(mtbf))
+with k4:
+    st.metric("🛠️ MTTR (h)", _metric_fmt(mttr))
+with k5:
+    st.metric("📦 Projet chargé", project_loaded)
 
-st.markdown("---")
+st.markdown('<div class="hr-soft"></div>', unsafe_allow_html=True)
 
-# =========================
-# CARTES DE NAVIGATION (3 par ligne)
-# =========================
-st.markdown("### 🧭 Navigation principale")
-
-# Ligne 1 : Sources / Indicateurs / Optimisation
-row1 = st.columns(3)
-with row1[0]:
-    st.markdown('<div class="card-panel">', unsafe_allow_html=True)
-    st.markdown("#### 📥 Sources de données")
-    st.markdown(
-        "<p>Importer les historiques de pannes (CSV TTF) ou le projet Excel complet qui alimentera toutes les pages.</p>",
-        unsafe_allow_html=True,
+# =========================================================
+# STATUS STRIP
+# =========================================================
+left, right = st.columns([1.25, 1])
+with left:
+    st.info(
+        f"Dataset TTF actif : {fail_meta.get('rows', 0)} lignes | "
+        f"hash={fail_meta.get('hash', '') or '—'} | "
+        f"source={fail_meta.get('source', '') or '—'}"
     )
-    st.page_link("pages/1_Sources_fully_linked.py", label="Ouvrir les sources", icon="📥")
-    st.markdown("</div>", unsafe_allow_html=True)
-
-with row1[1]:
-    st.markdown('<div class="card-panel">', unsafe_allow_html=True)
-    st.markdown("#### 📊 Indicateurs")
-    st.markdown(
-        "<p>Tests de tendance/dépendance, choix du processus, courbes R/F/f/h et thermique détaillée.</p>",
-        unsafe_allow_html=True,
+with right:
+    st.info(
+        f"Projet complet : {'chargé' if proj_meta.get('ok') else 'non chargé'} | "
+        f"source={proj_meta.get('source', '') or '—'}"
     )
-    st.page_link("pages/2_Indicateurs_corrected.py", label="Ouvrir les indicateurs", icon="📊")
-    st.markdown("</div>", unsafe_allow_html=True)
 
-with row1[2]:
-    st.markdown('<div class="card-panel">', unsafe_allow_html=True)
-    st.markdown("#### 🧠 Optimisation")
-    st.markdown(
-        "<p>Calcul des intervalles optimisés, contraintes thermiques et génération du rapport d’optimisation.</p>",
-        unsafe_allow_html=True,
-    )
-    st.page_link("pages/3_Optimisation_corrected.py", label="Ouvrir l’optimisation", icon="🧠")
-    st.markdown("</div>", unsafe_allow_html=True)
+# =========================================================
+# MAIN NAV
+# =========================================================
+st.markdown('<div class="section-title">🧭 Navigation principale</div>', unsafe_allow_html=True)
 
-# Ligne 2 : Temps réel / Maintenance / Résultat global
-row2 = st.columns(3)
-with row2[0]:
-    st.markdown('<div class="card-panel">', unsafe_allow_html=True)
-    st.markdown("#### 📡 Temps réel")
-    st.markdown(
-        "<p>Simulation ou acquisition MQTT : tensions, courants, températures, alertes et supervision.</p>",
-        unsafe_allow_html=True,
+# Ligne 1
+r1 = st.columns(4)
+with r1[0]:
+    _render_nav_card(
+        "Sources de données",
+        "Importer le CSV TTF ou le projet Excel complet qui alimentera toutes les pages.",
+        "pages/1_Sources_fully_linked.py",
+        "📥",
+        compact=True,
     )
-    st.page_link("pages/9_Visualisation_temps_reel.py", label="Ouvrir le temps réel", icon="📡")
-    st.markdown("</div>", unsafe_allow_html=True)
+with r1[1]:
+    _render_nav_card(
+        "Indicateurs",
+        "Tests de tendance/dépendance, processus retenu, courbes fiabilistes et thermique.",
+        "pages/2_Indicateurs_corrected.py",
+        "📊",
+        compact=True,
+    )
+with r1[2]:
+    _render_nav_card(
+        "Optimisation",
+        "Intervalles optimisés, coût, fiabilité cible et contraintes thermiques.",
+        "pages/4_Optimisation_corrected.py",
+        "🧠",
+        compact=True,
+    )
+with r1[3]:
+    _render_nav_card(
+        "Maintenance",
+        "Planning virtuel, tâches dues, commentaires maintenance et plan PDF.",
+        "pages/5_Maintenance_corrected.py",
+        "🛠️",
+        compact=True,
+    )
 
-with row2[1]:
-    st.markdown('<div class="card-panel">', unsafe_allow_html=True)
-    st.markdown("#### 🛠️ Maintenance")
-    st.markdown(
-        "<p>Planning virtuel, tâches dues, commentaires maintenance et génération du plan PDF.</p>",
-        unsafe_allow_html=True,
-    )
-    st.page_link("pages/5_Maintenance_corrected.py", label="Ouvrir la maintenance", icon="🛠️")
-    st.markdown("</div>", unsafe_allow_html=True)
-
-with row2[2]:
-    st.markdown('<div class="card-panel">', unsafe_allow_html=True)
-    st.markdown("#### 📋 Résultat global")
-    st.markdown(
-        "<p>Vue complète du flux : tests → modèles → thermique → optimisation → maintenance → décision finale.</p>",
-        unsafe_allow_html=True,
-    )
-    st.page_link(
+# Ligne 2
+r2 = st.columns(4)
+with r2[0]:
+    _render_nav_card(
+        "Résultat global",
+        "De l’analyse aux recommandations finales, avec synthèse complète par équipement.",
         "pages/6_Resultat_analyse_optimisation_Maintenance.py",
-        label="Ouvrir le résultat global",
-        icon="📋",
+        "📋",
+        compact=True,
     )
-    st.markdown("</div>", unsafe_allow_html=True)
+with r2[1]:
+    _render_nav_card(
+        "Stock & pièces",
+        "Pièces de rechange, seuils de stock et liaison avec la maintenance.",
+        "pages/7_Stock.py",
+        "📦",
+        compact=True,
+    )
+with r2[2]:
+    _render_nav_card(
+        "Transformateurs",
+        "Vue transformateurs, fiches ou registres dédiés si ton module est activé.",
+        "pages/8_Transformateurs.py",
+        "🔌",
+        compact=True,
+    )
+with r2[3]:
+    _render_nav_card(
+        "Temps réel",
+        "Visualisation MQTT / simulation des mesures et alertes temps réel.",
+        "pages/9_Visualisation_temps_reel.py",
+        "📡",
+        compact=True,
+    )
 
-# Ligne 3 : Stock / Alertes
-row3 = st.columns(3)
-with row3[0]:
-    st.markdown('<div class="card-panel">', unsafe_allow_html=True)
-    st.markdown("#### 📦 Stock & pièces")
+# Ligne 3
+r3 = st.columns([1, 1, 2])
+with r3[0]:
+    _render_nav_card(
+        "Paramètres alertes",
+        "Email, WhatsApp, seuils et canaux de notification.",
+        "pages/10_Parametres_Alertes.py",
+        "🚨",
+        compact=True,
+    )
+
+with r3[1]:
+    st.markdown('<div class="card-compact">', unsafe_allow_html=True)
+    st.markdown("#### ✅ Flux conseillé")
     st.markdown(
-        "<p>Pièces de rechange recommandées, mises à jour des quantités, alertes de seuil et lien avec la maintenance.</p>",
+        "<p>1. Sources → 2. Indicateurs → 3. Optimisation → 4. Maintenance → 5. Résultat global</p>",
         unsafe_allow_html=True,
     )
-    st.page_link("pages/7_Stock.py", label="Ouvrir le stock", icon="📦")
     st.markdown("</div>", unsafe_allow_html=True)
 
-with row3[1]:
-    st.markdown('<div class="card-panel">', unsafe_allow_html=True)
-    st.markdown("#### 🚨 Paramètres d’alertes")
+with r3[2]:
+    st.markdown('<div class="card-compact">', unsafe_allow_html=True)
+    st.markdown("#### ℹ️ Conseils d’organisation")
     st.markdown(
-        "<p>Destinataires email/WhatsApp, seuils globaux et configuration des canaux.</p>",
+        "<p>Pour que le menu latéral automatique Streamlit soit propre, renomme tes fichiers avec des préfixes sur 2 chiffres : "
+        "01_Sources.py, 02_Indicateurs.py, 03_Optimisation.py, etc. "
+        "Ton désordre actuel vient surtout du fait que les fichiers commencent par 1, 2, 4, 5, 6, 7, 8, 9, 10 avec des noms différents.</p>",
         unsafe_allow_html=True,
     )
-    st.page_link("pages/10_Parametres_Alertes.py", label="Configurer les alertes", icon="🚨")
     st.markdown("</div>", unsafe_allow_html=True)
 
-with row3[2]:
-    st.markdown('<div class="card-panel">', unsafe_allow_html=True)
-    st.markdown("#### ℹ️ Vue d’ensemble")
-    st.markdown(
-        "<p>Le projet est maintenant structuré autour d’une chaîne unique : import → analyse → optimisation → maintenance → synthèse.</p>",
-        unsafe_allow_html=True,
-    )
-    st.info("Utilise d’abord la page Sources pour alimenter automatiquement toutes les autres pages.")
-    st.markdown("</div>", unsafe_allow_html=True)
-
-# =========================
-# PIED DE PAGE
-# =========================
+# =========================================================
+# FOOTER
+# =========================================================
 st.markdown(
     '<div class="footer">© 2026 mumputujeanbaptiste@gmail.com — Fiabilité, optimisation et gestion de stock des transformateurs</div>',
     unsafe_allow_html=True,
