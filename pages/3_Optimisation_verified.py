@@ -45,14 +45,12 @@ st.title("🧠 Optimisation")
 # -------------------------------------------------------------------
 # Helpers
 # -------------------------------------------------------------------
-def _safe_num(x: Any) -> Optional[float]:
+def _safe_num(x: Any, default: Optional[float] = None) -> Optional[float]:
     try:
         v = float(x)
-        if np.isfinite(v):
-            return v
-        return None
+        return v if np.isfinite(v) else default
     except Exception:
-        return None
+        return default
 
 
 def _fmt(x: Any, nd: int = 2, default: str = "—") -> str:
