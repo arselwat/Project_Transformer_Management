@@ -17,7 +17,7 @@ PROJECT_DIR = DATA_DIR / "current_project"
 PROJECT_DIR.mkdir(parents=True, exist_ok=True)
 PROJECT_META_FILE = PROJECT_DIR / "project_meta.json"
 
-REQUIRED_FAIL_COLS = {"equipment_code", "ttf_h"}
+REQUIRED_COLS = {"equipment_code", "ttf_h"}
 PROJECT_SHEETS = [
     "asset_info",
     "events_history",
@@ -29,9 +29,10 @@ PROJECT_SHEETS = [
 ]
 
 
-# -------------------------------------------------------------------
-# Small utils
-# -------------------------------------------------------------------
+# ============================================================
+# Helpers
+# ============================================================
+
 def _safe_df(df: Optional[pd.DataFrame]) -> pd.DataFrame:
     if isinstance(df, pd.DataFrame):
         out = df.copy()
@@ -40,21 +41,10 @@ def _safe_df(df: Optional[pd.DataFrame]) -> pd.DataFrame:
     return pd.DataFrame()
 
 
-def _read_json(path: Path) -> dict:
-    if not path.exists():
-        return {}
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-
-def _write_json(path: Path, payload: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
 def _coerce_bool01(s: pd.Series) -> pd.Series:
+    if s is None:
+        return pd.Series(dtype="int64")
+
     if s.dtype == bool:
         return s.astype(int)
 
@@ -82,15 +72,46 @@ def _coerce_bool01(s: pd.Series) -> pd.Series:
     )
 
 
-# -------------------------------------------------------------------
+def _dataset_hash(df: pd.DataFrame) -> str:
+    if df is None or df.empty:
+        return ""
+    x = df.copy()
+    x.columns = [str(c).strip() for c in x.columns]
+    keep = [c for c in ["equipment_code", "ttf_h", "duree_rep_h"] if c in x.columns]
+    x = x[keep].copy()
+    if "equipment_code" in x.columns:
+        x["equipment_code"] = x["equipment_code"].astype(str)
+    if "ttf_h" in x.columns:
+        x["ttf_h"] = pd.to_numeric(x["ttf_h"], errors="coerce").round(6)
+    if "duree_rep_h" in x.columns:
+        x["duree_rep_h"] = pd.to_numeric(x["duree_rep_h"], errors="coerce").round(6)
+
+    blob = x.to_csv(index=False).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()[:16]
+
+
+def _project_hash(frames: Dict[str, pd.DataFrame]) -> str:
+    chunks = []
+    for name in sorted(frames.keys()):
+        df = _safe_df(frames[name])
+        chunks.append(f"##{name}\n")
+        chunks.append(df.to_csv(index=False))
+    blob = "".join(chunks).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()[:16]
+
+
+# ============================================================
 # Failures dataset
-# -------------------------------------------------------------------
+# ============================================================
+
 def _clean_failures_df(df: pd.DataFrame) -> pd.DataFrame:
-    df = _safe_df(df)
-    if df.empty:
+    if df is None or df.empty:
         return pd.DataFrame(columns=["equipment_code", "ttf_h", "duree_rep_h"])
 
-    if not REQUIRED_FAIL_COLS.issubset(df.columns):
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+
+    if not REQUIRED_COLS.issubset(set(df.columns)):
         return pd.DataFrame(columns=["equipment_code", "ttf_h", "duree_rep_h"])
 
     if "duree_rep_h" not in df.columns:
@@ -105,22 +126,11 @@ def _clean_failures_df(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _dataset_hash(df: pd.DataFrame) -> str:
-    df = _clean_failures_df(df)
-    if df.empty:
-        return ""
-    x = df[["equipment_code", "ttf_h", "duree_rep_h"]].copy()
-    x["equipment_code"] = x["equipment_code"].astype(str)
-    x["ttf_h"] = pd.to_numeric(x["ttf_h"], errors="coerce").round(6)
-    x["duree_rep_h"] = pd.to_numeric(x["duree_rep_h"], errors="coerce").round(6)
-    return hashlib.sha256(x.to_csv(index=False).encode("utf-8")).hexdigest()[:16]
-
-
 def set_current_failures_df(
     df: pd.DataFrame,
     source_name: str = "unknown",
     persist: bool = True,
-) -> dict:
+) -> Dict[str, Any]:
     df2 = _clean_failures_df(df)
     if df2.empty:
         return {
@@ -174,7 +184,7 @@ def get_current_failures_df() -> pd.DataFrame:
     return df
 
 
-def get_failures_meta() -> dict:
+def get_failures_meta() -> Dict[str, Any]:
     df = get_current_failures_df()
     if df.empty:
         return {
@@ -194,9 +204,10 @@ def get_failures_meta() -> dict:
     }
 
 
-# -------------------------------------------------------------------
+# ============================================================
 # Project normalization
-# -------------------------------------------------------------------
+# ============================================================
+
 def _normalize_project_frames(frames: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
     out: Dict[str, pd.DataFrame] = {}
 
@@ -212,6 +223,7 @@ def _normalize_project_frames(frames: Dict[str, pd.DataFrame]) -> Dict[str, pd.D
                 "id_asset": "asset_id",
                 "nom_actif": "asset_name",
                 "nom": "asset_name",
+                "rated_power_mva": "rated_power_mva",
                 "sn_mva": "rated_power_mva",
             }
             for k, v in aliases.items():
@@ -221,10 +233,10 @@ def _normalize_project_frames(frames: Dict[str, pd.DataFrame]) -> Dict[str, pd.D
 
         elif name == "events_history":
             aliases = {
-                "assetid": "asset_id",
                 "date_panne": "event_start",
                 "failure_time": "event_start",
                 "failure_date": "event_start",
+                "assetid": "asset_id",
                 "repair_hours": "repair_time_hours",
                 "mttr_h": "repair_time_hours",
                 "downtime_h": "downtime_hours",
@@ -279,20 +291,6 @@ def _normalize_project_frames(frames: Dict[str, pd.DataFrame]) -> Dict[str, pd.D
                 if c in df.columns:
                     df[c] = pd.to_numeric(df[c], errors="coerce")
 
-            if "K" not in df.columns:
-                if "load_factor" in df.columns:
-                    df["K"] = pd.to_numeric(df["load_factor"], errors="coerce")
-                elif "charge_pct" in df.columns:
-                    df["K"] = pd.to_numeric(df["charge_pct"], errors="coerce") / 100.0
-
-            if "charge_pct" not in df.columns and "K" in df.columns:
-                df["charge_pct"] = pd.to_numeric(df["K"], errors="coerce") * 100.0
-
-            if "etat_ventilateurs" not in df.columns:
-                df["etat_ventilateurs"] = 0
-            else:
-                df["etat_ventilateurs"] = pd.to_numeric(df["etat_ventilateurs"], errors="coerce").fillna(0)
-
         elif name == "thermal_params":
             aliases = {
                 "delta_theta_to_r": "delta_to_r",
@@ -309,7 +307,10 @@ def _normalize_project_frames(frames: Dict[str, pd.DataFrame]) -> Dict[str, pd.D
 
             for c in df.columns:
                 if c != "asset_id":
-                    df[c] = pd.to_numeric(df[c], errors="ignore")
+                    try:
+                        df[c] = pd.to_numeric(df[c], errors="ignore")
+                    except Exception:
+                        pass
 
             if "tau_to_hours" in df.columns and "tau_to_min" not in df.columns:
                 df["tau_to_min"] = pd.to_numeric(df["tau_to_hours"], errors="coerce") * 60.0
@@ -346,34 +347,31 @@ def _normalize_project_frames(frames: Dict[str, pd.DataFrame]) -> Dict[str, pd.D
 
         out[name] = df
 
+    # enrichissement sn_mva depuis asset_info
     if "asset_info" in out and "thermal_params" in out:
         a = out["asset_info"].copy()
         t = out["thermal_params"].copy()
-        if (
-            not a.empty
-            and not t.empty
-            and "asset_id" in a.columns
-            and "asset_id" in t.columns
-            and "rated_power_mva" in a.columns
-        ):
-            if "sn_mva" not in t.columns or t["sn_mva"].isna().all():
-                merge = a[["asset_id", "rated_power_mva"]].rename(columns={"rated_power_mva": "sn_mva_from_asset"})
+        if "asset_id" in a.columns and "asset_id" in t.columns:
+            if ("sn_mva" not in t.columns or t["sn_mva"].isna().all()) and "rated_power_mva" in a.columns:
+                merge = a[["asset_id", "rated_power_mva"]].copy().rename(columns={"rated_power_mva": "sn_mva_from_asset"})
                 t = t.merge(merge, on="asset_id", how="left")
                 if "sn_mva" not in t.columns:
                     t["sn_mva"] = t["sn_mva_from_asset"]
                 else:
                     t["sn_mva"] = pd.to_numeric(t["sn_mva"], errors="coerce").fillna(t["sn_mva_from_asset"])
-                t = t.drop(columns=["sn_mva_from_asset"], errors="ignore")
+                t = t.drop(columns=[c for c in ["sn_mva_from_asset"] if c in t.columns])
                 out["thermal_params"] = t
 
     return out
 
 
-# -------------------------------------------------------------------
-# Build TTF from events
-# -------------------------------------------------------------------
+# ============================================================
+# Public project builder
+# ============================================================
+
 def build_ttf_from_events(events: pd.DataFrame) -> pd.DataFrame:
     df = _safe_df(events)
+
     needed = {"event_id", "asset_id", "event_start", "is_failure"}
     if df.empty or not needed.issubset(df.columns):
         return pd.DataFrame(columns=["equipment_code", "ttf_h", "duree_rep_h", "failure_time", "event_id"])
@@ -390,37 +388,26 @@ def build_ttf_from_events(events: pd.DataFrame) -> pd.DataFrame:
 
     df = df[df["is_failure"] == 1].sort_values(["asset_id", "event_start"]).reset_index(drop=True)
 
-    rows = []
+    out = []
     for asset_id, g in df.groupby("asset_id"):
         g = g.sort_values("event_start").reset_index(drop=True)
         for i in range(1, len(g)):
-            dh = (g.loc[i, "event_start"] - g.loc[i - 1, "event_start"]).total_seconds() / 3600.0
-            if dh > 0:
-                rows.append(
+            dt_h = (g.loc[i, "event_start"] - g.loc[i - 1, "event_start"]).total_seconds() / 3600.0
+            if dt_h > 0:
+                out.append(
                     {
                         "equipment_code": str(asset_id),
-                        "ttf_h": float(dh),
+                        "ttf_h": float(dt_h),
                         "duree_rep_h": g.loc[i, "repair_time_hours"],
                         "failure_time": g.loc[i, "event_start"],
                         "event_id": g.loc[i, "event_id"],
                     }
                 )
 
-    if not rows:
+    if not out:
         return pd.DataFrame(columns=["equipment_code", "ttf_h", "duree_rep_h", "failure_time", "event_id"])
 
-    return pd.DataFrame(rows)
-
-
-# -------------------------------------------------------------------
-# Project persistence
-# -------------------------------------------------------------------
-def _project_hash(frames: Dict[str, pd.DataFrame]) -> str:
-    chunks = []
-    for name in sorted(frames.keys()):
-        chunks.append(f"## {name}\n")
-        chunks.append(_safe_df(frames[name]).to_csv(index=False))
-    return hashlib.sha256("".join(chunks).encode("utf-8")).hexdigest()[:16]
+    return pd.DataFrame(out)
 
 
 def set_current_project_data(
@@ -428,9 +415,11 @@ def set_current_project_data(
     source_name: str = "unknown",
     persist: bool = True,
     sync_failures: bool = True,
-) -> dict:
+) -> Dict[str, Any]:
     frames = _normalize_project_frames(frames)
-    for name in PROJECT_SHEETS:
+    frames = {k: _safe_df(v) for k, v in frames.items()}
+
+    for name in ["asset_info", "events_history", "thermal_timeseries", "thermal_params", "maintenance_policies", "analysis_settings"]:
         frames.setdefault(name, pd.DataFrame())
 
     failures_ttf = build_ttf_from_events(frames.get("events_history", pd.DataFrame()))
@@ -445,18 +434,16 @@ def set_current_project_data(
     if persist:
         PROJECT_DIR.mkdir(parents=True, exist_ok=True)
         for name, df in frames.items():
-            _safe_df(df).to_csv(PROJECT_DIR / f"{name}.csv", index=False, encoding="utf-8")
+            df.to_csv(PROJECT_DIR / f"{name}.csv", index=False, encoding="utf-8")
 
-        _write_json(
-            PROJECT_META_FILE,
-            {
-                "ok": True,
-                "hash": h,
-                "source": source_name,
-                "sheets": list(frames.keys()),
-                "rows": {k: int(len(v)) for k, v in frames.items()},
-            },
-        )
+        meta = {
+            "ok": True,
+            "hash": h,
+            "source": source_name,
+            "sheets": list(frames.keys()),
+            "rows": {k: int(len(v)) for k, v in frames.items()},
+        }
+        PROJECT_META_FILE.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
     if sync_failures and not failures_ttf.empty:
         set_current_failures_df(
@@ -472,6 +459,7 @@ def set_current_project_data(
         "sheets": list(frames.keys()),
         "rows": {k: int(len(v)) for k, v in frames.items()},
         "failures_rows": int(len(failures_ttf)),
+        "meta_file": str(PROJECT_META_FILE),
     }
 
 
@@ -500,19 +488,18 @@ def get_current_project_data() -> Dict[str, pd.DataFrame]:
     if frames:
         st.session_state["project_data"] = frames
         if not st.session_state.get("project_hash"):
-            meta = _read_json(PROJECT_META_FILE)
-            st.session_state["project_hash"] = meta.get("hash", _project_hash(frames))
+            st.session_state["project_hash"] = _project_hash(frames)
         if not st.session_state.get("project_source"):
-            meta = _read_json(PROJECT_META_FILE)
-            st.session_state["project_source"] = meta.get("source", "file:current_project")
+            st.session_state["project_source"] = "file:current_project"
         return frames
 
     return {name: pd.DataFrame() for name in PROJECT_SHEETS}
 
 
-def get_project_meta() -> dict:
+def get_project_meta() -> Dict[str, Any]:
     proj = get_current_project_data()
     has_any = any(isinstance(df, pd.DataFrame) and not df.empty for df in proj.values())
+
     if not has_any:
         return {
             "ok": False,
@@ -522,12 +509,11 @@ def get_project_meta() -> dict:
             "dir": str(PROJECT_DIR),
         }
 
-    meta = _read_json(PROJECT_META_FILE)
     return {
         "ok": True,
-        "rows": meta.get("rows", {k: int(len(v)) for k, v in proj.items()}),
-        "hash": str(st.session_state.get("project_hash", meta.get("hash", ""))),
-        "source": str(st.session_state.get("project_source", meta.get("source", ""))),
+        "rows": {k: int(len(v)) for k, v in proj.items()},
+        "hash": str(st.session_state.get("project_hash", "")),
+        "source": str(st.session_state.get("project_source", "")),
         "dir": str(PROJECT_DIR),
     }
 
@@ -562,9 +548,10 @@ def clear_current_project_data(clear_failures: bool = False) -> None:
         st.session_state.pop("failures_source", None)
 
 
-# -------------------------------------------------------------------
-# Unified inputs for analysis pages
-# -------------------------------------------------------------------
+# ============================================================
+# Unified pipeline bundle
+# ============================================================
+
 def get_pipeline_inputs(asset_id: Optional[str] = None) -> Dict[str, Any]:
     proj = get_current_project_data()
     failures_df = get_current_failures_df()
@@ -575,8 +562,8 @@ def get_pipeline_inputs(asset_id: Optional[str] = None) -> Dict[str, Any]:
     thermal_params = _safe_df(proj.get("thermal_params"))
     maintenance_policies = _safe_df(proj.get("maintenance_policies"))
     analysis_settings = _safe_df(proj.get("analysis_settings"))
+    failures_ttf = _clean_failures_df(_safe_df(proj.get("failures_ttf")))
 
-    failures_ttf = build_ttf_from_events(events_history)
     if failures_ttf.empty and not failures_df.empty:
         failures_ttf = failures_df.copy()
 
@@ -600,7 +587,9 @@ def get_pipeline_inputs(asset_id: Optional[str] = None) -> Dict[str, Any]:
             ].copy()
 
         if not thermal_params.empty and "asset_id" in thermal_params.columns:
-            thermal_params = thermal_params[thermal_params["asset_id"].astype(str) == str(selected_asset)].copy()
+            thermal_params = thermal_params[
+                thermal_params["asset_id"].astype(str) == str(selected_asset)
+            ].copy()
 
         if not maintenance_policies.empty and "asset_id" in maintenance_policies.columns:
             maintenance_policies = maintenance_policies[
@@ -619,15 +608,18 @@ def get_pipeline_inputs(asset_id: Optional[str] = None) -> Dict[str, Any]:
 
     ttf_series = []
     repair_series = []
+
     if not failures_ttf.empty:
         ttf_series = pd.to_numeric(failures_ttf["ttf_h"], errors="coerce").dropna().tolist()
         if "duree_rep_h" in failures_ttf.columns:
             repair_series = pd.to_numeric(failures_ttf["duree_rep_h"], errors="coerce").dropna().tolist()
 
-    thermal_cfg: Dict[str, Any] = {}
+    thermal_df = thermal_timeseries.copy()
+
+    thermal_config: Dict[str, Any] = {}
     if not thermal_params.empty:
         row = thermal_params.iloc[0].to_dict()
-        allowed = {
+        allowed_keys = {
             "sn_mva",
             "R",
             "delta_to_r",
@@ -641,27 +633,22 @@ def get_pipeline_inputs(asset_id: Optional[str] = None) -> Dict[str, Any]:
             "forced_delta_h_factor",
             "normal_insulation_life_h",
         }
-        for k in allowed:
-            v = row.get(k)
-            if pd.notna(v):
-                thermal_cfg[k] = v
+        for k, v in row.items():
+            if k in allowed_keys and pd.notna(v):
+                thermal_config[k] = v
 
-    thermal_cfg.setdefault("sn_mva", 100.0)
-    thermal_cfg.setdefault("R", 5.0)
-    thermal_cfg.setdefault("delta_to_r", 55.0)
-    thermal_cfg.setdefault("delta_h_r", 30.0)
-    thermal_cfg.setdefault("tau_to_min", 180.0)
-    thermal_cfg.setdefault("tau_w_min", 10.0)
-    thermal_cfg.setdefault("n_exp", 0.8)
-    thermal_cfg.setdefault("m_exp", 0.8)
-    thermal_cfg.setdefault("forced_tau_to_factor", 0.75)
-    thermal_cfg.setdefault("forced_delta_to_factor", 0.92)
-    thermal_cfg.setdefault("forced_delta_h_factor", 0.92)
-    thermal_cfg.setdefault("normal_insulation_life_h", 180000.0)
-
-    thermal_df = thermal_timeseries.copy()
-    if not thermal_df.empty:
-        thermal_df = thermal_df.drop(columns=["asset_id", "equipment_code"], errors="ignore")
+    thermal_config.setdefault("sn_mva", 100.0)
+    thermal_config.setdefault("R", 5.0)
+    thermal_config.setdefault("delta_to_r", 55.0)
+    thermal_config.setdefault("delta_h_r", 30.0)
+    thermal_config.setdefault("tau_to_min", 180.0)
+    thermal_config.setdefault("tau_w_min", 10.0)
+    thermal_config.setdefault("n_exp", 0.8)
+    thermal_config.setdefault("m_exp", 0.8)
+    thermal_config.setdefault("forced_tau_to_factor", 0.75)
+    thermal_config.setdefault("forced_delta_to_factor", 0.92)
+    thermal_config.setdefault("forced_delta_h_factor", 0.92)
+    thermal_config.setdefault("normal_insulation_life_h", 180000.0)
 
     alpha = 0.05
     if not analysis_settings.empty and "alpha_significance" in analysis_settings.columns:
@@ -678,10 +665,11 @@ def get_pipeline_inputs(asset_id: Optional[str] = None) -> Dict[str, Any]:
         "ttf_series": ttf_series,
         "repair_series": repair_series,
         "thermal_df": thermal_df if not thermal_df.empty else None,
-        "thermal_config": thermal_cfg if thermal_cfg else None,
+        "thermal_config": thermal_config if thermal_config else None,
         "maintenance_policies": maintenance_policies,
         "analysis_settings": analysis_settings,
         "alpha": alpha,
-        "project_meta": get_project_meta(),
+        "project_data": proj,
         "failures_meta": get_failures_meta(),
+        "project_meta": get_project_meta(),
     }
