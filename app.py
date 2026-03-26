@@ -276,12 +276,12 @@ with st.sidebar:
         st.page_link("pages/1_Sources_fully_linked.py", label="Sources", icon="📥")
     if _file_exists("pages/2_Indicateurs_corrected.py"):
         st.page_link("pages/2_Indicateurs_corrected.py", label="Indicateurs", icon="📊")
-    if _file_exists("pages/4_Optimisation_corrected.py"):
-        st.page_link("pages/4_Optimisation_corrected.py", label="Optimisation", icon="🧠")
-    if _file_exists("pages/5_Maintenance_corrected.py"):
-        st.page_link("pages/5_Maintenance_corrected.py", label="Maintenance", icon="🛠️")
-    if _file_exists("pages/6_Resultat_analyse_optimisation_Maintenance.py"):
-        st.page_link("pages/6_Resultat_analyse_optimisation_Maintenance.py", label="Résultat global", icon="📋")
+    if _file_exists("pages/3_Optimisation_corrected.py"):
+        st.page_link("pages/3_Optimisation_corrected.py", label="Optimisation", icon="🧠")
+    if _file_exists("pages/4_Maintenance_corrected.py"):
+        st.page_link("pages/4_Maintenance_corrected.py", label="Maintenance", icon="🛠️")
+    if _file_exists("pages/5_Resultat_analyse_optimisation_Maintenance.py"):
+        st.page_link("pages/5_Resultat_analyse_optimisation_Maintenance.py", label="Résultat global", icon="📋")
     st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown(
@@ -371,7 +371,7 @@ with r1[2]:
     _render_nav_card(
         "Optimisation",
         "Intervalles optimisés, coût, fiabilité cible et contraintes thermiques.",
-        "pages/4_Optimisation_corrected.py",
+        "pages/3_Optimisation_corrected.py",
         "🧠",
         compact=True,
     )
@@ -379,7 +379,7 @@ with r1[3]:
     _render_nav_card(
         "Maintenance",
         "Planning virtuel, tâches dues, commentaires maintenance et plan PDF.",
-        "pages/5_Maintenance_corrected.py",
+        "pages/4_Maintenance_corrected.py",
         "🛠️",
         compact=True,
     )
@@ -390,7 +390,7 @@ with r2[0]:
     _render_nav_card(
         "Résultat global",
         "De l’analyse aux recommandations finales, avec synthèse complète par équipement.",
-        "pages/6_Resultat_analyse_optimisation_Maintenance.py",
+        "pages/5_Resultat_analyse_optimisation_Maintenance.py",
         "📋",
         compact=True,
     )
@@ -398,7 +398,7 @@ with r2[1]:
     _render_nav_card(
         "Stock & pièces",
         "Pièces de rechange, seuils de stock et liaison avec la maintenance.",
-        "pages/7_Stock.py",
+        "pages/6_Stock.py",
         "📦",
         compact=True,
     )
@@ -406,7 +406,7 @@ with r2[2]:
     _render_nav_card(
         "Transformateurs",
         "Vue transformateurs, fiches ou registres dédiés si ton module est activé.",
-        "pages/8_Transformateurs.py",
+        "pages/7_Transformateurs.py",
         "🔌",
         compact=True,
     )
@@ -414,7 +414,7 @@ with r2[3]:
     _render_nav_card(
         "Temps réel",
         "Visualisation MQTT / simulation des mesures et alertes temps réel.",
-        "pages/9_Visualisation_temps_reel.py",
+        "pages/8_Visualisation_temps_reel.py",
         "📡",
         compact=True,
     )
@@ -425,7 +425,7 @@ with r3[0]:
     _render_nav_card(
         "Paramètres alertes",
         "Email, WhatsApp, seuils et canaux de notification.",
-        "pages/10_Parametres_Alertes.py",
+        "pages/9_Parametres_Alertes.py",
         "🚨",
         compact=True,
     )

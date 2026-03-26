@@ -4,14 +4,13 @@ import io
 import json
 import sqlite3
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict
 
 import pandas as pd
 import streamlit as st
 
 from core.security.auth import require_login
 from core.datahub import (
-    build_ttf_from_events,
     clear_current_project_data,
     get_current_failures_df,
     get_current_project_data,
@@ -141,6 +140,71 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _coerce_bool01(s: pd.Series) -> pd.Series:
+    if s.dtype == bool:
+        return s.astype(int)
+    mapping = {
+        "1": 1,
+        "0": 0,
+        "true": 1,
+        "false": 0,
+        "yes": 1,
+        "no": 0,
+        "oui": 1,
+        "non": 0,
+        "y": 1,
+        "n": 0,
+    }
+    return (
+        s.astype(str)
+        .str.strip()
+        .str.lower()
+        .map(mapping)
+        .fillna(pd.to_numeric(s, errors="coerce"))
+        .fillna(0)
+        .astype(int)
+    )
+
+
+def _build_ttf_from_events(events: pd.DataFrame) -> pd.DataFrame:
+    df = events.copy()
+
+    needed = {"event_id", "asset_id", "event_start", "is_failure"}
+    if df.empty or not needed.issubset(df.columns):
+        return pd.DataFrame(columns=["equipment_code", "ttf_h", "duree_rep_h", "failure_time", "event_id"])
+
+    if "repair_time_hours" not in df.columns:
+        df["repair_time_hours"] = None
+
+    df["event_start"] = pd.to_datetime(df["event_start"], errors="coerce")
+    df = df.dropna(subset=["event_start"]).copy()
+    df["asset_id"] = df["asset_id"].astype(str)
+    df["is_failure"] = _coerce_bool01(df["is_failure"])
+    df["repair_time_hours"] = pd.to_numeric(df["repair_time_hours"], errors="coerce")
+
+    df = df[df["is_failure"] == 1].sort_values(["asset_id", "event_start"]).reset_index(drop=True)
+
+    out = []
+    for asset_id, g in df.groupby("asset_id"):
+        g = g.sort_values("event_start").reset_index(drop=True)
+        for i in range(1, len(g)):
+            dt_h = (g.loc[i, "event_start"] - g.loc[i - 1, "event_start"]).total_seconds() / 3600.0
+            if dt_h > 0:
+                out.append(
+                    {
+                        "equipment_code": str(asset_id),
+                        "ttf_h": float(dt_h),
+                        "duree_rep_h": g.loc[i, "repair_time_hours"],
+                        "failure_time": g.loc[i, "event_start"],
+                        "event_id": g.loc[i, "event_id"],
+                    }
+                )
+
+    if not out:
+        return pd.DataFrame(columns=["equipment_code", "ttf_h", "duree_rep_h", "failure_time", "event_id"])
+    return pd.DataFrame(out)
+
+
 def _normalize_project_frames(frames: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
     out: Dict[str, pd.DataFrame] = {}
 
@@ -184,16 +248,7 @@ def _normalize_project_frames(frames: Dict[str, pd.DataFrame]) -> Dict[str, pd.D
                     df[c] = pd.to_datetime(df[c], errors="coerce")
             for c in ["is_failure", "is_planned"]:
                 if c in df.columns:
-                    df[c] = (
-                        df[c]
-                        .astype(str)
-                        .str.strip()
-                        .str.lower()
-                        .map({"1": 1, "0": 0, "true": 1, "false": 0, "yes": 1, "no": 0, "oui": 1, "non": 0})
-                        .fillna(pd.to_numeric(df[c], errors="coerce"))
-                        .fillna(0)
-                        .astype(int)
-                    )
+                    df[c] = _coerce_bool01(df[c])
             for c in ["repair_time_hours", "downtime_hours", "cost_corrective_usd"]:
                 if c in df.columns:
                     df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -248,7 +303,6 @@ def _normalize_project_frames(frames: Dict[str, pd.DataFrame]) -> Dict[str, pd.D
                 if c != "asset_id":
                     df[c] = pd.to_numeric(df[c], errors="ignore")
 
-            # Convertit éventuellement des constantes en heures vers minutes pour le moteur thermique
             if "tau_to_hours" in df.columns and "tau_to_min" not in df.columns:
                 df["tau_to_min"] = pd.to_numeric(df["tau_to_hours"], errors="coerce") * 60.0
             if "tau_h_hours" in df.columns and "tau_w_min" not in df.columns:
@@ -282,7 +336,6 @@ def _normalize_project_frames(frames: Dict[str, pd.DataFrame]) -> Dict[str, pd.D
 
         out[name] = df
 
-    # enrichit sn_mva depuis asset_info si manquant dans thermal_params
     if "asset_info" in out and "thermal_params" in out:
         a = out["asset_info"].copy()
         t = out["thermal_params"].copy()
@@ -338,9 +391,7 @@ def _validate_project_sheets(frames: Dict[str, pd.DataFrame]) -> list[str]:
 
     has_load_driver = any(c in th.columns for c in ["K", "charge_pct", "load_factor", "load_mva"])
     if not has_load_driver:
-        errors.append(
-            "thermal_timeseries: il faut au moins une colonne parmi K, charge_pct, load_factor ou load_mva."
-        )
+        errors.append("thermal_timeseries: il faut au moins une colonne parmi K, charge_pct, load_factor ou load_mva.")
 
     assets = set(frames["asset_info"]["asset_id"].astype(str).dropna().unique())
     for sheet_name in ["events_history", "thermal_timeseries", "thermal_params", "maintenance_policies", "analysis_settings"]:
@@ -381,7 +432,7 @@ with cmeta2:
         st.success(
             "Projet actif ✅ | "
             f"source={project_meta.get('source')} | "
-            f"feuilles={', '.join(project_meta.get('sheets', []))}"
+            f"hash={project_meta.get('hash', '')}"
         )
     else:
         st.info("Aucun projet Excel actif pour le moment.")
@@ -504,7 +555,7 @@ with tab_upload:
                 for msg in errors:
                     st.write(f"- {msg}")
             else:
-                derived_ttf = build_ttf_from_events(frames["events_history"])
+                derived_ttf = _build_ttf_from_events(frames["events_history"])
                 frames["failures_ttf"] = derived_ttf
 
                 if derived_ttf.empty:

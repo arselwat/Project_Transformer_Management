@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import hashlib
@@ -9,13 +10,16 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 import streamlit as st
 
-from core.maintenance.reporting_plus import export_pm_plan_with_kits_pdf
 from core.security.auth import require_login
 
+try:
+    from core.maintenance.reporting_plus import export_pm_plan_with_kits_pdf
+except Exception as e:
+    export_pm_plan_with_kits_pdf = None
+    _PM_REPORT_ERR = str(e)
+else:
+    _PM_REPORT_ERR = None
 
-# ============================================================
-# Helpers
-# ============================================================
 
 def _hash_df(df: pd.DataFrame) -> str:
     if df is None or df.empty:
@@ -52,9 +56,6 @@ def _maintenance_label(mtype: str) -> str:
 
 
 def _pick_interval_h(row: dict) -> tuple[Optional[float], Optional[str]]:
-    """
-    Priorité stricte des colonnes d’intervalle.
-    """
     for c in ["T_recommended_h", "T_R_h", "T_cost_h", "interval_opt_h", "interval_h"]:
         if c in row and row[c] is not None:
             v = _safe_float(row[c], None)
@@ -95,14 +96,6 @@ def build_maintenance_comment(
     thermal_faa_max: Optional[float] = None,
     thermal_lol_pct: Optional[float] = None,
 ) -> str:
-    """
-    Génère un commentaire actionnable en combinant :
-    - β / η
-    - intervalle optimisé
-    - type de maintenance
-    - modèle global
-    - statut thermique
-    """
     b = _safe_float(beta, None)
     e = _safe_float(eta_h, None)
     itv = _safe_float(interval_h, None)
@@ -205,10 +198,6 @@ def _load_optimization_fallback() -> pd.DataFrame:
     return pd.DataFrame()
 
 
-# ============================================================
-# Core builder
-# ============================================================
-
 def build_virtual_pm_plan_from_optimization(
     opt_df: pd.DataFrame,
     start_date: date,
@@ -218,14 +207,6 @@ def build_virtual_pm_plan_from_optimization(
     only_admissible: bool = False,
     min_days: int = 1,
 ) -> Dict[str, Any]:
-    """
-    Construit un plan PM virtuel à partir du tableau d’optimisation.
-
-    Règle :
-      - interval_h = T_recommended_h > T_R_h > T_cost_h > interval_opt_h > interval_h
-      - periodicity_days = max(min_days, round(interval_h/24))
-      - next_due_date = start_date + periodicity_days
-    """
     if opt_df is None or opt_df.empty:
         return {"ok": False, "msg": "Optimisation vide", "rows": [], "due": []}
 
@@ -296,26 +277,22 @@ def build_virtual_pm_plan_from_optimization(
             "periodicity_days": periodicity_days,
             "next_due_date": next_due.isoformat(),
             "days_left": int(days_left),
-
             "beta": beta,
             "eta_h": eta_h,
             "gamma_h": row.get("gamma_pipe_h", row.get("gamma_opt_h")),
             "model": row.get("process_model", row.get("model")),
             "distribution": row.get("distribution"),
-
             "T_recommended_h": row.get("T_recommended_h"),
             "T_R_h": row.get("T_R_h"),
             "T_cost_h": row.get("T_cost_h"),
             "R_at_T": row.get("R_at_T", row.get("R(T_cost)")),
             "C_min_per_h": row.get("C_min_per_h", row.get("C_min")),
-
             "FAA_max": row.get("FAA_max"),
             "loss_of_life_pct": row.get("loss_of_life_pct"),
             "thermal_status": row.get("thermal_status"),
             "thermal_ok": row.get("thermal_ok"),
             "reliability_ok": row.get("reliability_ok"),
             "admissible_global": row.get("admissible_global"),
-
             "status": "VIRTUAL",
         }
 
@@ -333,10 +310,6 @@ def build_virtual_pm_plan_from_optimization(
         "interval_priority": ["T_recommended_h", "T_R_h", "T_cost_h", "interval_opt_h", "interval_h"],
     }
 
-
-# ============================================================
-# UI
-# ============================================================
 
 st.set_page_config(page_title="Maintenance", page_icon="🛠️", layout="wide")
 require_login()
@@ -390,9 +363,6 @@ st.caption(f"Colonnes réellement utilisées : {plan.get('used_cols_stats')}")
 rows_all = plan.get("rows", [])
 rows_due = plan.get("due", [])
 
-# ------------------------------------------------------------
-# KPI
-# ------------------------------------------------------------
 colk1, colk2, colk3, colk4 = st.columns(4)
 with colk1:
     st.metric("Équipements planifiés", len(rows_all))
@@ -405,21 +375,12 @@ with colk4:
     preventive = int(sum(1 for r in rows_all if "Préventive" in str(r.get("maintenance_type", ""))))
     st.metric("Préventives", preventive)
 
-# ------------------------------------------------------------
-# Résumé commentaires
-# ------------------------------------------------------------
 st.markdown("## 0) Commentaires maintenance (résumé)")
 if rows_all:
     df_comm = pd.DataFrame(rows_all)[
         [c for c in [
-            "equipment_code",
-            "maintenance_type",
-            "interval_source",
-            "interval_h",
-            "beta",
-            "eta_h",
-            "thermal_status",
-            "maintenance_comment",
+            "equipment_code", "maintenance_type", "interval_source", "interval_h",
+            "beta", "eta_h", "thermal_status", "maintenance_comment",
         ] if c in pd.DataFrame(rows_all).columns]
     ].copy()
     df_comm = df_comm.drop_duplicates(subset=["equipment_code"]).sort_values("equipment_code")
@@ -427,72 +388,34 @@ if rows_all:
 else:
     st.info("Aucun commentaire : aucune ligne exploitable.")
 
-# ------------------------------------------------------------
-# Planning complet
-# ------------------------------------------------------------
 st.markdown("## 1) Planning (issu de l’optimisation)")
 if not rows_all:
     st.warning("Aucune ligne exploitable (intervalles manquants ou <=0).")
 else:
     df_all = pd.DataFrame(rows_all)
     cols = [
-        "equipment_code",
-        "maintenance_type",
-        "interval_source",
-        "interval_h",
-        "periodicity_days",
-        "next_due_date",
-        "days_left",
-        "beta",
-        "eta_h",
-        "model",
-        "distribution",
-        "FAA_max",
-        "loss_of_life_pct",
-        "thermal_status",
-        "admissible_global",
-        "T_recommended_h",
-        "T_R_h",
-        "T_cost_h",
-        "maintenance_comment",
+        "equipment_code", "maintenance_type", "interval_source", "interval_h", "periodicity_days",
+        "next_due_date", "days_left", "beta", "eta_h", "model", "distribution", "FAA_max",
+        "loss_of_life_pct", "thermal_status", "admissible_global", "T_recommended_h", "T_R_h",
+        "T_cost_h", "maintenance_comment",
     ]
     cols = [c for c in cols if c in df_all.columns]
     st.dataframe(df_all[cols], use_container_width=True, hide_index=True)
 
-# ------------------------------------------------------------
-# Tâches dues
-# ------------------------------------------------------------
 st.markdown("## 2) Tâches dues (dans la fenêtre)")
 if not rows_due:
     st.info("Aucune tâche due dans la fenêtre. Augmente la fenêtre ou change la date de départ.")
 else:
     df_due = pd.DataFrame(rows_due)
     cols = [
-        "equipment_code",
-        "maintenance_type",
-        "interval_source",
-        "interval_h",
-        "next_due_date",
-        "days_left",
-        "beta",
-        "eta_h",
-        "model",
-        "distribution",
-        "FAA_max",
-        "loss_of_life_pct",
-        "thermal_status",
-        "admissible_global",
-        "T_recommended_h",
-        "T_R_h",
-        "T_cost_h",
-        "maintenance_comment",
+        "equipment_code", "maintenance_type", "interval_source", "interval_h",
+        "next_due_date", "days_left", "beta", "eta_h", "model", "distribution", "FAA_max",
+        "loss_of_life_pct", "thermal_status", "admissible_global", "T_recommended_h", "T_R_h",
+        "T_cost_h", "maintenance_comment",
     ]
     cols = [c for c in cols if c in df_due.columns]
     st.dataframe(df_due[cols], use_container_width=True, hide_index=True)
 
-# ------------------------------------------------------------
-# Recommandation finale simple
-# ------------------------------------------------------------
 st.markdown("## 3) Recommandation finale")
 if rows_all:
     df_rank = pd.DataFrame(rows_all).copy()
@@ -503,29 +426,18 @@ if rows_all:
     if "C_min_per_h" in df_rank.columns:
         df_rank["C_min_per_h"] = pd.to_numeric(df_rank["C_min_per_h"], errors="coerce")
 
-    # priorité : admissible, dû tôt, coût plus bas
     sort_cols = [c for c in ["admissible_global", "days_left", "C_min_per_h"] if c in df_rank.columns]
-    ascending = []
-    for c in sort_cols:
-        if c == "admissible_global":
-            ascending.append(False)
-        else:
-            ascending.append(True)
-
+    ascending = [False if c == "admissible_global" else True for c in sort_cols]
     if sort_cols:
         df_rank = df_rank.sort_values(sort_cols, ascending=ascending)
 
     best = df_rank.iloc[0].to_dict()
     st.success(
         f"Équipement prioritaire : {best.get('equipment_code', '—')} | "
-        f"{best.get('maintenance_type', '—')} | "
-        f"échéance {best.get('next_due_date', '—')}"
+        f"{best.get('maintenance_type', '—')} | échéance {best.get('next_due_date', '—')}"
     )
     st.write(best.get("maintenance_comment", "—"))
 
-# ------------------------------------------------------------
-# Exports
-# ------------------------------------------------------------
 st.session_state["pm_virtual_all"] = rows_all
 st.session_state["pm_virtual_due"] = rows_due
 
@@ -543,25 +455,32 @@ if rows_all:
 
 include_all_in_pdf = st.toggle("Inclure tout le planning dans le PDF (sinon seulement les tâches dues)", value=False)
 
-if st.button("📄 Générer PDF (plan issu optimisation)", use_container_width=True):
-    tasks_for_pdf = rows_all if include_all_in_pdf else rows_due
-    metrics_table = df_opt.to_dict("records")
-
-    out = export_pm_plan_with_kits_pdf(
-        tasks_due=tasks_for_pdf,
-        kits_by_eq={},
-        metrics_table=metrics_table,
-        out_dir="reports",
-        title="Plan de maintenance — issu de l’optimisation",
-        include_kits=False,
-        tools_checklist=None,
-    )
-    st.success("PDF généré.")
-    with open(out, "rb") as f:
-        st.download_button(
-            "⬇️ Télécharger le PDF",
-            f,
-            file_name=Path(out).name,
-            mime="application/pdf",
-            use_container_width=True,
-        )
+if export_pm_plan_with_kits_pdf is None:
+    st.info("Module PDF maintenance indisponible ou incompatible.")
+    if _PM_REPORT_ERR:
+        st.caption(f"Détail import: {_PM_REPORT_ERR}")
+else:
+    if st.button("📄 Générer PDF (plan issu optimisation)", use_container_width=True):
+        tasks_for_pdf = rows_all if include_all_in_pdf else rows_due
+        metrics_table = df_opt.to_dict("records")
+        try:
+            out = export_pm_plan_with_kits_pdf(
+                tasks_due=tasks_for_pdf,
+                kits_by_eq={},
+                metrics_table=metrics_table,
+                out_dir="reports",
+                title="Plan de maintenance — issu de l’optimisation",
+                include_kits=False,
+                tools_checklist=None,
+            )
+            st.success("PDF généré.")
+            with open(out, "rb") as f:
+                st.download_button(
+                    "⬇️ Télécharger le PDF",
+                    f,
+                    file_name=Path(out).name,
+                    mime="application/pdf",
+                    use_container_width=True,
+                )
+        except Exception as e:
+            st.error(f"PDF : {e}")

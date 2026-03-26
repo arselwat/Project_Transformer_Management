@@ -1,8 +1,10 @@
+
 from __future__ import annotations
 
 from pathlib import Path
 from datetime import date, timedelta
 from io import BytesIO
+import io
 import math
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -19,9 +21,16 @@ from core.reliability.organigram import analyze_ttf_pipeline
 
 # Optional imports / fallbacks
 try:
-    from core.datahub import get_current_failures_df
+    from core.datahub import get_current_failures_df, get_failures_meta  # type: ignore
 except Exception:
     get_current_failures_df = None
+    get_failures_meta = None
+
+try:
+    from core.datahub import get_current_project_data, get_project_meta  # type: ignore
+except Exception:
+    get_current_project_data = None
+    get_project_meta = None
 
 try:
     from core.reliability.reporting_global import export_global_analysis_report_pdf
@@ -83,7 +92,6 @@ def _read_csv_flex(src) -> pd.DataFrame:
     return df
 
 
-
 def _safe_float(x: Any, default: Optional[float] = None) -> Optional[float]:
     try:
         if x is None:
@@ -96,13 +104,11 @@ def _safe_float(x: Any, default: Optional[float] = None) -> Optional[float]:
         return default
 
 
-
 def _fmt(x: Any, nd: int = 2, default: str = "—") -> str:
     v = _safe_float(x, None)
     if v is None:
         return default
     return f"{v:.{nd}f}"
-
 
 
 def _decision_badge(label: str) -> str:
@@ -115,6 +121,106 @@ def _decision_badge(label: str) -> str:
         return "🟡 " + label
     return "🟢 " + label
 
+
+def _coerce_bool01(s: pd.Series) -> pd.Series:
+    if s.dtype == bool:
+        return s.astype(int)
+    mapping = {
+        "1": 1, "0": 0, "true": 1, "false": 0,
+        "yes": 1, "no": 0, "oui": 1, "non": 0, "y": 1, "n": 0,
+    }
+    return (
+        s.astype(str)
+        .str.strip()
+        .str.lower()
+        .map(mapping)
+        .fillna(pd.to_numeric(s, errors="coerce"))
+        .fillna(0)
+        .astype(int)
+    )
+
+
+def _normalize_thermal_timeseries(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    out.columns = [str(c).strip() for c in out.columns]
+
+    aliases = {
+        "ambient_temp_c": "temp_amb_C",
+        "temp_ambiante_c": "temp_amb_C",
+        "temperature_ambiante": "temp_amb_C",
+        "fan_status": "etat_ventilateurs",
+        "fans_status": "etat_ventilateurs",
+        "ventilateurs": "etat_ventilateurs",
+        "load_pct": "charge_pct",
+    }
+    lower = {c.lower().strip(): c for c in out.columns}
+    ren = {}
+    for k, v in aliases.items():
+        if k in lower and v not in out.columns:
+            ren[lower[k]] = v
+    out = out.rename(columns=ren)
+
+    if "timestamp" in out.columns:
+        out["timestamp"] = pd.to_datetime(out["timestamp"], errors="coerce")
+        out = out.dropna(subset=["timestamp"])
+
+    # normalisation du facteur de charge
+    if "K" not in out.columns:
+        if "load_factor" in out.columns:
+            out["K"] = pd.to_numeric(out["load_factor"], errors="coerce")
+        elif "charge_pct" in out.columns:
+            out["K"] = pd.to_numeric(out["charge_pct"], errors="coerce") / 100.0
+        elif "load_mva" in out.columns:
+            out["K"] = pd.to_numeric(out["load_mva"], errors="coerce") / 100.0  # fallback sur 100 MVA
+
+    if "etat_ventilateurs" not in out.columns:
+        out["etat_ventilateurs"] = 0
+
+    for c in [
+        "temp_amb_C", "K", "charge_pct", "load_factor", "load_mva",
+        "etat_ventilateurs", "temp_cuve_C", "current_a",
+        "top_oil_temp_c", "hotspot_temp_c",
+    ]:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce")
+
+    out = out.reset_index(drop=True)
+    return out
+
+
+def _normalize_thermal_params(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    out.columns = [str(c).strip() for c in out.columns]
+
+    aliases = {
+        "delta_theta_to_r": "delta_to_r",
+        "delta_theta_h_r": "delta_h_r",
+        "tau_to_hours": "tau_to_hours",
+        "tau_h_hours": "tau_h_hours",
+        "normal_life_hours": "normal_insulation_life_h",
+        "rated_power_mva": "sn_mva",
+    }
+    lower = {c.lower().strip(): c for c in out.columns}
+    ren = {}
+    for k, v in aliases.items():
+        if k in lower and v not in out.columns:
+            ren[lower[k]] = v
+    out = out.rename(columns=ren)
+
+    for c in out.columns:
+        if c != "asset_id":
+            out[c] = pd.to_numeric(out[c], errors="ignore")
+
+    if "tau_to_hours" in out.columns and "tau_to_min" not in out.columns:
+        out["tau_to_min"] = pd.to_numeric(out["tau_to_hours"], errors="coerce") * 60.0
+    if "tau_h_hours" in out.columns and "tau_w_min" not in out.columns:
+        out["tau_w_min"] = pd.to_numeric(out["tau_h_hours"], errors="coerce") * 60.0
+
+    return out
 
 
 def _load_failures_df(uploaded_csv=None) -> pd.DataFrame:
@@ -142,33 +248,72 @@ def _load_failures_df(uploaded_csv=None) -> pd.DataFrame:
     df["ttf_h"] = pd.to_numeric(df["ttf_h"], errors="coerce")
     if "duree_rep_h" in df.columns:
         df["duree_rep_h"] = pd.to_numeric(df["duree_rep_h"], errors="coerce")
+    else:
+        df["duree_rep_h"] = np.nan
     df = df.dropna(subset=["ttf_h"])
     df = df[df["ttf_h"] > 0]
     return df.reset_index(drop=True)
 
 
-
 def _load_optimization_df() -> pd.DataFrame:
     df = st.session_state.get("optimization_df")
     if isinstance(df, pd.DataFrame) and not df.empty:
-        return df.copy()
-    if OPTIM_CSV.exists():
+        out = df.copy()
+    elif OPTIM_CSV.exists():
         out = _read_csv_flex(OPTIM_CSV)
-        if not out.empty:
-            return out
-    return pd.DataFrame()
+    else:
+        out = pd.DataFrame()
+
+    if out.empty:
+        return out
+
+    out.columns = [str(c).strip() for c in out.columns]
+    # normaliser quelques colonnes pour usage global
+    if "process_model" in out.columns and "model" not in out.columns:
+        out["model"] = out["process_model"]
+    if "beta_pipe" in out.columns and "beta" not in out.columns:
+        out["beta"] = out["beta_pipe"]
+    if "eta_pipe_h" in out.columns and "eta_h" not in out.columns:
+        out["eta_h"] = out["eta_pipe_h"]
+    if "gamma_pipe_h" in out.columns and "gamma_h" not in out.columns:
+        out["gamma_h"] = out["gamma_pipe_h"]
+
+    for c in ["T_recommended_h", "T_R_h", "T_cost_h", "days_left", "beta", "eta_h", "gamma_h"]:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce")
+    return out
 
 
+def _load_project_context(uploaded_xlsx=None) -> Dict[str, pd.DataFrame]:
+    # 1) upload manuel prioritaire
+    if uploaded_xlsx is not None:
+        try:
+            raw = uploaded_xlsx.read()
+            bio = io.BytesIO(raw)
+            xls = pd.ExcelFile(bio)
+            sheets = {sheet: pd.read_excel(io.BytesIO(raw), sheet_name=sheet) for sheet in xls.sheet_names}
+        except Exception:
+            sheets = {}
+    # 2) projet actif dans datahub
+    elif callable(get_current_project_data):
+        try:
+            sheets = get_current_project_data() or {}
+        except Exception:
+            sheets = {}
+    else:
+        sheets = {}
 
-def _load_project_sheets(uploaded_xlsx=None) -> Dict[str, pd.DataFrame]:
-    if uploaded_xlsx is None:
-        return {}
-    try:
-        xls = pd.ExcelFile(uploaded_xlsx)
-        return {sheet: pd.read_excel(uploaded_xlsx, sheet_name=sheet) for sheet in xls.sheet_names}
-    except Exception:
-        return {}
+    out: Dict[str, pd.DataFrame] = {}
+    for k, v in sheets.items():
+        if isinstance(v, pd.DataFrame):
+            out[str(k).strip()] = v.copy()
 
+    if "thermal_timeseries" in out:
+        out["thermal_timeseries"] = _normalize_thermal_timeseries(out["thermal_timeseries"])
+    if "thermal_params" in out:
+        out["thermal_params"] = _normalize_thermal_params(out["thermal_params"])
+
+    return out
 
 
 def _extract_thermal_for_eq(
@@ -184,18 +329,18 @@ def _extract_thermal_for_eq(
     ts = sheets.get("thermal_timeseries")
     if isinstance(ts, pd.DataFrame) and not ts.empty:
         tmp = ts.copy()
-        tmp.columns = [str(c).strip() for c in tmp.columns]
-        if "asset_id" in tmp.columns:
-            tmp = tmp[tmp["asset_id"].astype(str) == str(equipment_code)]
+        asset_col = "asset_id" if "asset_id" in tmp.columns else "equipment_code" if "equipment_code" in tmp.columns else None
+        if asset_col:
+            tmp = tmp[tmp[asset_col].astype(str) == str(equipment_code)]
         if not tmp.empty:
             thermal_df = tmp.reset_index(drop=True)
 
     params = sheets.get("thermal_params")
     if isinstance(params, pd.DataFrame) and not params.empty:
         tmp = params.copy()
-        tmp.columns = [str(c).strip() for c in tmp.columns]
-        if "asset_id" in tmp.columns:
-            tmp = tmp[tmp["asset_id"].astype(str) == str(equipment_code)]
+        asset_col = "asset_id" if "asset_id" in tmp.columns else "equipment_code" if "equipment_code" in tmp.columns else None
+        if asset_col:
+            tmp = tmp[tmp[asset_col].astype(str) == str(equipment_code)]
         if not tmp.empty:
             r = tmp.iloc[0].to_dict()
             thermal_cfg = {
@@ -214,7 +359,6 @@ def _extract_thermal_for_eq(
             }
 
     return thermal_df, thermal_cfg
-
 
 
 def _build_virtual_pm_plan_from_optimization(
@@ -269,8 +413,10 @@ def _build_virtual_pm_plan_from_optimization(
     if all_df.empty:
         return all_df, all_df
     due_df = all_df[all_df["days_left"] <= int(within_days)].copy()
-    return all_df.sort_values(["days_left", "equipment_code"]), due_df.sort_values(["days_left", "equipment_code"])
-
+    return (
+        all_df.sort_values(["days_left", "equipment_code"]).reset_index(drop=True),
+        due_df.sort_values(["days_left", "equipment_code"]).reset_index(drop=True),
+    )
 
 
 def _thermal_status(theta_hs_max: Any, faa_max: Any, lol_pct: Any) -> str:
@@ -287,7 +433,6 @@ def _thermal_status(theta_hs_max: Any, faa_max: Any, lol_pct: Any) -> str:
     return "Normal"
 
 
-
 def _process_score(model: str) -> int:
     m = (model or "").upper()
     if "NHPP" in m:
@@ -295,7 +440,6 @@ def _process_score(model: str) -> int:
     if "BPP" in m or "HAWKES" in m:
         return 2
     return 1
-
 
 
 def _final_decision_row(row: pd.Series) -> Tuple[str, str, int]:
@@ -336,18 +480,17 @@ def _final_decision_row(row: pd.Series) -> Tuple[str, str, int]:
     elif score >= 7:
         decision = "Préventif renforcé"
         reason = (
-            f"Risque significatif détecté. Renforcer la surveillance conditionnelle et planifier une "
-            f"intervention avant l’intervalle critique."
+            "Risque significatif détecté. Renforcer la surveillance conditionnelle et planifier une "
+            "intervention avant l’intervalle critique."
         )
     elif score >= 4:
         decision = "Surveillance active"
         reason = "Situation intermédiaire : conserver le plan optimisé, surveiller les tendances et les dérives thermiques."
     else:
         decision = "Suivi nominal"
-        reason = "Pas de signal critique immédiat : appliquer le calendrier recommandé et surveillance standard."
+        reason = "Pas de signal critique immédiat : appliquer le calendrier recommandé et une surveillance standard."
 
     return decision, reason, int(score)
-
 
 
 def _style_decision_df(df: pd.DataFrame):
@@ -360,11 +503,11 @@ def _style_decision_df(df: pd.DataFrame):
         if "surveillance" in d.lower():
             return ["background-color: #fff9cc"] * len(row)
         return ["background-color: #e7f5ea"] * len(row)
+
     try:
         return df.style.apply(_row_style, axis=1)
     except Exception:
         return df
-
 
 
 def _xlsx_bytes(global_tables: Dict[str, pd.DataFrame], detail_tables: Dict[str, Dict[str, pd.DataFrame]]) -> bytes:
@@ -377,7 +520,10 @@ def _xlsx_bytes(global_tables: Dict[str, pd.DataFrame], detail_tables: Dict[str,
             for tname, df in tables.items():
                 if isinstance(df, pd.DataFrame) and not df.empty:
                     sheet = f"{eq}_{tname}"[:31]
-                    df.to_excel(writer, sheet_name=sheet, index=False)
+                    try:
+                        df.to_excel(writer, sheet_name=sheet, index=False)
+                    except Exception:
+                        pass
     buff.seek(0)
     return buff.getvalue()
 
@@ -406,8 +552,22 @@ if df_fail.empty:
     st.error("Aucun dataset TTF disponible. Charge d’abord les sources ou importe un CSV equipment_code, ttf_h[, duree_rep_h].")
     st.stop()
 
-project_sheets = _load_project_sheets(up_project)
+project_sheets = _load_project_context(up_project)
 opt_df = _load_optimization_df()
+
+meta_fail = {}
+if callable(get_failures_meta):
+    try:
+        meta_fail = get_failures_meta() or {}
+    except Exception:
+        meta_fail = {}
+
+meta_project = {}
+if callable(get_project_meta):
+    try:
+        meta_project = get_project_meta() or {}
+    except Exception:
+        meta_project = {}
 
 pm_all = st.session_state.get("pm_virtual_all")
 pm_due = st.session_state.get("pm_virtual_due")
@@ -416,6 +576,15 @@ if not isinstance(pm_all, list) or not isinstance(pm_due, list):
 else:
     pm_all_df = pd.DataFrame(pm_all)
     pm_due_df = pd.DataFrame(pm_due)
+
+# small source strip
+s1, s2, s3 = st.columns(3)
+with s1:
+    st.info(f"TTF actifs : {len(df_fail)} lignes")
+with s2:
+    st.info(f"Projet thermique : {'chargé' if bool(project_sheets) else 'non chargé'}")
+with s3:
+    st.info(f"Optimisation : {'disponible' if isinstance(opt_df, pd.DataFrame) and not opt_df.empty else 'non disponible'}")
 
 # ---------------------------------------------------------------------
 # Main analysis
@@ -428,12 +597,13 @@ with st.spinner("Analyse globale en cours..."):
     eqs = sorted(df_fail["equipment_code"].astype(str).unique().tolist())
 
     for eq in eqs:
-        g = df_fail[df_fail["equipment_code"] == eq].copy()
+        g = df_fail[df_fail["equipment_code"].astype(str) == str(eq)].copy()
         ttf_series = g["ttf_h"].dropna().astype(float).tolist()
-        repair_series = None
-        if "duree_rep_h" in g.columns:
-            rr = pd.to_numeric(g["duree_rep_h"], errors="coerce").dropna().tolist()
-            repair_series = rr if rr else None
+        if len(ttf_series) < 3:
+            continue
+
+        rr = pd.to_numeric(g.get("duree_rep_h"), errors="coerce").dropna().tolist() if "duree_rep_h" in g.columns else []
+        repair_series = rr if rr else None
 
         thermal_df_eq, thermal_cfg_eq = _extract_thermal_for_eq(project_sheets, eq)
 
@@ -461,28 +631,43 @@ with st.spinner("Analyse globale en cours..."):
         thermal_summary = (thermal.get("summary") or {}) if isinstance(thermal, dict) else {}
 
         opt_row = {}
-        if isinstance(opt_df, pd.DataFrame) and not opt_df.empty:
+        if isinstance(opt_df, pd.DataFrame) and not opt_df.empty and "equipment_code" in opt_df.columns:
             match = opt_df[opt_df["equipment_code"].astype(str) == str(eq)]
             if not match.empty:
                 opt_row = match.iloc[0].to_dict()
 
         pm_row = {}
-        if isinstance(pm_all_df, pd.DataFrame) and not pm_all_df.empty:
+        if isinstance(pm_all_df, pd.DataFrame) and not pm_all_df.empty and "equipment_code" in pm_all_df.columns:
             match_pm = pm_all_df[pm_all_df["equipment_code"].astype(str) == str(eq)]
             if not match_pm.empty:
                 pm_row = match_pm.iloc[0].to_dict()
 
+        trend_mk = tests.get("trend_mk", {}) or {}
+        trend_lap = tests.get("trend_laplace", {}) or {}
+        dep = tests.get("dependence", {}) or {}
+        direction = trend_mk.get("direction") or trend_lap.get("direction")
+
+        beta_pref = params.get("beta")
+        if beta_pref is None:
+            beta_pref = opt_row.get("beta")
+        eta_pref = params.get("eta")
+        if eta_pref is None:
+            eta_pref = opt_row.get("eta_h", opt_row.get("eta"))
+        gamma_pref = params.get("gamma")
+        if gamma_pref is None:
+            gamma_pref = opt_row.get("gamma_h")
+
         row = {
             "equipment_code": eq,
             "n_ttf": len(ttf_series),
-            "trend_detected": "Oui" if (tests.get("trend_mk", {}).get("has_trend") or tests.get("trend_laplace", {}).get("has_trend")) else "Non",
-            "trend_direction": tests.get("trend_mk", {}).get("direction") or tests.get("trend_laplace", {}).get("direction"),
-            "dependence_detected": "Oui" if tests.get("dependence", {}).get("has_dep") else "Non",
+            "trend_detected": "Oui" if (trend_mk.get("has_trend") or trend_lap.get("has_trend")) else "Non",
+            "trend_direction": direction,
+            "dependence_detected": "Oui" if dep.get("has_dep") else "Non",
             "model": reliability.get("model"),
             "distribution": reliability.get("distribution"),
-            "beta": params.get("beta"),
-            "eta_h": params.get("eta"),
-            "gamma_h": params.get("gamma"),
+            "beta": beta_pref,
+            "eta_h": eta_pref,
+            "gamma_h": gamma_pref,
             "mtbf_h": indicators.get("mtbf_h"),
             "mttr_h": indicators.get("mttr_h"),
             "availability_pct": None if indicators.get("availability_intrinsic") is None else 100.0 * float(indicators.get("availability_intrinsic")),
@@ -528,15 +713,18 @@ trend_overview = summary_df[[
 ]].copy()
 
 risk_overview = summary_df[[
-    "equipment_code", "beta", "eta_h", "mtbf_h", "mttr_h", "availability_pct", "theta_hs_max", "faa_max", "loss_of_life_pct", "thermal_status"
+    "equipment_code", "beta", "eta_h", "mtbf_h", "mttr_h", "availability_pct",
+    "theta_hs_max", "faa_max", "loss_of_life_pct", "thermal_status"
 ]].copy()
 
 optimization_overview = summary_df[[
-    "equipment_code", "maintenance_type", "T_recommended_h", "T_R_h", "T_cost_h", "R(T_cost)", "C_min_per_h", "next_due_date", "days_left"
+    "equipment_code", "maintenance_type", "T_recommended_h", "T_R_h", "T_cost_h", "R(T_cost)",
+    "C_min_per_h", "next_due_date", "days_left"
 ]].copy()
 
 final_decision_df = summary_df[[
-    "equipment_code", "model", "distribution", "thermal_status", "maintenance_type", "days_left", "priority_score", "priorite", "decision_finale", "motif_decision"
+    "equipment_code", "model", "distribution", "thermal_status", "maintenance_type", "days_left",
+    "priority_score", "priorite", "decision_finale", "motif_decision"
 ]].copy()
 
 if not pm_due_df.empty:
@@ -629,9 +817,10 @@ with tests_tab:
 
     rel = eq_res.get("reliability", {})
     ind = rel.get("indicators", {}) or {}
+    avail = None if ind.get("availability_intrinsic") is None else 100 * float(ind.get("availability_intrinsic"))
     st.info(
         f"Équipement {eq} → Processus **{rel.get('model', '—')}**, loi **{rel.get('distribution', '—')}**, "
-        f"MTBF={_fmt(ind.get('mtbf_h'),1)} h, MTTR={_fmt(ind.get('mttr_h'),1)} h, disponibilité={_fmt(None if ind.get('availability_intrinsic') is None else 100*float(ind.get('availability_intrinsic')),1)} %."
+        f"MTBF={_fmt(ind.get('mtbf_h'),1)} h, MTTR={_fmt(ind.get('mttr_h'),1)} h, disponibilité={_fmt(avail,1)} %."
     )
 
 with thermal_tab:
@@ -641,7 +830,7 @@ with thermal_tab:
     thermal = eq_res.get("thermal")
 
     if not thermal:
-        st.warning("Aucune donnée thermique disponible pour cet équipement. Charge le fichier projet Excel pour enrichir cette section.")
+        st.warning("Aucune donnée thermique disponible pour cet équipement. Charge le fichier projet Excel ou un projet actif depuis Sources.")
     else:
         st.dataframe(eq_tables.get("thermal_table_dataset", pd.DataFrame()), use_container_width=True, hide_index=True)
         st.dataframe(eq_tables.get("thermal_table_params", pd.DataFrame()), use_container_width=True, hide_index=True)
@@ -684,7 +873,7 @@ with opt_tab:
     else:
         st.dataframe(due_tasks_df, use_container_width=True, hide_index=True)
 
-    if not opt_df.empty:
+    if not opt_df.empty and "T_recommended_h" in opt_df.columns:
         fig, ax = plt.subplots(figsize=(8, 4))
         plot_df = opt_df[["equipment_code", "T_recommended_h"]].copy()
         plot_df["T_recommended_h"] = pd.to_numeric(plot_df["T_recommended_h"], errors="coerce")
@@ -706,12 +895,12 @@ with decision_tab:
 
     st.markdown(f"### {_decision_badge(str(row['decision_finale']))} — {eq}")
     st.markdown(
-        f"**Processus retenu** : {row.get('model','—')}  \\n"
-        f"**Distribution** : {row.get('distribution','—')}  \\n"
-        f"**Beta / Eta** : {_fmt(row.get('beta'),2)} / {_fmt(row.get('eta_h'),1)} h  \\n"
-        f"**Statut thermique** : {row.get('thermal_status','—')}  \\n"
-        f"**Maintenance recommandée** : {row.get('maintenance_type','—')}  \\n"
-        f"**Échéance** : {row.get('next_due_date','—')} (J-{row.get('days_left','—')})  \\n"
+        f"**Processus retenu** : {row.get('model','—')}  \n"
+        f"**Distribution** : {row.get('distribution','—')}  \n"
+        f"**Beta / Eta** : {_fmt(row.get('beta'),2)} / {_fmt(row.get('eta_h'),1)} h  \n"
+        f"**Statut thermique** : {row.get('thermal_status','—')}  \n"
+        f"**Maintenance recommandée** : {row.get('maintenance_type','—')}  \n"
+        f"**Échéance** : {row.get('next_due_date','—')} (J-{row.get('days_left','—')})  \n"
         f"**Score de priorité** : {row.get('priority_score','—')} ({row.get('priorite','—')})"
     )
     st.info(row.get("motif_decision", "Aucun motif disponible."))
@@ -759,6 +948,9 @@ else:
                     "window_days": within_days,
                     "start_date": str(start_dt),
                     "n_equipment": len(summary_df),
+                    "source_rows": len(df_fail),
+                    "source_hash": meta_fail.get("hash", "") if isinstance(meta_fail, dict) else "",
+                    "project_hash": meta_project.get("hash", "") if isinstance(meta_project, dict) else "",
                 },
             )
             st.session_state["global_pdf_path"] = pdf_path

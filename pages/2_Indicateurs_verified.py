@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 from io import BytesIO
@@ -14,24 +15,18 @@ import streamlit as st
 from scipy import stats as sst
 
 from core.security.auth import require_login
-from core.datahub import get_current_failures_df, get_failures_meta
+from core.datahub import (
+    get_current_failures_df,
+    get_failures_meta,
+    get_project_meta,
+)
+
+try:
+    from core.datahub import get_pipeline_inputs  # type: ignore
+except Exception:
+    get_pipeline_inputs = None
+
 from core.reliability.organigram import analyze_ttf_pipeline
-
-# Optional datahub accessors for project/thermal context
-try:
-    from core.datahub import get_current_project_data  # type: ignore
-except Exception:
-    get_current_project_data = None
-
-try:
-    from core.datahub import get_current_thermal_df  # type: ignore
-except Exception:
-    get_current_thermal_df = None
-
-try:
-    from core.datahub import get_current_thermal_params  # type: ignore
-except Exception:
-    get_current_thermal_params = None
 
 try:
     from core.reliability.reporting_merged import export_merged_report_pdf
@@ -46,16 +41,13 @@ require_login()
 
 st.title("📊 Indicateurs — Fiabilité & Thermique")
 st.caption(
-    "Cette page exploite le nouveau pipeline intégré : tests de tendance, dépendance, "
-    "choix du processus, ajustement, indicateurs fiabilistes et, si disponible, modélisation thermique."
+    "Tests de tendance et de dépendance, choix du processus, ajustement des lois, "
+    "indicateurs fiabilistes et modélisation thermique si des données projet sont disponibles."
 )
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 
 
-# ---------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------
 def fnum(x: Any, nd: int = 2, default: str = "—") -> str:
     try:
         if x is None:
@@ -68,7 +60,6 @@ def fnum(x: Any, nd: int = 2, default: str = "—") -> str:
         return default
 
 
-
 def _series_to_list(s: pd.Series) -> Optional[list[float]]:
     vals = pd.to_numeric(s, errors="coerce").dropna()
     vals = vals[vals > 0]
@@ -77,85 +68,21 @@ def _series_to_list(s: pd.Series) -> Optional[list[float]]:
     return vals.astype(float).tolist()
 
 
-
-def _extract_thermal_context(eq: str) -> tuple[Optional[pd.DataFrame], Optional[Dict[str, Any]]]:
-    thermal_df: Optional[pd.DataFrame] = None
-    thermal_cfg: Optional[Dict[str, Any]] = None
-
-    # 1) project_data (preferred if available)
-    try:
-        if callable(get_current_project_data):
-            proj = get_current_project_data()
-        else:
-            proj = st.session_state.get("project_data")
-    except Exception:
-        proj = st.session_state.get("project_data")
-
-    if isinstance(proj, dict):
-        raw_thermal = proj.get("thermal_timeseries")
-        raw_params = proj.get("thermal_params")
-        if isinstance(raw_thermal, pd.DataFrame) and not raw_thermal.empty:
-            asset_col = "asset_id" if "asset_id" in raw_thermal.columns else "equipment_code" if "equipment_code" in raw_thermal.columns else None
-            thermal_df = raw_thermal.copy()
-            if asset_col:
-                thermal_df = thermal_df[thermal_df[asset_col].astype(str) == str(eq)].copy()
-            if thermal_df.empty:
-                thermal_df = None
-        if isinstance(raw_params, pd.DataFrame) and not raw_params.empty:
-            param_row = raw_params.copy()
-            asset_col = "asset_id" if "asset_id" in param_row.columns else "equipment_code" if "equipment_code" in param_row.columns else None
-            if asset_col:
-                param_row = param_row[param_row[asset_col].astype(str) == str(eq)].copy()
-            if param_row.empty:
-                param_row = raw_params.head(1).copy()
-            if not param_row.empty:
-                row = param_row.iloc[0].to_dict()
-                row.pop("asset_id", None)
-                row.pop("equipment_code", None)
-                thermal_cfg = {k: v for k, v in row.items() if pd.notna(v)}
-
-    # 2) dedicated optional accessors
-    if thermal_df is None:
+def _get_pipeline_bundle(eq: str) -> dict[str, Any]:
+    if callable(get_pipeline_inputs):
         try:
-            if callable(get_current_thermal_df):
-                raw = get_current_thermal_df()
-                if isinstance(raw, pd.DataFrame) and not raw.empty:
-                    asset_col = "asset_id" if "asset_id" in raw.columns else "equipment_code" if "equipment_code" in raw.columns else None
-                    thermal_df = raw.copy()
-                    if asset_col:
-                        thermal_df = thermal_df[thermal_df[asset_col].astype(str) == str(eq)].copy()
-                    if thermal_df.empty:
-                        thermal_df = None
+            return get_pipeline_inputs(asset_id=str(eq))
         except Exception:
-            thermal_df = thermal_df
-
-    if thermal_cfg is None:
-        try:
-            if callable(get_current_thermal_params):
-                raw_cfg = get_current_thermal_params(eq)
-                if isinstance(raw_cfg, dict) and raw_cfg:
-                    thermal_cfg = raw_cfg
-        except Exception:
-            thermal_cfg = thermal_cfg
-
-    # 3) session-state fallbacks
-    if thermal_df is None:
-        raw = st.session_state.get("thermal_df")
-        if isinstance(raw, pd.DataFrame) and not raw.empty:
-            asset_col = "asset_id" if "asset_id" in raw.columns else "equipment_code" if "equipment_code" in raw.columns else None
-            thermal_df = raw.copy()
-            if asset_col:
-                thermal_df = thermal_df[thermal_df[asset_col].astype(str) == str(eq)].copy()
-            if thermal_df.empty:
-                thermal_df = None
-
-    if thermal_cfg is None:
-        raw_cfg = st.session_state.get("thermal_config")
-        if isinstance(raw_cfg, dict) and raw_cfg:
-            thermal_cfg = raw_cfg
-
-    return thermal_df, thermal_cfg
-
+            pass
+    return {
+        "asset_id": str(eq),
+        "ttf_series": [],
+        "repair_series": [],
+        "thermal_df": None,
+        "thermal_config": None,
+        "alpha": 0.05,
+        "project_meta": get_project_meta(),
+    }
 
 
 def _get_dist_and_params(reliability: Dict[str, Any]):
@@ -175,7 +102,6 @@ def _get_dist_and_params(reliability: Dict[str, Any]):
     if name in {"weibull_2p", "weibull_3p"}:
         return sst.weibull_min, params
     return None, None
-
 
 
 def _compute_curve(reliability: Dict[str, Any], t: np.ndarray, curve: str) -> Optional[np.ndarray]:
@@ -200,7 +126,6 @@ def _compute_curve(reliability: Dict[str, Any], t: np.ndarray, curve: str) -> Op
         return None
 
 
-
 def _pipeline_str(result: Dict[str, Any]) -> str:
     rel = result.get("reliability", {}) or {}
     tests = rel.get("tests", {}) or {}
@@ -219,7 +144,6 @@ def _pipeline_str(result: Dict[str, Any]) -> str:
     )
 
 
-
 def _export_tables_xlsx(result_by_eq: Dict[str, Dict[str, Any]]) -> bytes:
     buffer = BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
@@ -229,7 +153,7 @@ def _export_tables_xlsx(result_by_eq: Dict[str, Dict[str, Any]]) -> bytes:
                 if isinstance(table, pd.DataFrame) and not table.empty:
                     sheet = f"{eq}_{name}"[:31]
                     table.to_excel(writer, sheet_name=sheet, index=False)
-            rel = result.get("reliability", {})
+            rel = result.get("reliability", {}) or {}
             ind = rel.get("indicators", {}) or {}
             summary_rows.append(
                 {
@@ -248,9 +172,6 @@ def _export_tables_xlsx(result_by_eq: Dict[str, Dict[str, Any]]) -> bytes:
     return buffer.getvalue()
 
 
-# ---------------------------------------------------------------------
-# Dataset actif
-# ---------------------------------------------------------------------
 meta = get_failures_meta()
 df_src = get_current_failures_df()
 
@@ -258,7 +179,9 @@ if df_src.empty:
     st.error("Aucun dataset actif. Va sur « Sources de données » et synchronise un dataset.")
     st.stop()
 
-st.success(f"Dataset actif ✅ | rows={meta.get('rows')} | hash={meta.get('hash')} | source={meta.get('source')}")
+st.success(
+    f"Dataset actif ✅ | rows={meta.get('rows')} | hash={meta.get('hash')} | source={meta.get('source')}"
+)
 
 if "equipment_code" not in df_src.columns or "ttf_h" not in df_src.columns:
     st.error("Le dataset actif doit contenir au minimum les colonnes `equipment_code` et `ttf_h`.")
@@ -275,10 +198,6 @@ if not sel:
     st.info("Sélectionne au moins un équipement.")
     st.stop()
 
-
-# ---------------------------------------------------------------------
-# Analyse intégrée par équipement
-# ---------------------------------------------------------------------
 results_by: Dict[str, Dict[str, Any]] = {}
 summary_rows: list[dict[str, Any]] = []
 curve_ready_eqs: list[str] = []
@@ -294,7 +213,9 @@ for eq in sel:
     if "duree_rep_h" in g.columns:
         repair_list = _series_to_list(g["duree_rep_h"])
 
-    thermal_df, thermal_cfg = _extract_thermal_context(eq)
+    bundle = _get_pipeline_bundle(str(eq))
+    thermal_df = bundle.get("thermal_df")
+    thermal_cfg = bundle.get("thermal_config")
 
     try:
         result = analyze_ttf_pipeline(
@@ -306,7 +227,7 @@ for eq in sel:
         )
         results_by[str(eq)] = result
 
-        rel = result["reliability"]
+        rel = result.get("reliability", {}) or {}
         ind = rel.get("indicators", {}) or {}
         therm = result.get("thermal")
         therm_summary = (therm or {}).get("summary", {}) if therm else {}
@@ -352,10 +273,6 @@ detail_tables = detail_result.get("tables", {}) or {}
 detail_rel = detail_result.get("reliability", {}) or {}
 detail_therm = detail_result.get("thermal")
 
-
-# ---------------------------------------------------------------------
-# Synthèse
-# ---------------------------------------------------------------------
 st.subheader("📋 Synthèse globale")
 metric_cols = st.columns(4)
 with metric_cols[0]:
@@ -371,10 +288,6 @@ with metric_cols[3]:
 
 st.dataframe(summary_df, use_container_width=True, hide_index=True)
 
-
-# ---------------------------------------------------------------------
-# Tabs
-# ---------------------------------------------------------------------
 main_tabs = st.tabs([
     "📈 Courbes fiabilistes",
     "🧭 Tests & organigramme",
@@ -382,7 +295,6 @@ main_tabs = st.tabs([
     "📄 Exports",
 ])
 
-# ---------- Courbes ----------
 with main_tabs[0]:
     st.caption("Les courbes analytiques R(t), F(t), f(t), h(t) sont tracées pour les équipements RP avec loi paramétrique iid retenue.")
     if skipped_curve_eqs:
@@ -432,7 +344,6 @@ with main_tabs[0]:
         multi_plot(ax, "hazard", "Taux de défaillance h(t)", "h(t)")
         st.pyplot(fig, clear_figure=True)
 
-# ---------- Tests & Organigramme ----------
 with main_tabs[1]:
     st.subheader(f"Détail — {detail_eq}")
     st.code(_pipeline_str(detail_result), language="text")
@@ -458,12 +369,11 @@ with main_tabs[1]:
     with rel_tabs[5]:
         st.json(detail_result)
 
-# ---------- Thermique ----------
 with main_tabs[2]:
     if detail_therm is None:
         st.info(
-            "Aucune série thermique disponible pour cet équipement. La page fonctionne déjà pour la partie fiabilité ; "
-            "la partie thermique apparaîtra dès que `Sources` synchronisera `thermal_timeseries` et `thermal_params` dans le datahub ou la session."
+            "Aucune série thermique disponible pour cet équipement. La partie fiabilité reste exploitable. "
+            "La partie thermique apparaîtra dès que la page Sources synchronisera thermal_timeseries et thermal_params."
         )
     else:
         therm_tabs = st.tabs([
@@ -519,7 +429,6 @@ with main_tabs[2]:
             st.markdown("**Top 5 jours critiques**")
             st.dataframe(detail_tables.get("thermal_top5_days", pd.DataFrame()), use_container_width=True, hide_index=True)
 
-# ---------- Exports ----------
 with main_tabs[3]:
     st.subheader("Téléchargements")
     xlsx_bytes = _export_tables_xlsx(results_by)
@@ -532,7 +441,7 @@ with main_tabs[3]:
     )
 
     if export_merged_report_pdf is None:
-        st.info("Module `core.reliability.reporting_merged` non détecté ou incompatible.")
+        st.info("Module core.reliability.reporting_merged non détecté ou incompatible.")
         if _REPORT_ERR:
             st.caption(f"Détail import: {_REPORT_ERR}")
     else:
@@ -567,7 +476,3 @@ with main_tabs[3]:
                     mime="application/pdf",
                     use_container_width=True,
                 )
-
-st.info(
-    "Suite logique : après cette page, il faudra ajuster `Optimisation`, `Maintenance` et le module PDF pour exploiter les mêmes `tables` retournées par le pipeline intégré."
-)
