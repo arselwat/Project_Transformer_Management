@@ -1,9 +1,11 @@
-# pages/4_Optimisation.py
 from __future__ import annotations
 
 from pathlib import Path
+import io
 import math
 import hashlib
+from typing import Any, Optional
+
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -35,14 +37,18 @@ except Exception as e:
 st.set_page_config(page_title="Optimisation maintenance", page_icon="🧠", layout="wide")
 require_login()
 
-st.title("🧠 Optimisation — Intervalles, coût & fiabilité")
+st.title("🧠 Optimisation — Intervalles, coût, fiabilité et thermique")
 st.caption(
-    "Cette page calcule un planning optimisé (par équipement) et peut **envoyer directement** le résultat à la page Maintenance "
-    "sans passer par une BD (utile tant que la BD n'est pas prête)."
+    "Cette page exploite le nouveau pipeline fiabiliste + thermo-fiabiliste. "
+    "Elle calcule les intervalles économiques, contrôle les contraintes thermiques, "
+    "et prépare un tableau de synthèse directement réutilisable dans Maintenance."
 )
 
-# ---------- Helpers ----------
-def _read_csv_flex(src):
+
+# ------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------
+def _read_csv_flex(src) -> pd.DataFrame:
     def _try_read(s, **kw):
         try:
             return pd.read_csv(s, **kw)
@@ -73,7 +79,30 @@ def _read_csv_flex(src):
     return df
 
 
-def fnum(x, nd=2, default="—"):
+def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    mapping = {
+        "equipment": "equipment_code",
+        "equipement": "equipment_code",
+        "code_equipement": "equipment_code",
+        "asset_id": "equipment_code",
+        "eqp": "equipment_code",
+        "ttf": "ttf_h",
+        "ttf_hours": "ttf_h",
+        "mttr_h": "duree_rep_h",
+        "repair_hours": "duree_rep_h",
+        "repair_time_hours": "duree_rep_h",
+    }
+    cols = {str(c).lower().strip(): c for c in df.columns}
+    ren = {}
+    for k, v in mapping.items():
+        if k in cols:
+            ren[cols[k]] = v
+    out = df.rename(columns=ren).copy()
+    out.columns = [str(c).strip() for c in out.columns]
+    return out
+
+
+def _fnum(x: Any, nd: int = 2, default: str = "—") -> str:
     try:
         if x is None:
             return default
@@ -85,7 +114,7 @@ def fnum(x, nd=2, default="—"):
         return default
 
 
-def is_pos_number(x) -> bool:
+def _is_pos_number(x: Any) -> bool:
     try:
         return float(x) > 0 and np.isfinite(float(x))
     except Exception:
@@ -97,50 +126,357 @@ def _df_hash(df: pd.DataFrame) -> str:
     return hashlib.md5(b).hexdigest()
 
 
-# ==========================
-# 1) Chargement données
-# ==========================
+def _safe_num(x: Any) -> Optional[float]:
+    try:
+        v = float(x)
+        return v if np.isfinite(v) else None
+    except Exception:
+        return None
+
+
+def _load_excel_bytes(uploaded_file) -> bytes:
+    uploaded_file.seek(0)
+    return uploaded_file.read()
+
+
+def _compute_ttf_from_events(events_df: pd.DataFrame) -> pd.DataFrame:
+    if events_df.empty:
+        return pd.DataFrame(columns=["equipment_code", "ttf_h", "duree_rep_h"])
+
+    df = events_df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+
+    if "asset_id" not in df.columns or "event_start" not in df.columns:
+        return pd.DataFrame(columns=["equipment_code", "ttf_h", "duree_rep_h"])
+
+    if "is_failure" in df.columns:
+        df["is_failure"] = pd.to_numeric(df["is_failure"], errors="coerce").fillna(0)
+        df = df[df["is_failure"] == 1].copy()
+    elif "event_type" in df.columns:
+        df = df[df["event_type"].astype(str).str.upper().eq("FAILURE")].copy()
+
+    if df.empty:
+        return pd.DataFrame(columns=["equipment_code", "ttf_h", "duree_rep_h"])
+
+    df["event_start"] = pd.to_datetime(df["event_start"], errors="coerce")
+    df = df.dropna(subset=["event_start"]).sort_values(["asset_id", "event_start"])
+
+    if "repair_time_hours" not in df.columns:
+        df["repair_time_hours"] = np.nan
+    df["repair_time_hours"] = pd.to_numeric(df["repair_time_hours"], errors="coerce")
+
+    rows = []
+    for eq, g in df.groupby("asset_id"):
+        g = g.reset_index(drop=True)
+        for i in range(1, len(g)):
+            ttf_h = (g.loc[i, "event_start"] - g.loc[i - 1, "event_start"]).total_seconds() / 3600.0
+            if ttf_h > 0:
+                rows.append(
+                    {
+                        "equipment_code": str(eq),
+                        "ttf_h": float(ttf_h),
+                        "duree_rep_h": _safe_num(g.loc[i, "repair_time_hours"]),
+                    }
+                )
+    return pd.DataFrame(rows)
+
+
+def _load_project_excel(src) -> dict[str, Any]:
+    if isinstance(src, (str, Path)):
+        xls = pd.ExcelFile(src)
+    else:
+        raw = _load_excel_bytes(src)
+        xls = pd.ExcelFile(io.BytesIO(raw))
+
+    sheets = {name: pd.read_excel(xls, sheet_name=name) for name in xls.sheet_names}
+
+    events = sheets.get("events_history", pd.DataFrame())
+    thermal = sheets.get("thermal_timeseries", pd.DataFrame())
+    thermal_params = sheets.get("thermal_params", pd.DataFrame())
+    settings = sheets.get("analysis_settings", pd.DataFrame())
+    policies = sheets.get("maintenance_policies", pd.DataFrame())
+    asset_info = sheets.get("asset_info", pd.DataFrame())
+
+    ttf_df = _compute_ttf_from_events(events)
+    ttf_df = _normalize_columns(ttf_df)
+
+    alpha_default = 0.05
+    if not settings.empty and "alpha_significance" in settings.columns:
+        alpha_default = _safe_num(settings.iloc[0]["alpha_significance"]) or 0.05
+
+    thermal.columns = [str(c).strip() for c in thermal.columns]
+    thermal_params.columns = [str(c).strip() for c in thermal_params.columns]
+    policies.columns = [str(c).strip() for c in policies.columns]
+    asset_info.columns = [str(c).strip() for c in asset_info.columns]
+
+    thermal_map: dict[str, pd.DataFrame] = {}
+    if not thermal.empty and "asset_id" in thermal.columns:
+        for eq, g in thermal.groupby("asset_id"):
+            thermal_map[str(eq)] = g.copy().reset_index(drop=True)
+
+    thermal_cfg_map: dict[str, dict[str, Any]] = {}
+    allowed_thermal_keys = {
+        "sn_mva",
+        "R",
+        "delta_to_r",
+        "delta_h_r",
+        "tau_to_min",
+        "tau_w_min",
+        "n_exp",
+        "m_exp",
+        "forced_tau_to_factor",
+        "forced_delta_to_factor",
+        "forced_delta_h_factor",
+        "normal_insulation_life_h",
+    }
+    if not thermal_params.empty and "asset_id" in thermal_params.columns:
+        for _, row in thermal_params.iterrows():
+            eq = str(row["asset_id"])
+            cfg = {}
+            for k in allowed_thermal_keys:
+                if k in thermal_params.columns:
+                    v = _safe_num(row.get(k))
+                    if v is not None:
+                        cfg[k] = v
+            thermal_cfg_map[eq] = cfg
+
+    return {
+        "ttf_df": ttf_df,
+        "events_history": events,
+        "thermal_map": thermal_map,
+        "thermal_cfg_map": thermal_cfg_map,
+        "analysis_settings": settings,
+        "maintenance_policies": policies,
+        "asset_info": asset_info,
+        "alpha_default": alpha_default,
+        "sheet_names": list(sheets.keys()),
+    }
+
+
+def _recommend_maintenance(beta: float, model: Optional[str] = None, thermal_status: Optional[str] = None) -> str:
+    model_s = (model or "").upper()
+    if thermal_status == "Alerte thermique":
+        return "Préventive immédiate + contrôle thermique"
+    if "NHPP" in model_s:
+        return "Préventive planifiée (vieillissement détecté)"
+    if "BPP" in model_s:
+        return "Conditionnelle + analyse causale / inspection rapprochée"
+    if beta < 0.9:
+        return "Corrective + fiabilisation (pannes de jeunesse)"
+    if 0.9 <= beta <= 1.1:
+        return "Conditionnelle / inspection (pannes aléatoires)"
+    return "Préventive planifiée (âge / usure)"
+
+
+def _recommend_interval(beta: float, model: Optional[str], t_cost: Any, t_r: Any) -> Optional[float]:
+    model_s = (model or "").upper()
+    vals = [float(v) for v in [t_cost, t_r] if _is_pos_number(v)]
+    if not vals:
+        return None
+    if "BPP" in model_s:
+        return float(min(vals))
+    if beta <= 1.1 and "NHPP" not in model_s:
+        return None
+    return float(min(vals))
+
+
+def _thermal_status_label(thermal_result: Optional[dict], faa_limit: Optional[float], lol_limit_pct: Optional[float]) -> tuple[Optional[bool], str, Optional[float], Optional[float]]:
+    if not thermal_result:
+        return None, "Pas de données thermiques", None, None
+
+    summary = thermal_result.get("summary", {})
+    faa_max = _safe_num(summary.get("faa_max"))
+    lol_pct = _safe_num(summary.get("loss_of_life_pct"))
+
+    checks = []
+    if faa_limit is not None and faa_max is not None:
+        checks.append(faa_max <= faa_limit)
+    if lol_limit_pct is not None and lol_pct is not None:
+        checks.append(lol_pct <= lol_limit_pct)
+
+    if not checks:
+        return None, "Thermique calculée", faa_max, lol_pct
+    if all(checks):
+        return True, "Conforme thermique", faa_max, lol_pct
+    return False, "Alerte thermique", faa_max, lol_pct
+
+
+def _build_excel_export(summary_df: pd.DataFrame, detail_payload: dict[str, dict[str, pd.DataFrame]]) -> bytes:
+    bio = io.BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        summary_df.to_excel(writer, sheet_name="Synthese_Optimisation", index=False)
+        for eq, tables in detail_payload.items():
+            prefix = str(eq)[:20]
+            for name, df in tables.items():
+                safe_name = f"{prefix}_{name}"[:31]
+                try:
+                    df.to_excel(writer, sheet_name=safe_name, index=False)
+                except Exception:
+                    pass
+    bio.seek(0)
+    return bio.getvalue()
+
+
+# ------------------------------------------------------------------
+# Chargement données
+# ------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parents[1]
-DATA_FILE = BASE_DIR / "data" / "failures_saved.csv"
+DATA_DIR = BASE_DIR / "data"
+DATA_DIR.mkdir(exist_ok=True, parents=True)
+FALLBACK_TTF = DATA_DIR / "failures_saved.csv"
+FALLBACK_PROJECTS = sorted(DATA_DIR.glob("*.xlsx"))
 
-src = st.radio("Source TTF", ["Fichier projet", "Uploader CSV"], horizontal=True)
+source_mode = st.radio(
+    "Source des données",
+    ["Fichier projet (.xlsx)", "CSV TTF simple"],
+    horizontal=True,
+)
 
-if src == "Fichier projet":
-    if not DATA_FILE.exists():
-        st.error("Aucun fichier data/failures_saved.csv — va dans « Sources de données » pour enregistrer.")
+project_payload: dict[str, Any] = {
+    "ttf_df": pd.DataFrame(),
+    "events_history": pd.DataFrame(),
+    "thermal_map": {},
+    "thermal_cfg_map": {},
+    "analysis_settings": pd.DataFrame(),
+    "maintenance_policies": pd.DataFrame(),
+    "asset_info": pd.DataFrame(),
+    "alpha_default": 0.05,
+    "sheet_names": [],
+}
+
+ttf_df = pd.DataFrame()
+
+auto_thermal_available = False
+
+if source_mode == "Fichier projet (.xlsx)":
+    project_choice = st.radio("Mode de chargement", ["Fichier projet local", "Uploader Excel"], horizontal=True)
+
+    if project_choice == "Fichier projet local":
+        if not FALLBACK_PROJECTS:
+            st.error("Aucun fichier .xlsx trouvé dans le dossier data/. Dépose un fichier projet ou passe par l’uploader.")
+            st.stop()
+        selected_path = st.selectbox("Choisir le fichier projet", options=[str(p.name) for p in FALLBACK_PROJECTS])
+        project_path = DATA_DIR / selected_path
+        try:
+            project_payload = _load_project_excel(project_path)
+        except Exception as e:
+            st.error(f"Lecture Excel impossible: {e}")
+            st.stop()
+    else:
+        up_xlsx = st.file_uploader("Uploader un fichier projet Excel", type=["xlsx"])
+        if up_xlsx is None:
+            st.stop()
+        try:
+            project_payload = _load_project_excel(up_xlsx)
+        except Exception as e:
+            st.error(f"Lecture Excel impossible: {e}")
+            st.stop()
+
+    ttf_df = project_payload["ttf_df"].copy()
+    auto_thermal_available = bool(project_payload["thermal_map"])
+
+    if ttf_df.empty:
+        st.error("Aucun TTF construit depuis la feuille events_history. Vérifie les colonnes asset_id, event_start, is_failure.")
         st.stop()
-    df = _read_csv_flex(DATA_FILE)
+
+    with st.expander("Voir les feuilles détectées"):
+        st.write(project_payload.get("sheet_names", []))
+        st.dataframe(ttf_df.head(20), use_container_width=True, hide_index=True)
 else:
-    up = st.file_uploader("CSV (equipment_code, ttf_h)", type=["csv"])
-    if up is None:
-        st.stop()
-    df = _read_csv_flex(up)
+    csv_choice = st.radio("Mode CSV", ["Fichier projet local", "Uploader CSV"], horizontal=True)
+    if csv_choice == "Fichier projet local":
+        if not FALLBACK_TTF.exists():
+            st.error("Aucun fichier data/failures_saved.csv — va d’abord dans « Sources de données ».")
+            st.stop()
+        ttf_df = _read_csv_flex(FALLBACK_TTF)
+    else:
+        up_csv = st.file_uploader("CSV (equipment_code, ttf_h[, duree_rep_h])", type=["csv"])
+        if up_csv is None:
+            st.stop()
+        ttf_df = _read_csv_flex(up_csv)
 
-if df.empty:
-    st.error("CSV vide ou illisible.")
-    st.stop()
+    ttf_df = _normalize_columns(ttf_df)
+    if ttf_df.empty:
+        st.error("CSV vide ou illisible.")
+        st.stop()
 
 required = {"equipment_code", "ttf_h"}
-if not required.issubset(set(df.columns)):
+if not required.issubset(set(ttf_df.columns)):
     st.error("Colonnes requises: equipment_code, ttf_h")
     st.stop()
 
-df["equipment_code"] = df["equipment_code"].astype(str)
-df["ttf_h"] = pd.to_numeric(df["ttf_h"], errors="coerce")
-df = df.dropna(subset=["ttf_h"])
-df = df[df["ttf_h"] > 0]
+ttf_df["equipment_code"] = ttf_df["equipment_code"].astype(str)
+ttf_df["ttf_h"] = pd.to_numeric(ttf_df["ttf_h"], errors="coerce")
+if "duree_rep_h" in ttf_df.columns:
+    ttf_df["duree_rep_h"] = pd.to_numeric(ttf_df["duree_rep_h"], errors="coerce")
+else:
+    ttf_df["duree_rep_h"] = np.nan
 
-eqs = sorted(df["equipment_code"].unique().tolist())
-if not eqs:
-    st.error("Aucun équipement valide (TTF>0).")
+ttf_df = ttf_df.dropna(subset=["ttf_h"])
+ttf_df = ttf_df[ttf_df["ttf_h"] > 0].reset_index(drop=True)
+
+if ttf_df.empty:
+    st.error("Aucune donnée TTF valide après nettoyage.")
+    st.stop()
+
+eqs_all = sorted(ttf_df["equipment_code"].unique().tolist())
+selected_eqs = st.multiselect("Équipements à optimiser", eqs_all, default=eqs_all)
+if not selected_eqs:
+    st.warning("Sélectionne au moins un équipement.")
+    st.stop()
+
+df = ttf_df[ttf_df["equipment_code"].isin(selected_eqs)].copy().reset_index(drop=True)
+
+if df.empty:
+    st.error("Aucune ligne après filtrage des équipements.")
     st.stop()
 
 
-# ==========================
-# 2) Fit Weibull (baseline)
-# ==========================
-fits = {}
-for eq in eqs:
+# ------------------------------------------------------------------
+# Paramètres utilisateur
+# ------------------------------------------------------------------
+st.markdown("### Paramètres de fiabilité, coût et thermique")
+alpha_default = float(project_payload.get("alpha_default", 0.05) or 0.05)
+
+c_alpha, cR, cC1, cC2, cRmin = st.columns(5)
+with c_alpha:
+    alpha = st.number_input("Alpha", min_value=0.001, max_value=0.20, value=float(alpha_default), step=0.001, format="%.3f")
+with cR:
+    R_target = st.slider("Fiabilité cible R(t)", 0.50, 0.99, 0.80, 0.01)
+with cC1:
+    C_prev = st.number_input("Coût préventive (C_prev)", min_value=0.0, value=1.0, step=0.1)
+with cC2:
+    C_corr = st.number_input("Coût corrective (C_corr)", min_value=0.0, value=5.0, step=0.5)
+with cRmin:
+    R_min_cost = st.slider("Fiabilité min. pour T_cost", 0.0, 0.99, 0.70, 0.01)
+
+cTherm, cFAA, cLOL = st.columns(3)
+with cTherm:
+    use_thermal_constraint = st.toggle("Activer contrainte thermique", value=auto_thermal_available)
+with cFAA:
+    faa_limit = st.number_input("FAA max admissible", min_value=0.0, value=1.50, step=0.05) if use_thermal_constraint else None
+with cLOL:
+    lol_limit_pct = st.number_input("Perte de vie max (%)", min_value=0.0, value=0.50, step=0.05) if use_thermal_constraint else None
+
+st.caption(
+    "Base économique actuelle: politique âge sur Weibull. "
+    "Le nouveau pipeline fiabiliste sert de décision principale, et le Weibull reste la base de calcul de T_cost / T_R."
+)
+
+
+econ_enabled = (C_prev > 0) and (C_corr > 0)
+if not econ_enabled:
+    st.warning("Renseigne C_prev > 0 et C_corr > 0 pour activer T_cost.")
+
+if use_thermal_constraint and not auto_thermal_available and source_mode != "Fichier projet (.xlsx)":
+    st.info("Aucune donnée thermique liée au CSV simple. La contrainte thermique sera ignorée pour ces équipements.")
+
+
+# ------------------------------------------------------------------
+# Baseline Weibull pour l'optimisation coût / fiabilité
+# ------------------------------------------------------------------
+fits: dict[str, Any] = {}
+for eq in selected_eqs:
     x = df.loc[df["equipment_code"] == eq, "ttf_h"].values
     if len(x) >= 3:
         try:
@@ -149,52 +485,49 @@ for eq in eqs:
             pass
 
 if not fits:
-    st.error("Pas assez de TTF (≥3) pour estimer Weibull.")
+    st.error("Pas assez de TTF (≥3) pour estimer Weibull sur les équipements sélectionnés.")
     st.stop()
 
 
-# ==========================
-# 3) Paramètres utilisateur
-# ==========================
-st.markdown("### Paramètres de fiabilité et de coût")
+# ------------------------------------------------------------------
+# Nouveau pipeline par équipement
+# ------------------------------------------------------------------
+org_results: dict[str, dict[str, Any]] = {}
+detail_tables: dict[str, dict[str, pd.DataFrame]] = {}
 
-colR, colC1, colC2, colRmin = st.columns(4)
-with colR:
-    R_target = st.slider("Fiabilité cible R(t)", 0.50, 0.99, 0.80, 0.01)
-with colC1:
-    C_prev = st.number_input("Coût maintenance préventive (C_prev)", min_value=0.0, value=1.0, step=0.1)
-with colC2:
-    C_corr = st.number_input("Coût panne / corrective (C_corr)", min_value=0.0, value=5.0, step=0.5)
-with colRmin:
-    R_min_cost = st.slider("Fiabilité min. pour l’optimum coût", 0.0, 0.99, 0.70, 0.01)
+for eq in selected_eqs:
+    ttf_series = df.loc[df["equipment_code"] == eq, "ttf_h"].tolist()
+    rep_series = df.loc[df["equipment_code"] == eq, "duree_rep_h"].dropna().tolist()
 
-st.caption(
-    "Formule coût (politique âge) : "
-    "C(T) = (C_prev·R(T) + C_corr·(1−R(T))) / ∫₀ᵀ R(t)dt. "
-    "Le préventif est pondéré par R(T) (on ne paye pas si la panne survient avant T)."
-)
+    thermal_df = None
+    thermal_cfg = None
+    if source_mode == "Fichier projet (.xlsx)":
+        thermal_df = project_payload["thermal_map"].get(eq)
+        thermal_cfg = project_payload["thermal_cfg_map"].get(eq, {}) or None
 
-econ_enabled = (C_prev > 0) and (C_corr > 0)
-if not econ_enabled:
-    st.warning("Renseigne C_prev > 0 et C_corr > 0 pour activer l’optimisation économique (T_cost).")
-
-
-# ==========================
-# 4) Organigramme (par équipement)
-# ==========================
-org_results: dict[str, dict] = {}
-for eq in fits.keys():
-    ttf = df.loc[df["equipment_code"] == eq, "ttf_h"].tolist()
     try:
-        org_results[eq] = analyze_ttf_pipeline(ttf)
-    except Exception:
-        org_results[eq] = {}
+        pipe = analyze_ttf_pipeline(
+            ttf_series=ttf_series,
+            alpha=float(alpha),
+            repair_series=rep_series if rep_series else None,
+            thermal_df=thermal_df,
+            thermal_config=thermal_cfg,
+        )
+    except Exception as e:
+        pipe = {
+            "reliability": {"error": str(e), "model": "?", "distribution": "?", "params": {}, "goodness": {}, "tests": {}, "decision": {}, "indicators": {}, "candidates": {}},
+            "thermal": None,
+            "tables": {},
+        }
+
+    org_results[eq] = pipe
+    detail_tables[eq] = pipe.get("tables", {}) or {}
 
 
-# ==========================
-# 5) Intervalles coût + fiabilité
-# ==========================
-res_all = {}
+# ------------------------------------------------------------------
+# Intervalles coût + fiabilité
+# ------------------------------------------------------------------
+res_all: dict[str, dict[str, Any]] = {}
 if econ_enabled:
     res_all = propose_intervals_cost_and_reliability(
         fits=fits,
@@ -210,91 +543,117 @@ R_at_cost = {eq: (res_all.get(eq) or {}).get("R_at_T") for eq in fits.keys()}
 C_min_map = {eq: (res_all.get(eq) or {}).get("C_min") for eq in fits.keys()}
 
 
-# ==========================
-# 6) Recommandations
-# ==========================
-def recommend_maintenance(beta: float, model: str | None = None) -> str:
-    if beta < 0.9:
-        return "Corrective + fiabilisation (pannes de jeunesse)"
-    if 0.9 <= beta <= 1.1:
-        return "Conditionnelle / inspection (pannes aléatoires)"
-    if model and "NHPP" in str(model).upper():
-        return "Préventive planifiée (bloc/inspection) — vieillissement"
-    return "Préventive planifiée (âge) — usure / vieillissement"
-
-
-def recommend_interval(beta: float, T_cost: float | None, T_R: float | None) -> float | None:
-    if beta <= 1.1:
-        return None
-    vals = [v for v in [T_cost, T_R] if is_pos_number(v)]
-    return float(min(vals)) if vals else None
-
-
-# ==========================
-# 7) Tableau synthèse + CSV + PASSERELLE
-# ==========================
+# ------------------------------------------------------------------
+# Tableau synthèse + passerelle
+# ------------------------------------------------------------------
 rows = []
 for eq, ft in fits.items():
-    org = org_results.get(eq, {}) or {}
-    beta = float(getattr(ft, "beta", float("nan")))
-    eta = float(getattr(ft, "eta", float("nan")))
-    gamma = float(getattr(ft, "gamma", 0.0) or 0.0)
+    pipe = org_results.get(eq, {}) or {}
+    rel = pipe.get("reliability", {}) or {}
+    thermal = pipe.get("thermal")
+    indicators = rel.get("indicators", {}) or {}
+    decision = rel.get("decision", {}) or {}
+    params = rel.get("params", {}) or {}
 
-    itv_R = intervals_R.get(eq)
-    itv_C = intervals_cost.get(eq)
-    R_cost = R_at_cost.get(eq)
-    C_min = C_min_map.get(eq)
+    beta_weibull = float(getattr(ft, "beta", float("nan")))
+    eta_weibull = float(getattr(ft, "eta", float("nan")))
+    gamma_weibull = float(getattr(ft, "gamma", 0.0) or 0.0)
 
-    maint_type = recommend_maintenance(beta, org.get("model"))
-    T_rec = recommend_interval(beta, itv_C, itv_R)
+    t_r = intervals_R.get(eq)
+    t_cost = intervals_cost.get(eq)
+    r_cost = R_at_cost.get(eq)
+    c_min = C_min_map.get(eq)
 
-    rows.append({
-        "equipment_code": eq,
-        "beta": round(beta, 3) if np.isfinite(beta) else None,
-        "eta_h": round(eta, 1) if np.isfinite(eta) else None,
-        "gamma_h": round(gamma, 1) if np.isfinite(gamma) else 0.0,
+    thermal_ok, thermal_status, faa_max, lol_pct = _thermal_status_label(
+        thermal,
+        faa_limit if use_thermal_constraint else None,
+        lol_limit_pct if use_thermal_constraint else None,
+    )
 
-        "T_cost_h": round(float(itv_C), 1) if is_pos_number(itv_C) else None,
-        "R(T_cost)": round(float(R_cost), 3) if is_pos_number(R_cost) else None,
-        "C_min_per_h": round(float(C_min), 4) if is_pos_number(C_min) else None,
+    model = rel.get("model")
+    distribution = rel.get("distribution")
 
-        "T_R_h": round(float(itv_R), 1) if is_pos_number(itv_R) else None,
+    # paramètres issus du pipeline si disponibles
+    beta_pipe = params.get("beta")
+    eta_pipe = params.get("eta")
+    gamma_pipe = params.get("gamma")
 
-        "T_recommended_h": round(float(T_rec), 1) if is_pos_number(T_rec) else None,
-        "maintenance_type": maint_type,
+    beta_for_policy = beta_pipe if _is_pos_number(beta_pipe) else beta_weibull
+    maintenance_type = _recommend_maintenance(beta_for_policy, model, thermal_status)
+    t_rec = _recommend_interval(beta_for_policy, model, t_cost, t_r)
 
-        "model": org.get("model", "?"),
-        "distribution": org.get("distribution", "?"),
-    })
+    reliability_ok = None
+    if _is_pos_number(t_cost) and _is_pos_number(r_cost):
+        reliability_ok = float(r_cost) >= float(R_min_cost)
+    elif _is_pos_number(t_r):
+        reliability_ok = True
+
+    admissible_global = None
+    checks = []
+    if reliability_ok is not None:
+        checks.append(bool(reliability_ok))
+    if thermal_ok is not None:
+        checks.append(bool(thermal_ok))
+    if checks:
+        admissible_global = all(checks)
+
+    rows.append(
+        {
+            "equipment_code": eq,
+            "process_model": model,
+            "distribution": distribution,
+            "decision_reason": decision.get("reason"),
+            "beta_opt": round(beta_weibull, 3) if np.isfinite(beta_weibull) else None,
+            "eta_opt_h": round(eta_weibull, 1) if np.isfinite(eta_weibull) else None,
+            "gamma_opt_h": round(gamma_weibull, 1) if np.isfinite(gamma_weibull) else 0.0,
+            "beta_pipe": round(float(beta_pipe), 3) if _is_pos_number(beta_pipe) else None,
+            "eta_pipe_h": round(float(eta_pipe), 1) if _is_pos_number(eta_pipe) else None,
+            "gamma_pipe_h": round(float(gamma_pipe), 1) if gamma_pipe is not None and np.isfinite(float(gamma_pipe)) else None,
+            "MTBF_h": round(float(indicators.get("mtbf_h")), 2) if _is_pos_number(indicators.get("mtbf_h")) else None,
+            "MTTR_h": round(float(indicators.get("mttr_h")), 2) if _is_pos_number(indicators.get("mttr_h")) else None,
+            "availability": round(float(indicators.get("availability_intrinsic")), 4) if indicators.get("availability_intrinsic") is not None else None,
+            "T_cost_h": round(float(t_cost), 1) if _is_pos_number(t_cost) else None,
+            "R(T_cost)": round(float(r_cost), 3) if _is_pos_number(r_cost) else None,
+            "C_min_per_h": round(float(c_min), 4) if _is_pos_number(c_min) else None,
+            "T_R_h": round(float(t_r), 1) if _is_pos_number(t_r) else None,
+            "T_recommended_h": round(float(t_rec), 1) if _is_pos_number(t_rec) else None,
+            "FAA_max": round(float(faa_max), 4) if faa_max is not None else None,
+            "loss_of_life_pct": round(float(lol_pct), 4) if lol_pct is not None else None,
+            "thermal_status": thermal_status,
+            "thermal_ok": thermal_ok,
+            "reliability_ok": reliability_ok,
+            "admissible_global": admissible_global,
+            "maintenance_type": maintenance_type,
+        }
+    )
 
 df_out = pd.DataFrame(rows).sort_values("equipment_code").reset_index(drop=True)
+
 st.session_state["optimization_df"] = df_out.copy()
 st.session_state["optimization_src"] = "optimisation_page"
-
-# ✅ Passerelle : ENVOI AUTO vers Maintenance (session), sans bouton
 opt_hash = _df_hash(df_out)
 st.session_state["opt_df_out"] = df_out.copy()
 st.session_state["opt_meta"] = {"hash": opt_hash, "rows": int(len(df_out)), "source": "optimisation_page"}
 
+
+# ------------------------------------------------------------------
+# Restitution
+# ------------------------------------------------------------------
 st.divider()
-st.subheader("🧩 Passerelle → Maintenance (SANS BD)")
+st.subheader("🧩 Passerelle → Maintenance")
 st.success(f"Planning envoyé automatiquement ✅ | rows={len(df_out)} | hash={opt_hash}")
 
-# fallback fichier (on garde ton bouton)
-DATA_DIR = BASE_DIR / "data"
-DATA_DIR.mkdir(exist_ok=True, parents=True)
 FALLBACK_OPT = DATA_DIR / "last_optimization.csv"
-
 if st.button("💾 Sauver aussi en fichier (fallback Streamlit Cloud)", use_container_width=True):
     df_out.to_csv(FALLBACK_OPT, index=False, encoding="utf-8")
     st.success(f"Écrit: {FALLBACK_OPT}")
 
 st.caption(
-    "Astuce Streamlit Cloud : la session peut disparaître après redémarrage. "
-    "Le fichier `data/last_optimization.csv` sert de fallback."
+    "La session peut disparaître après redémarrage sur Streamlit Cloud. "
+    "Le fichier data/last_optimization.csv sert de fallback."
 )
 
-st.subheader("📋 Synthèse optimisation (coût, fiabilité, recommandation)")
+st.subheader("📋 Synthèse optimisation")
 st.dataframe(df_out, use_container_width=True, hide_index=True)
 
 csv_bytes = df_out.to_csv(index=False).encode("utf-8")
@@ -306,26 +665,37 @@ st.download_button(
     use_container_width=True,
 )
 
+xlsx_bytes = _build_excel_export(df_out, detail_tables)
+st.download_button(
+    "⬇️ Télécharger Excel optimisation + détails",
+    data=xlsx_bytes,
+    file_name="optimisation_intervalles_detail.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    use_container_width=True,
+)
 
-# ==========================
-# 8) Courbes R(t) (Weibull)
-# ==========================
-st.subheader("📈 Courbes R(t) (Weibull)")
+
+# ------------------------------------------------------------------
+# Courbes R(t) de référence économique (Weibull)
+# ------------------------------------------------------------------
+st.subheader("📈 Courbes R(t) — référence économique")
+st.caption(
+    "Ces courbes restent basées sur Weibull car le module économique T_cost / T_R utilise actuellement cette base. "
+    "Le processus retenu par l’organigramme reste affiché séparément dans les tableaux et le détail."
+)
 
 etas = [float(getattr(ft, "eta", 1.0) or 1.0) for ft in fits.values()]
 tmax = max(etas) * 1.6 if etas else 1000.0
-
 maybe_itv = []
 for eq in fits.keys():
-    if is_pos_number(intervals_R.get(eq)):
+    if _is_pos_number(intervals_R.get(eq)):
         maybe_itv.append(float(intervals_R[eq]))
-    if is_pos_number(intervals_cost.get(eq)):
+    if _is_pos_number(intervals_cost.get(eq)):
         maybe_itv.append(float(intervals_cost[eq]))
 if maybe_itv:
     tmax = max(tmax, max(maybe_itv) * 1.2)
 
 t = np.linspace(0, max(tmax, 1.0), 350)
-
 fig, ax = plt.subplots()
 for eq, ft in fits.items():
     beta = float(getattr(ft, "beta", 1.0))
@@ -335,9 +705,10 @@ for eq, ft in fits.items():
     y = np.ones_like(t, dtype=float)
     mask = t > gamma
     y[mask] = np.exp(-(((t[mask] - gamma) / max(eta, 1e-9)) ** max(beta, 1e-9)))
-    ax.plot(t, y, linewidth=2, label=f"{eq} (β={beta:.2f}, η={eta:.1f}, γ={gamma:.1f})")
+    proc = ((org_results.get(eq, {}) or {}).get("reliability", {}) or {}).get("model", "?")
+    ax.plot(t, y, linewidth=2, label=f"{eq} | {proc} | β={beta:.2f}, η={eta:.1f}")
 
-ax.grid(True, alpha=.3)
+ax.grid(True, alpha=0.3)
 ax.set_xlabel("Temps (h)")
 ax.set_ylabel("R(t)")
 ax.set_title("Fiabilité R(t)")
@@ -345,69 +716,126 @@ ax.legend(fontsize=8)
 st.pyplot(fig, clear_figure=True)
 
 
-# ==========================
-# 9) Détails & interprétation
-# ==========================
-st.subheader("🔎 Détails & interprétation")
-
+# ------------------------------------------------------------------
+# Détails par équipement
+# ------------------------------------------------------------------
+st.subheader("🔎 Détails et tableaux du pipeline")
 sel_eq = st.selectbox("Équipement", options=df_out["equipment_code"].tolist())
 row = df_out[df_out["equipment_code"] == sel_eq].iloc[0].to_dict()
-ft = fits[sel_eq]
-org = (org_results.get(sel_eq, {}) or {})
-
-beta = float(getattr(ft, "beta", float("nan")))
-eta = float(getattr(ft, "eta", float("nan")))
-gamma = float(getattr(ft, "gamma", 0.0) or 0.0)
-
-itv_R = intervals_R.get(sel_eq)
-itv_C = intervals_cost.get(sel_eq)
-R_cost = R_at_cost.get(sel_eq)
-C_min = C_min_map.get(sel_eq)
+pipe = org_results.get(sel_eq, {}) or {}
+rel = pipe.get("reliability", {}) or {}
+thermal = pipe.get("thermal")
+tables = pipe.get("tables", {}) or {}
 
 st.markdown(
     f"### Résultats — **{sel_eq}**\n"
-    f"- **β (forme)** = **{fnum(beta,3)}**\n"
-    f"- **η (échelle)** = **{fnum(eta,1)} h**\n"
-    f"- **γ (décalage)** = **{fnum(gamma,1)} h**\n"
-    f"- **T_cost** = **{fnum(itv_C,1)} h**\n"
-    f"- **R(T_cost)** = **{fnum(R_cost,3)}**\n"
-    f"- **C_min** = **{fnum(C_min,4)} /h**\n"
-    f"- **T_R** = **{fnum(itv_R,1)} h** (R_target={R_target:.2f})\n"
-    f"- **Maintenance recommandée** : **{row.get('maintenance_type','—')}**\n"
+    f"- **Processus retenu** : **{row.get('process_model', '—')}**\n"
+    f"- **Distribution retenue** : **{row.get('distribution', '—')}**\n"
+    f"- **T_cost** = **{_fnum(row.get('T_cost_h'), 1)} h**\n"
+    f"- **T_R** = **{_fnum(row.get('T_R_h'), 1)} h**\n"
+    f"- **T recommandé** = **{_fnum(row.get('T_recommended_h'), 1)} h**\n"
+    f"- **Maintenance recommandée** : **{row.get('maintenance_type', '—')}**\n"
+    f"- **Statut thermique** : **{row.get('thermal_status', '—')}**\n"
 )
 
-if is_pos_number(row.get("T_recommended_h")):
-    st.markdown(f"- **Intervalle recommandé** : **{row['T_recommended_h']:.1f} h**")
-else:
-    st.markdown("- **Intervalle recommandé** : basé sur l’état/inspection (pas de périodicité stricte)")
+if row.get("decision_reason"):
+    st.caption(str(row["decision_reason"]))
 
-st.caption(
-    "Note: T_cost est économique, T_R est orienté fiabilité. "
-    "Sur un équipement critique, on privilégie souvent T_R."
-)
-
-st.write(f"Modèle global (organigramme): **{org.get('model','?')}** • Distribution: **{org.get('distribution','?')}**")
-
-st.markdown("#### Actions suggérées (selon β)")
-for a in suggested_actions(beta if np.isfinite(beta) else 1.0):
+st.markdown("#### Actions suggérées")
+for a in suggested_actions(float(row["beta_opt"]) if _is_pos_number(row.get("beta_opt")) else 1.0):
     st.markdown(f"- {a}")
 
 
-# ==========================
-# 10) Export PDF + Download
-# ==========================
+tab_a, tab_b, tab_c = st.tabs(["Fiabilité", "Thermique", "Tableaux exportables"])
+
+with tab_a:
+    if rel.get("error"):
+        st.error(rel["error"])
+    else:
+        if "reliability_summary" in tables:
+            st.markdown("##### Synthèse fiabiliste")
+            st.dataframe(tables["reliability_summary"], use_container_width=True, hide_index=True)
+        if "process_choice" in tables:
+            st.markdown("##### Choix du processus")
+            st.dataframe(tables["process_choice"], use_container_width=True, hide_index=True)
+        if "trend_results" in tables:
+            st.markdown("##### Tests de tendance")
+            st.dataframe(tables["trend_results"], use_container_width=True, hide_index=True)
+        if "dependence_results" in tables:
+            st.markdown("##### Tests de dépendance")
+            st.dataframe(tables["dependence_results"], use_container_width=True, hide_index=True)
+        if "fit_candidates" in tables and not tables["fit_candidates"].empty:
+            st.markdown("##### Candidats et ajustements")
+            st.dataframe(tables["fit_candidates"], use_container_width=True, hide_index=True)
+
+with tab_b:
+    if thermal is None:
+        st.info("Pas de données thermiques disponibles pour cet équipement.")
+    else:
+        if "thermal_summary" in tables:
+            st.markdown("##### Synthèse thermique")
+            st.dataframe(tables["thermal_summary"], use_container_width=True, hide_index=True)
+        if "thermal_table_indicators" in tables:
+            st.markdown("##### Indicateurs thermiques")
+            st.dataframe(tables["thermal_table_indicators"], use_container_width=True, hide_index=True)
+        if "thermal_top5_days" in tables:
+            st.markdown("##### Top 5 jours critiques")
+            st.dataframe(tables["thermal_top5_days"], use_container_width=True, hide_index=True)
+
+        ts = thermal.get("timeseries")
+        if isinstance(ts, pd.DataFrame) and not ts.empty:
+            c1, c2 = st.columns(2)
+            with c1:
+                fig1, ax1 = plt.subplots()
+                ax1.plot(ts["timestamp"], ts["theta_HS_est_C"])
+                ax1.set_title("Température point chaud estimée")
+                ax1.set_xlabel("Temps")
+                ax1.set_ylabel("°C")
+                ax1.grid(True, alpha=0.3)
+                st.pyplot(fig1, clear_figure=True)
+            with c2:
+                fig2, ax2 = plt.subplots()
+                ax2.plot(ts["timestamp"], ts["FAA"])
+                ax2.set_title("Facteur d’accélération du vieillissement")
+                ax2.set_xlabel("Temps")
+                ax2.set_ylabel("FAA")
+                ax2.grid(True, alpha=0.3)
+                st.pyplot(fig2, clear_figure=True)
+
+with tab_c:
+    for key in [
+        "trend_results",
+        "dependence_results",
+        "process_choice",
+        "fit_candidates",
+        "reliability_summary",
+        "thermal_table_dataset",
+        "thermal_table_params",
+        "thermal_table_indicators",
+        "thermal_summary",
+        "thermal_daily",
+        "thermal_top5_days",
+    ]:
+        df_table = tables.get(key)
+        if isinstance(df_table, pd.DataFrame) and not df_table.empty:
+            st.markdown(f"##### {key}")
+            st.dataframe(df_table, use_container_width=True, hide_index=True)
+
+
+# ------------------------------------------------------------------
+# Export PDF + Download
+# ------------------------------------------------------------------
 st.divider()
 st.subheader("📄 Rapport PDF — Optimisation")
 
 if export_optimization_report_pdf is None:
-    st.info("Module `core.reliability.reporting_optimize` non détecté.")
+    st.info("Module core.reliability.reporting_optimize non détecté ou non compatible.")
     if _pdf_import_error is not None:
         st.caption(f"Détail import: {_pdf_import_error}")
 else:
     if st.button("📄 Générer rapport optimisation (PDF)"):
         try:
             out_dir = str(BASE_DIR / "reports")
-
             intervals = {}
             for eq in fits.keys():
                 intervals[eq] = {
@@ -417,11 +845,16 @@ else:
                     "C_min": C_min_map.get(eq),
                 }
 
+            org_results_compat = {
+                eq: (org_results.get(eq, {}) or {}).get("reliability", {})
+                for eq in org_results.keys()
+            }
+
             path = export_optimization_report_pdf(
                 df,
                 fits,
                 intervals,
-                org_results,
+                org_results_compat,
                 out_dir=out_dir,
             )
 

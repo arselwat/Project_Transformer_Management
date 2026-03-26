@@ -1,19 +1,18 @@
-# core/reliability/reporting_optimize.py
 from __future__ import annotations
 
 from io import BytesIO
 from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, Optional, List
-import math
 
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+
 # ------------------------------------------------------------
-# ReportLab (recommandé)
+# ReportLab
 # ------------------------------------------------------------
 try:
     from reportlab.lib.pagesizes import A4
@@ -32,11 +31,12 @@ try:
     HAVE_REPORTLAB = True
 except Exception:
     HAVE_REPORTLAB = False
+
+
 # ------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------
 def _san(s: Any) -> str:
-    """Sanitize texte (évite certaines typos qui cassent certains PDF)."""
     s = "" if s is None else str(s)
     return (
         s.replace("’", "'")
@@ -46,6 +46,8 @@ def _san(s: Any) -> str:
         .replace("—", "-")
         .replace("\u00A0", " ")
     )
+
+
 def _safe_float(x: Any) -> Optional[float]:
     try:
         v = float(x)
@@ -54,22 +56,24 @@ def _safe_float(x: Any) -> Optional[float]:
         return v
     except Exception:
         return None
+
+
 def _fmt(x: Any, nd: int = 2, dash: str = "—") -> str:
     v = _safe_float(x)
     if v is None:
         return dash
     return f"{v:.{nd}f}"
+
+
 def _require_reportlab():
     if not HAVE_REPORTLAB:
         raise RuntimeError(
             "ReportLab n’est pas disponible. Ajoute `reportlab` dans requirements.txt "
-            "ou installe-le: pip install reportlab. Ensuite relance l’application."
+            "ou installe-le, puis relance l’application."
         )
+
+
 def _plot_R_curves_png(fits: Dict[str, Any], out_png: Path) -> Optional[str]:
-    """
-    Courbes R(t).
-    Supporte Weibull 2p et 3p (si gamma existe).
-    """
     if not fits:
         return None
 
@@ -88,7 +92,6 @@ def _plot_R_curves_png(fits: Dict[str, Any], out_png: Path) -> Optional[str]:
         y = np.ones_like(t, dtype=float)
         mask = t > gamma
         y[mask] = np.exp(-(((t[mask] - gamma) / max(eta, 1e-12)) ** beta))
-
         plt.plot(t, y, linewidth=2, label=f"{eq} (β={beta:.2f}, η={eta:.1f}, γ={gamma:.1f})")
 
     plt.grid(True, alpha=0.3)
@@ -110,27 +113,19 @@ def _mk_table(
     font_size: int = 8,
     repeat_header: bool = True,
 ) -> "Table":
-    """
-    Table robuste:
-    - wrap automatique via Paragraph
-    - scale automatique si la somme des colWidths dépasse la largeur dispo (A4)
-    - repeatRows=1 pour répéter l'entête sur pages suivantes
-    """
     styles = getSampleStyleSheet()
     cell_style = styles["BodyText"]
     cell_style.fontName = "Helvetica"
     cell_style.fontSize = font_size
     cell_style.leading = font_size + 2
 
-    # largeur dispo: A4 - marges (doit correspondre à celles du doc)
     if avail_width is None:
         avail_width = A4[0] - (14 * mm + 14 * mm)
 
     wrapped: List[List[Any]] = []
-    for r_i, row in enumerate(data):
+    for row in data:
         new_row = []
         for c in row:
-            # si déjà un flowable (Image/Table/Paragraph), on garde
             if hasattr(c, "wrapOn"):
                 new_row.append(c)
             else:
@@ -141,7 +136,6 @@ def _mk_table(
     col_widths = [avail_width / max(ncol, 1)] * ncol
 
     tbl = Table(wrapped, colWidths=col_widths, repeatRows=1 if repeat_header else 0)
-
     tbl.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#96AEE4")),
         ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
@@ -168,18 +162,26 @@ def _maintenance_type(beta: float) -> str:
         return "Corrective + fiabilisation (jeunesse)"
     if beta <= 1.1:
         return "Conditionnelle / inspection (aléatoire)"
-    return "Préventive planifiée (âge) (usure)"
+    return "Préventive planifiée (usure)"
 
 
 def _pipe_line(pipe: dict) -> str:
+    """
+    Supporte soit :
+    - ancien format direct : {"model", "distribution", "goodness", "tests"}
+    - nouveau format complet : {"reliability": {...}, "thermal": ..., "tables": ...}
+    """
     if not isinstance(pipe, dict) or not pipe:
         return "Trace indisponible."
-    model = pipe.get("model", "RP")
-    dist = pipe.get("distribution", "weibull_2p")
-    good = pipe.get("goodness", {}) or {}
-    tests = pipe.get("tests", {}) or {}
+
+    rel = pipe.get("reliability", pipe)
+    model = rel.get("model", "RP")
+    dist = rel.get("distribution", "weibull_2p")
+    good = rel.get("goodness", {}) or {}
+    tests = rel.get("tests", {}) or {}
     mk = tests.get("trend_mk", {}) or {}
     dep = tests.get("dependence", {}) or {}
+
     return (
         f"TTF>0 → MK(p={_fmt(mk.get('p'),3)}, dir={mk.get('direction','none')}) "
         f"→ Dep(r={_fmt(dep.get('r'),3)}, p={_fmt(dep.get('p'),3)}) "
@@ -194,31 +196,30 @@ def _build_synthesis_table(
     organigram_by_eq: Optional[Dict[str, Any]] = None,
     df_out: Optional[Any] = None,
 ) -> List[List[Any]]:
-    """
-    Table synthèse.
-    - Si df_out fourni => on l'utilise directement (meilleur)
-    - Sinon fallback sur fits + intervals dict
-    intervals peut être:
-      - dict[eq] = {"T_R":..., "T_cost":..., "R_at_T":..., "C_min":..., ...}
-      - ou dict[eq] = valeur T_R (ancien format)
-    """
     intervals = intervals or {}
     organigram_by_eq = organigram_by_eq or {}
 
     if df_out is not None:
         cols_pref = [
             "equipment_code",
-            "beta",
-            "eta_h",
-            "gamma_h",
+            "process_model",
+            "distribution",
+            "beta_opt",
+            "eta_opt_h",
+            "gamma_opt_h",
+            "beta_pipe",
+            "eta_pipe_h",
+            "gamma_pipe_h",
             "T_cost_h",
             "R(T_cost)",
             "C_min_per_h",
             "T_R_h",
             "T_recommended_h",
+            "FAA_max",
+            "loss_of_life_pct",
+            "thermal_status",
+            "admissible_global",
             "maintenance_type",
-            "model",
-            "distribution",
         ]
         cols = [c for c in cols_pref if c in getattr(df_out, "columns", [])]
         data: List[List[Any]] = [cols]
@@ -226,9 +227,8 @@ def _build_synthesis_table(
             row = []
             for c in cols:
                 v = r.get(c, "")
-                # format cohérent
                 if isinstance(v, (int, float)) and np.isfinite(float(v)):
-                    if c in ("beta", "R(T_cost)"):
+                    if c in ("beta_opt", "beta_pipe", "R(T_cost)", "FAA_max", "loss_of_life_pct"):
                         row.append(_fmt(v, 3))
                     elif c.endswith("_h") or "eta" in c or "gamma" in c:
                         row.append(_fmt(v, 1))
@@ -241,7 +241,6 @@ def _build_synthesis_table(
             data.append(row)
         return data
 
-    # fallback
     head = ["Équipement", "β", "η(h)", "γ(h)", "T_R(h)", "T_cost(h)", "R(T_cost)", "C_min(/h)", "Type", "Modèle", "Loi"]
     data = [head]
 
@@ -251,27 +250,21 @@ def _build_synthesis_table(
         gamma = _safe_float(getattr(ft, "gamma", 0.0)) or 0.0
 
         itv = intervals.get(eq)
-        # ancien format => itv est une valeur
-        if isinstance(itv, (int, float)):
-            T_R = itv
-            T_cost = None
-            R_at_T = None
-            C_min = None
-        # nouveau format => itv est dict
-        elif isinstance(itv, dict):
+        if isinstance(itv, dict):
             T_R = itv.get("T_R")
             T_cost = itv.get("T_cost")
             R_at_T = itv.get("R_at_T")
             C_min = itv.get("C_min")
         else:
-            T_R = None
+            T_R = itv if isinstance(itv, (int, float)) else None
             T_cost = None
             R_at_T = None
             C_min = None
 
         og = organigram_by_eq.get(eq, {}) or {}
-        model = og.get("model", "?")
-        loi = og.get("distribution", "?")
+        rel = og.get("reliability", og)
+        model = rel.get("model", "?")
+        loi = rel.get("distribution", "?")
 
         data.append([
             _san(eq),
@@ -291,7 +284,7 @@ def _build_synthesis_table(
 
 
 # ------------------------------------------------------------
-# API 1 : Export PDF en mémoire (Streamlit download_button)
+# API 1 : PDF en mémoire
 # ------------------------------------------------------------
 def export_optimization_report_pdf_bytes(
     *,
@@ -300,21 +293,16 @@ def export_optimization_report_pdf_bytes(
     fits: Dict[str, Any] | None = None,
     intervals: Dict[str, Any] | None = None,
     organigram_by_eq: Dict[str, Any] | None = None,
+    detail_tables_by_eq: Optional[Dict[str, Dict[str, Any]]] = None,
     meta: Optional[Dict[str, Any]] = None,
-    title: str = "Rapport d’analyse & optimisation de maintenance",
+    title: str = "Rapport d’analyse et optimisation de maintenance",
 ) -> bytes:
-    """
-    Génère un PDF en mémoire.
-    - df : données brutes (equipment_code, ttf_h)
-    - df_out : dataframe synthèse UI (recommandé)
-    - fits / intervals / organigram_by_eq : fallback si df_out non fourni
-    - meta : paramètres (R_target, C_prev, C_corr, R_min_cost, etc.)
-    """
     _require_reportlab()
 
     fits = fits or {}
     intervals = intervals or {}
     organigram_by_eq = organigram_by_eq or {}
+    detail_tables_by_eq = detail_tables_by_eq or {}
     meta = meta or {}
 
     styles = getSampleStyleSheet()
@@ -333,12 +321,11 @@ def export_optimization_report_pdf_bytes(
 
     story: List[Any] = []
 
-    # --- Couverture
+    # Couverture
     story.append(Paragraph(_san(title), styles["Title"]))
     story.append(Paragraph(_san(f"Généré le {datetime.now().strftime('%d/%m/%Y %H:%M')}"), styles["Normal"]))
     story.append(Spacer(1, 10))
 
-    # --- Résumé
     nb_obs = int(getattr(df, "shape", [0])[0]) if df is not None else 0
     nb_eq = int(getattr(df_out, "shape", [0])[0]) if df_out is not None else len(fits)
 
@@ -347,45 +334,33 @@ def export_optimization_report_pdf_bytes(
     story.append(Paragraph(_san(f"- Nombre d’observations TTF : {nb_obs}"), styles["Normal"]))
     story.append(Spacer(1, 8))
 
-    # --- Paramètres d'optimisation (meta)
     if meta:
         story.append(Paragraph("Paramètres d’optimisation", styles["Heading2"]))
-        lines = []
-        if "R_target" in meta:
-            lines.append(f"- Fiabilité cible R_target : {meta.get('R_target')}")
-        if "C_prev" in meta:
-            lines.append(f"- Coût préventif C_prev : {meta.get('C_prev')}")
-        if "C_corr" in meta:
-            lines.append(f"- Coût correctif C_corr : {meta.get('C_corr')}")
-        if "R_min_cost" in meta:
-            lines.append(f"- Fiabilité minimale pour l’optimum coût R_min_cost : {meta.get('R_min_cost')}")
-        if lines:
-            for l in lines:
-                story.append(Paragraph(_san(l), styles["Normal"]))
-            story.append(Spacer(1, 8))
+        for k in ["R_target", "C_prev", "C_corr", "R_min_cost", "faa_limit", "lol_limit_pct"]:
+            if k in meta:
+                story.append(Paragraph(_san(f"- {k} : {meta.get(k)}"), styles["Normal"]))
+        story.append(Spacer(1, 8))
 
     story.append(Paragraph(
         _san(
-            "Rappel Weibull : β<1 (jeunesse), β≈1 (aléatoire), β>1 (usure). "
-            "T_cost est orienté économie, T_R est orienté fiabilité. "
-            "Sur un équipement critique, on privilégie souvent T_R ou on impose un R_min élevé."
+            "Lecture : le module économique T_cost / T_R repose sur Weibull, tandis que le processus retenu "
+            "par l’organigramme (RP / NHPP / BPP) est donné à titre décisionnel. "
+            "Les contraintes thermiques (FAA, perte de vie) permettent d’écarter les plans non admissibles."
         ),
         styles["Normal"]
     ))
     story.append(Spacer(1, 12))
 
-    # --- Synthèse
-    story.append(Paragraph("Synthèse paramètres & intervalles", styles["Heading2"]))
+    story.append(Paragraph("Synthèse paramètres, intervalles et thermique", styles["Heading2"]))
     data = _build_synthesis_table(
         fits=fits,
         intervals=intervals,
         organigram_by_eq=organigram_by_eq,
         df_out=df_out,
     )
-    story.append(_mk_table(data, font_size=7))  # 7 => plus compact pour éviter dépassement A4
+    story.append(_mk_table(data, font_size=7))
     story.append(Spacer(1, 12))
 
-    # --- Courbes
     if fits:
         tmp_png = Path("reports") / f"rt_curves_tmp_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
         png = _plot_R_curves_png(fits, tmp_png)
@@ -394,22 +369,22 @@ def export_optimization_report_pdf_bytes(
             story.append(Image(png, width=170 * mm, height=95 * mm))
             story.append(Spacer(1, 12))
 
-    # --- Détails par équipement (optimisation)
     story.append(PageBreak())
-    story.append(Paragraph("Détails — Optimisation par équipement", styles["Heading2"]))
+    story.append(Paragraph("Détails par équipement", styles["Heading2"]))
     story.append(Spacer(1, 8))
 
-    eqs = list(fits.keys())
+    eqs = list(fits.keys()) if fits else list(organigram_by_eq.keys())
     for eq in eqs:
         ft = fits.get(eq)
-        og = (organigram_by_eq.get(eq, {}) or {})
+        og = organigram_by_eq.get(eq, {}) or {}
+        rel = og.get("reliability", og)
+        tables = detail_tables_by_eq.get(eq, {}) or {}
         itv = intervals.get(eq)
 
-        beta = _safe_float(getattr(ft, "beta", None))
-        eta = _safe_float(getattr(ft, "eta", None))
-        gamma = _safe_float(getattr(ft, "gamma", 0.0)) or 0.0
+        beta = _safe_float(getattr(ft, "beta", None)) if ft is not None else None
+        eta = _safe_float(getattr(ft, "eta", None)) if ft is not None else None
+        gamma = _safe_float(getattr(ft, "gamma", 0.0)) or 0.0 if ft is not None else 0.0
 
-        # lecture intervalle (nouveau format dict / ancien float)
         if isinstance(itv, dict):
             T_R = itv.get("T_R")
             T_cost = itv.get("T_cost")
@@ -422,8 +397,9 @@ def export_optimization_report_pdf_bytes(
             C_min = None
 
         story.append(Paragraph(_san(f"{eq}"), styles["Heading3"]))
-        story.append(Paragraph(_san(f"Paramètres Weibull : β={_fmt(beta,3)} ; η={_fmt(eta,1)} h ; γ={_fmt(gamma,1)} h"), styles["Normal"]))
-        story.append(Paragraph(_san(f"Type maintenance (β) : {_maintenance_type(beta if beta is not None else float('nan'))}"), styles["Normal"]))
+        if beta is not None and eta is not None:
+            story.append(Paragraph(_san(f"Weibull : β={_fmt(beta,3)} ; η={_fmt(eta,1)} h ; γ={_fmt(gamma,1)} h"), styles["Normal"]))
+        story.append(Paragraph(_san(f"Processus retenu : {rel.get('model', '?')} ; Loi : {rel.get('distribution', '?')}"), styles["Normal"]))
         story.append(Spacer(1, 4))
 
         opt_lines = [
@@ -432,23 +408,28 @@ def export_optimization_report_pdf_bytes(
             ["T_cost (optimum économique)", _fmt(T_cost, 1)],
             ["R(T_cost)", _fmt(R_at_T, 3)],
             ["C_min (/h)", _fmt(C_min, 4)],
-            ["Modèle (organigramme)", _san(og.get("model", "?"))],
-            ["Loi (organigramme)", _san(og.get("distribution", "?"))],
         ]
         story.append(_mk_table(opt_lines, font_size=8))
         story.append(Spacer(1, 6))
 
-        # Trace organigramme (format de analyze_ttf_pipeline)
         story.append(Paragraph(_san("Trace organigramme"), styles["Heading4"]))
         story.append(Paragraph(_san(_pipe_line(og)), styles["Normal"]))
-        story.append(Spacer(1, 10))
+        story.append(Spacer(1, 6))
+
+        thermal_summary = tables.get("thermal_summary")
+        if hasattr(thermal_summary, "empty") and not thermal_summary.empty:
+            story.append(Paragraph("Synthèse thermique", styles["Heading4"]))
+            head = list(thermal_summary.columns)
+            data_t = [head] + thermal_summary.astype(str).values.tolist()
+            story.append(_mk_table(data_t, font_size=7))
+            story.append(Spacer(1, 8))
 
     doc.build(story)
     return buff.getvalue()
 
 
 # ------------------------------------------------------------
-# API 2 : Export PDF sur disque (compatibilité existante)
+# API 2 : Export sur disque
 # ------------------------------------------------------------
 def export_optimization_report_pdf(
     df,
@@ -458,18 +439,10 @@ def export_optimization_report_pdf(
     out_dir: str = "reports",
     df_out=None,
     meta: Optional[Dict[str, Any]] = None,
-    title: str = "Rapport d’analyse & optimisation de maintenance",
-    # alias acceptés (au cas où)
+    title: str = "Rapport d’analyse et optimisation de maintenance",
     org_results: Optional[Dict[str, Any]] = None,
+    detail_tables_by_eq: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> str:
-    """
-    Écrit le PDF sur disque et retourne un chemin.
-
-    ✅ Signature compatible avec ton appel Streamlit :
-      export_optimization_report_pdf(df, fits, intervals, organigram_by_eq, out_dir="reports")
-
-    ✅ Et accepte aussi org_results=... en alias (si besoin).
-    """
     _require_reportlab()
 
     if organigram_by_eq is None and org_results is not None:
@@ -486,6 +459,7 @@ def export_optimization_report_pdf(
         fits=fits,
         intervals=intervals,
         organigram_by_eq=organigram_by_eq,
+        detail_tables_by_eq=detail_tables_by_eq,
         meta=meta,
         title=title,
     )

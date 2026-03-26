@@ -3,27 +3,40 @@ from __future__ import annotations
 """
 core/reliability/organigram.py
 
-Pipeline fiabiliste + thermo-fiabiliste inspiré de l'organigramme :
-- Test de tendance (graphique/diagnostic + Mann-Kendall + Laplace + indicateur MIL-HDBK-189)
-- Test de dépendance lag-1
-- Choix du processus : RP / NHPP / BPP
-- Ajustement selon la branche :
-    * RP   -> lois iid candidates (expon, norm, lognorm, weibull_2p, weibull_3p)
-    * NHPP -> Power Law Process / Crow-AMSAA
-    * BPP  -> approximation branchement de Poisson par Hawkes exponentiel
-- Validation statistique : AIC + KS + Chi² + Cramér-von Mises
-- Extension thermique : point chaud, FAA, perte de vie cumulée
+Pipeline fiabiliste + thermo-fiabiliste réorganisé pour le logiciel.
 
-NOTE:
-- La branche NHPP est implémentée via Crow-AMSAA (power law NHPP), cohérente
-  avec la logique "loi de puissance" de l'organigramme.
-- La branche BPP est approchée par un processus de type Hawkes exponentiel
-  (auto-excitant), qui est un proxy pratique d'un processus de branchement.
+Ce module couvre 3 blocs :
+1) Fiabilité :
+   - Tests de tendance : Mann-Kendall, Laplace, indicateur MIL-HDBK-189
+   - Test de dépendance : Pearson + Spearman
+   - Choix du processus : RP / NHPP / BPP
+   - Ajustement :
+       * RP   -> lois iid candidates (expon, norm, lognorm, weibull_2p, weibull_3p)
+       * NHPP -> Power Law Process / Crow-AMSAA
+       * BPP  -> approximation Hawkes exponentiel
+   - Validation : AIC + KS + Chi² + Cramér-von Mises
+   - Indicateurs : MTTF / MTBF / MTTR / disponibilité intrinsèque
+
+2) Thermique :
+   - Modèle dynamique 1er ordre
+   - Température top-oil, point chaud, FAA, perte de vie
+   - Résumés journaliers et top jours critiques
+
+3) Restitution :
+   - Tableaux prêts pour Streamlit / PDF
+   - Fonction intégrée unique : analyze_ttf_pipeline(...)
+
+Remarques :
+- La branche NHPP suit la logique Crow-AMSAA / loi de puissance.
+- La branche BPP est approchée par Hawkes exponentiel, utile en pratique.
+- L'optimisation / maintenance sera branchée ensuite sur les sorties retournées ici.
 """
 
 from typing import List, Dict, Any, Tuple, Optional
 import math
+
 import numpy as np
+import pandas as pd
 from scipy import stats as sst
 from scipy.optimize import minimize
 
@@ -31,16 +44,18 @@ from scipy.optimize import minimize
 # ---------------------------------------------------------------------
 # Utils
 # ---------------------------------------------------------------------
-def _clean_positive(series: List[float]) -> np.ndarray:
+def _clean_positive(series: List[float] | np.ndarray) -> np.ndarray:
     x = np.asarray(series, dtype=float)
     x = x[np.isfinite(x)]
     x = x[x > 0.0]
     return x
 
 
-def _to_event_times(ttf_series: List[float]) -> np.ndarray:
+
+def _to_event_times(ttf_series: List[float] | np.ndarray) -> np.ndarray:
     x = _clean_positive(ttf_series)
     return np.cumsum(x)
+
 
 
 def _safe_float(x: Any, default: Optional[float] = None) -> Optional[float]:
@@ -51,14 +66,16 @@ def _safe_float(x: Any, default: Optional[float] = None) -> Optional[float]:
         return default
 
 
+
 def _aic_from_loglik(loglik: float, k: int) -> float:
     return float(2 * k - 2 * loglik)
+
 
 
 def _merge_small_bins(
     observed: np.ndarray,
     expected: np.ndarray,
-    min_exp: float = 5.0
+    min_exp: float = 5.0,
 ) -> Tuple[np.ndarray, np.ndarray]:
     obs = observed.astype(float).tolist()
     exp = expected.astype(float).tolist()
@@ -82,11 +99,12 @@ def _merge_small_bins(
     return np.asarray(obs), np.asarray(exp)
 
 
+
 def _chi2_gof_prob_bins(
     data: np.ndarray,
     cdf_func,
     params: Tuple[float, ...],
-    nbins: int = 8
+    nbins: int = 8,
 ) -> float:
     n = data.size
     if n < 10:
@@ -116,6 +134,7 @@ def _chi2_gof_prob_bins(
         return 1.0
 
 
+
 def _cvm_gof(data: np.ndarray, cdf_func, params: Tuple[float, ...]) -> float:
     if data.size < 3:
         return 1.0
@@ -126,12 +145,33 @@ def _cvm_gof(data: np.ndarray, cdf_func, params: Tuple[float, ...]) -> float:
         return 1.0
 
 
+
 def _safe_logpdf_sum(dist, data: np.ndarray, params: Tuple[float, ...]) -> float:
     try:
         lp = dist.logpdf(data, *params).sum()
         return float(lp) if np.isfinite(lp) else -np.inf
     except Exception:
         return -np.inf
+
+
+
+def _safe_hazard(dist, t: float, params: Tuple[float, ...]) -> Optional[float]:
+    try:
+        sf = float(dist.sf(t, *params))
+        if sf <= 0:
+            return None
+        hz = float(dist.pdf(t, *params) / sf)
+        return hz if np.isfinite(hz) else None
+    except Exception:
+        return None
+
+
+
+def _round_df(df: pd.DataFrame, digits: int = 6) -> pd.DataFrame:
+    out = df.copy()
+    num_cols = out.select_dtypes(include=[np.number]).columns
+    out[num_cols] = out[num_cols].round(digits)
+    return out
 
 
 # ---------------------------------------------------------------------
@@ -165,6 +205,7 @@ def mann_kendall_test(series: List[float], alpha: float = 0.05) -> Dict[str, Any
     return {"z": float(z), "p": float(p), "has_trend": has, "direction": direction}
 
 
+
 def laplace_trend_test(ttf_series: List[float], alpha: float = 0.05) -> Dict[str, Any]:
     t = _to_event_times(ttf_series)
     n = len(t)
@@ -178,6 +219,7 @@ def laplace_trend_test(ttf_series: List[float], alpha: float = 0.05) -> Dict[str
     has = bool(p < alpha)
     direction = "up" if (has and u > 0) else "down" if (has and u < 0) else "none"
     return {"u": float(u), "p": float(p), "has_trend": has, "direction": direction}
+
 
 
 def mil_hdbk_189_indicator(ttf_series: List[float]) -> Dict[str, Any]:
@@ -312,11 +354,13 @@ def _fit_distribution(name: str, data: np.ndarray) -> Dict[str, Any]:
         return res
 
 
+
 def _normalize_weibull_params(name: str, params: Tuple[float, ...]) -> Tuple[float, float, float]:
     c, loc, scale = params
     if name == "weibull_2p":
         return float(c), 0.0, float(scale)
     return float(c), float(loc), float(scale)
+
 
 
 def fit_and_compare_distributions(data: np.ndarray) -> Dict[str, Any]:
@@ -366,7 +410,6 @@ def fit_power_law_nhpp(ttf_series: List[float]) -> Dict[str, Any]:
     beta = n / denom
     eta = T / (n ** (1.0 / beta))
 
-    # log-likelihood of PLP on [0,T]
     ll = (
         n * math.log(beta)
         - n * beta * math.log(eta)
@@ -374,7 +417,6 @@ def fit_power_law_nhpp(ttf_series: List[float]) -> Dict[str, Any]:
         - (T / eta) ** beta
     )
 
-    # Time-rescaling theorem: transformed inter-event compensators ~ Exp(1)
     m_prev = 0.0
     z = []
     for ti in t:
@@ -414,15 +456,14 @@ def _hawkes_neg_loglik(theta: np.ndarray, t: np.ndarray) -> float:
     log_mu, log_beta, q = theta
     mu = math.exp(log_mu)
     beta = math.exp(log_beta)
-    branch_ratio = 0.98 / (1.0 + math.exp(-q))  # in (0, 0.98)
+    branch_ratio = 0.98 / (1.0 + math.exp(-q))
     alpha = branch_ratio * beta
 
     T = float(t[-1])
     if mu <= 0 or beta <= 0 or alpha < 0:
         return 1e100
 
-    # Recursive evaluation of intensities
-    r_prev = 0.0  # sum exp(-beta*(t_i-t_j)) for j < i
+    r_prev = 0.0
     log_terms = []
     t_prev = 0.0
     for i, ti in enumerate(t):
@@ -441,6 +482,7 @@ def _hawkes_neg_loglik(theta: np.ndarray, t: np.ndarray) -> float:
     integral = mu * T + (alpha / beta) * float(np.sum(1.0 - np.exp(-beta * (T - t))))
     nll = -(float(np.sum(log_terms)) - integral)
     return nll if np.isfinite(nll) else 1e100
+
 
 
 def fit_hawkes_bpp(ttf_series: List[float]) -> Dict[str, Any]:
@@ -466,13 +508,7 @@ def fit_hawkes_bpp(ttf_series: List[float]) -> Dict[str, Any]:
     mean_gap = float(np.mean(np.diff(np.insert(t, 0, 0.0))))
     x0 = np.array([math.log(max(1e-6, 1.0 / max(mean_gap, 1e-6))), math.log(1.0), 0.0])
 
-    opt = minimize(
-        _hawkes_neg_loglik,
-        x0=x0,
-        args=(t,),
-        method="L-BFGS-B",
-    )
-
+    opt = minimize(_hawkes_neg_loglik, x0=x0, args=(t,), method="L-BFGS-B")
     if not opt.success:
         return res
 
@@ -484,9 +520,8 @@ def fit_hawkes_bpp(ttf_series: List[float]) -> Dict[str, Any]:
     ll = -float(opt.fun)
     T = float(t[-1])
 
-    # Time-rescaling theorem: integrated intensity increments ~ Exp(1)
     w = []
-    A_prev = 0.0  # state immediately after previous event
+    A_prev = 0.0
     t_prev = 0.0
     for ti in t:
         dt = ti - t_prev
@@ -523,124 +558,124 @@ def fit_hawkes_bpp(ttf_series: List[float]) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------
-# 6) Bloc thermique : point chaud, FAA, perte de vie
+# 6) Indicateurs fiabilistes
 # ---------------------------------------------------------------------
-def estimate_hotspot_profile(
-    theta_amb: List[float] | np.ndarray,
-    load_factor: Optional[List[float] | np.ndarray] = None,
+def _distribution_mean(name: str, params: Optional[Tuple[float, ...]]) -> Optional[float]:
+    if not params:
+        return None
+    try:
+        if name == "expon":
+            return float(sst.expon.mean(*params))
+        if name == "norm":
+            return float(sst.norm.mean(*params))
+        if name == "lognorm":
+            return float(sst.lognorm.mean(*params))
+        if name.startswith("weibull"):
+            return float(sst.weibull_min.mean(*params))
+        return None
+    except Exception:
+        return None
+
+
+
+def _distribution_hazard_at_mean(name: str, params: Optional[Tuple[float, ...]]) -> Optional[float]:
+    if not params:
+        return None
+    mean_ = _distribution_mean(name, params)
+    if mean_ is None or mean_ <= 0:
+        return None
+    try:
+        if name == "expon":
+            return _safe_hazard(sst.expon, mean_, params)
+        if name == "norm":
+            return _safe_hazard(sst.norm, mean_, params)
+        if name == "lognorm":
+            return _safe_hazard(sst.lognorm, mean_, params)
+        if name.startswith("weibull"):
+            return _safe_hazard(sst.weibull_min, mean_, params)
+        return None
+    except Exception:
+        return None
+
+
+
+def compute_reliability_indicators(
+    ttf_series: List[float] | np.ndarray,
+    repair_series: Optional[List[float] | np.ndarray] = None,
     *,
-    dt_hours: float = 1.0,
-    delta_theta_to_r: float = 55.0,
-    delta_theta_h_r: float = 30.0,
-    R: float = 5.0,
-    n_exp: float = 0.8,
-    m_exp: float = 1.6,
-    tau_to_hours: float = 4.0,
-    tau_h_hours: float = 1.0,
-    theta_to_init: Optional[float] = None,
-    theta_h_init: Optional[float] = None,
-    direct_top_oil_rise: Optional[List[float] | np.ndarray] = None,
-    direct_hotspot_gradient: Optional[List[float] | np.ndarray] = None,
-    normal_life_hours: float = 180000.0,
+    model: str,
+    distribution: str,
+    params: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """
-    Estimation thermique cohérente avec la structure du mémoire :
-        θHS = θamb + ΔθTO + ΔθH
-        FAA = exp(15000/383 - 15000/(θHS + 273))
-        L    = Σ FAA_i * Δt_i
+    ttf = _clean_positive(ttf_series)
+    rep = _clean_positive(repair_series) if repair_series is not None else np.asarray([], dtype=float)
 
-    Deux modes:
-    1) Direct:
-       - direct_top_oil_rise et direct_hotspot_gradient fournis
-    2) Estimé à partir du facteur de charge K:
-       - load_factor fourni + paramètres thermiques usuels
-    """
-    amb = np.asarray(theta_amb, dtype=float)
-    if amb.ndim != 1 or amb.size == 0:
-        raise ValueError("theta_amb doit être une série 1D non vide.")
+    empirical_mttf = float(np.mean(ttf)) if ttf.size else None
+    theoretical_mttf = None
+    mean_hazard = None
 
-    N = amb.size
+    if model == "RP":
+        theoretical_mttf = _distribution_mean(distribution, params.get("raw"))
+        mean_hazard = _distribution_hazard_at_mean(distribution, params.get("raw"))
+    elif model == "NHPP":
+        theoretical_mttf = empirical_mttf
+        beta = params.get("beta")
+        eta = params.get("eta")
+        if beta is not None and eta is not None:
+            try:
+                t_ref = float(np.mean(_to_event_times(ttf.tolist())))
+                mean_hazard = float((beta / eta) * ((t_ref / eta) ** (beta - 1.0)))
+            except Exception:
+                mean_hazard = None
+    elif model == "BPP":
+        theoretical_mttf = empirical_mttf
+        mu = params.get("mu")
+        if mu is not None and mu > 0:
+            mean_hazard = float(mu)
 
-    if direct_top_oil_rise is not None and direct_hotspot_gradient is not None:
-        d_to = np.asarray(direct_top_oil_rise, dtype=float)
-        d_h = np.asarray(direct_hotspot_gradient, dtype=float)
-        if d_to.size != N or d_h.size != N:
-            raise ValueError("Les séries directes doivent avoir la même taille que theta_amb.")
-    else:
-        if load_factor is None:
-            raise ValueError(
-                "Fournir soit load_factor, soit direct_top_oil_rise + direct_hotspot_gradient."
-            )
-        K = np.asarray(load_factor, dtype=float)
-        if K.size != N:
-            raise ValueError("load_factor doit avoir la même taille que theta_amb.")
-
-        d_to = np.zeros(N, dtype=float)
-        d_h = np.zeros(N, dtype=float)
-
-        d_to_ult = delta_theta_to_r * (((K ** 2) * R + 1.0) / (R + 1.0)) ** n_exp
-        d_h_ult = delta_theta_h_r * (K ** (2.0 * m_exp))
-
-        d_to[0] = d_to_ult[0] if theta_to_init is None else float(theta_to_init)
-        d_h[0] = d_h_ult[0] if theta_h_init is None else float(theta_h_init)
-
-        a_to = 1.0 - math.exp(-dt_hours / max(tau_to_hours, 1e-9))
-        a_h = 1.0 - math.exp(-dt_hours / max(tau_h_hours, 1e-9))
-
-        for i in range(1, N):
-            d_to[i] = d_to[i - 1] + a_to * (d_to_ult[i] - d_to[i - 1])
-            d_h[i] = d_h[i - 1] + a_h * (d_h_ult[i] - d_h[i - 1])
-
-    theta_hs = amb + d_to + d_h
-    faa = np.exp((15000.0 / 383.0) - (15000.0 / (theta_hs + 273.0)))
-    loss_hours = float(np.sum(faa * dt_hours))
-    loss_pu = loss_hours / float(normal_life_hours) if normal_life_hours > 0 else None
-    loss_pct = 100.0 * loss_pu if loss_pu is not None else None
+    mttr = float(np.mean(rep)) if rep.size else None
+    mtbf = theoretical_mttf if theoretical_mttf is not None else empirical_mttf
+    availability = None
+    if mtbf is not None and mttr is not None and (mtbf + mttr) > 0:
+        availability = float(mtbf / (mtbf + mttr))
 
     return {
-        "theta_hs": theta_hs.tolist(),
-        "delta_theta_to": d_to.tolist(),
-        "delta_theta_h": d_h.tolist(),
-        "faa": faa.tolist(),
-        "faa_mean": float(np.mean(faa)),
-        "faa_max": float(np.max(faa)),
-        "theta_hs_mean": float(np.mean(theta_hs)),
-        "theta_hs_max": float(np.max(theta_hs)),
-        "theta_hs_min": float(np.min(theta_hs)),
-        "loss_of_life_hours": loss_hours,
-        "loss_of_life_pu": None if loss_pu is None else float(loss_pu),
-        "loss_of_life_pct": None if loss_pct is None else float(loss_pct),
-        "inputs": {
-            "dt_hours": float(dt_hours),
-            "delta_theta_to_r": float(delta_theta_to_r),
-            "delta_theta_h_r": float(delta_theta_h_r),
-            "R": float(R),
-            "n_exp": float(n_exp),
-            "m_exp": float(m_exp),
-            "tau_to_hours": float(tau_to_hours),
-            "tau_h_hours": float(tau_h_hours),
-            "normal_life_hours": float(normal_life_hours),
-        },
+        "cleaned_failures_n": int(ttf.size),
+        "cleaned_repairs_n": int(rep.size),
+        "empirical_mttf_h": None if empirical_mttf is None else float(empirical_mttf),
+        "theoretical_mttf_h": None if theoretical_mttf is None else float(theoretical_mttf),
+        "mtbf_h": None if mtbf is None else float(mtbf),
+        "mttr_h": None if mttr is None else float(mttr),
+        "availability_intrinsic": availability,
+        "sample_std_ttf_h": float(np.std(ttf, ddof=1)) if ttf.size >= 2 else None,
+        "mean_failure_rate_h": mean_hazard,
+        "empirical_failure_rate_h": None if empirical_mttf in (None, 0) else float(1.0 / empirical_mttf),
     }
 
 
 # ---------------------------------------------------------------------
-# 7) Fonction principale
+# 7) Moteur fiabiliste principal
 # ---------------------------------------------------------------------
-def analyze_ttf_pipeline(
+def analyze_reliability_only(
     ttf_series: List[float],
+    repair_series: Optional[List[float]] = None,
     alpha: float = 0.05,
-    thermal_config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     data = _clean_positive(ttf_series)
     n = int(data.size)
 
     if n < 3:
-        out = {
+        result = {
             "error": "TTF insuffisants (<3 après nettoyage).",
             "cleaned_n": n,
             "model": "RP",
             "distribution": "weibull_2p",
+            "decision": {
+                "has_trend": False,
+                "has_dependence": False,
+                "selected_process": "RP",
+                "reason": "Données insuffisantes pour statuer, hypothèse RP par défaut.",
+            },
             "goodness": {"aic": None, "ks_p": None, "chi2_p": None, "cvm_p": None},
             "params": {
                 "raw": None,
@@ -668,11 +703,15 @@ def analyze_ttf_pipeline(
                 },
             },
             "candidates": {},
-            "thermal": None,
         }
-        if thermal_config:
-            out["thermal"] = estimate_hotspot_profile(**thermal_config)
-        return out
+        result["indicators"] = compute_reliability_indicators(
+            ttf_series=data,
+            repair_series=repair_series,
+            model=result["model"],
+            distribution=result["distribution"],
+            params=result["params"],
+        )
+        return result
 
     mk = mann_kendall_test(data.tolist(), alpha=alpha)
     lap = laplace_trend_test(data.tolist(), alpha=alpha)
@@ -682,10 +721,13 @@ def analyze_ttf_pipeline(
     has_trend = bool(mk["has_trend"] or lap["has_trend"])
     if has_trend:
         model = "NHPP"
+        reason = "Tendance significative détectée (Mann-Kendall et/ou Laplace)."
     elif dep["has_dep"]:
         model = "BPP"
+        reason = "Pas de tendance significative, mais dépendance détectée entre TTF successifs."
     else:
         model = "RP"
+        reason = "Ni tendance significative ni dépendance détectée : hypothèse iid retenue."
 
     beta = eta = gamma = None
     mu = alpha_bpp = beta_kernel = branch_ratio = None
@@ -714,26 +756,34 @@ def analyze_ttf_pipeline(
             eta = fits["weibull"]["eta"]
             gamma = fits["weibull"]["gamma"]
 
+    params = {
+        "raw": best.get("params"),
+        "beta": beta,
+        "eta": eta,
+        "gamma": gamma,
+        "mu": mu,
+        "alpha": alpha_bpp,
+        "beta_kernel": beta_kernel,
+        "branch_ratio": branch_ratio,
+    }
+
     out = {
         "cleaned_n": n,
         "model": model,
         "distribution": distribution,
+        "decision": {
+            "has_trend": has_trend,
+            "has_dependence": bool(dep["has_dep"]),
+            "selected_process": model,
+            "reason": reason,
+        },
         "goodness": {
             "aic": best.get("aic"),
             "ks_p": best.get("ks_p"),
             "chi2_p": best.get("chi2_p"),
             "cvm_p": best.get("cvm_p"),
         },
-        "params": {
-            "raw": best.get("params"),
-            "beta": beta,
-            "eta": eta,
-            "gamma": gamma,
-            "mu": mu,
-            "alpha": alpha_bpp,
-            "beta_kernel": beta_kernel,
-            "branch_ratio": branch_ratio,
-        },
+        "params": params,
         "tests": {
             "trend_mk": mk,
             "trend_laplace": lap,
@@ -741,10 +791,463 @@ def analyze_ttf_pipeline(
             "dependence": dep,
         },
         "candidates": candidates,
-        "thermal": None,
     }
 
-    if thermal_config:
-        out["thermal"] = estimate_hotspot_profile(**thermal_config)
-
+    out["indicators"] = compute_reliability_indicators(
+        ttf_series=data,
+        repair_series=repair_series,
+        model=model,
+        distribution=distribution,
+        params=params,
+    )
     return out
+
+
+# ---------------------------------------------------------------------
+# 8) Modélisation thermique dynamique
+# ---------------------------------------------------------------------
+def simulate_thermal_dynamic(
+    df: pd.DataFrame,
+    *,
+    sn_mva: float = 100.0,
+    R: float = 5.0,
+    delta_to_r: float = 55.0,
+    delta_h_r: float = 30.0,
+    tau_to_min: float = 180.0,
+    tau_w_min: float = 10.0,
+    n_exp: float = 0.8,
+    m_exp: float = 0.8,
+    forced_tau_to_factor: float = 0.75,
+    forced_delta_to_factor: float = 0.92,
+    forced_delta_h_factor: float = 0.92,
+    normal_insulation_life_h: float = 180000.0,
+) -> pd.DataFrame:
+    req = {"timestamp", "temp_amb_C"}
+    missing = req - set(df.columns)
+    if missing:
+        raise ValueError(f"Colonnes manquantes pour la thermique: {sorted(missing)}")
+
+    out = df.copy()
+    out["timestamp"] = pd.to_datetime(out["timestamp"], errors="coerce")
+    out = out.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+
+    if "K" not in out.columns:
+        if "charge_pct" in out.columns:
+            out["K"] = pd.to_numeric(out["charge_pct"], errors="coerce") / 100.0
+        elif "load_factor" in out.columns:
+            out["K"] = pd.to_numeric(out["load_factor"], errors="coerce")
+        elif "load_mva" in out.columns:
+            out["K"] = pd.to_numeric(out["load_mva"], errors="coerce") / float(sn_mva)
+        else:
+            raise ValueError("Il faut fournir K, charge_pct, load_factor ou load_mva.")
+
+    if "etat_ventilateurs" not in out.columns:
+        out["etat_ventilateurs"] = 0
+
+    out["temp_amb_C"] = pd.to_numeric(out["temp_amb_C"], errors="coerce")
+    out["K"] = pd.to_numeric(out["K"], errors="coerce")
+    out["etat_ventilateurs"] = (
+        pd.to_numeric(out["etat_ventilateurs"], errors="coerce").fillna(0).astype(int)
+    )
+    out = out.dropna(subset=["temp_amb_C", "K"]).reset_index(drop=True)
+
+    if len(out) < 2:
+        raise ValueError("La série thermique doit contenir au moins 2 points.")
+
+    dt_h_series = out["timestamp"].diff().dt.total_seconds().div(3600.0)
+    dt_h_default = float(dt_h_series.iloc[1:].median())
+    if not np.isfinite(dt_h_default) or dt_h_default <= 0:
+        dt_h_default = 1.0
+
+    n = len(out)
+    dTO = np.zeros(n, dtype=float)
+    dH = np.zeros(n, dtype=float)
+
+    tau_to_onan_h = tau_to_min / 60.0
+    tau_w_h = tau_w_min / 60.0
+
+    K0 = float(out.loc[0, "K"])
+    fans0 = int(out.loc[0, "etat_ventilateurs"])
+
+    dTO_ult0 = delta_to_r * ((((K0 ** 2) * R) + 1.0) / (R + 1.0)) ** n_exp
+    dH_ult0 = delta_h_r * (K0 ** (2.0 * m_exp))
+
+    if fans0 == 1:
+        dTO_ult0 *= forced_delta_to_factor
+        dH_ult0 *= forced_delta_h_factor
+
+    dTO[0] = 0.6 * dTO_ult0
+    dH[0] = 0.6 * dH_ult0
+
+    for i in range(1, n):
+        K = float(out.loc[i, "K"])
+        fans = int(out.loc[i, "etat_ventilateurs"])
+
+        dt_h_i = _safe_float(dt_h_series.iloc[i], dt_h_default)
+        if dt_h_i is None or dt_h_i <= 0:
+            dt_h_i = dt_h_default
+
+        tau_to_h = tau_to_onan_h * (forced_tau_to_factor if fans == 1 else 1.0)
+        tau_to_h = max(tau_to_h, 1e-6)
+        tau_w_h_eff = max(tau_w_h, 1e-6)
+
+        dTO_ult = delta_to_r * ((((K ** 2) * R) + 1.0) / (R + 1.0)) ** n_exp
+        dH_ult = delta_h_r * (K ** (2.0 * m_exp))
+
+        if fans == 1:
+            dTO_ult *= forced_delta_to_factor
+            dH_ult *= forced_delta_h_factor
+
+        a_to = math.exp(-dt_h_i / tau_to_h)
+        a_w = math.exp(-dt_h_i / tau_w_h_eff)
+
+        dTO[i] = dTO_ult + (dTO[i - 1] - dTO_ult) * a_to
+        dH[i] = dH_ult + (dH[i - 1] - dH_ult) * a_w
+
+        dTO[i] = float(np.clip(dTO[i], 0.0, 120.0))
+        dH[i] = float(np.clip(dH[i], 0.0, 80.0))
+
+    out["Delta_theta_TO"] = dTO
+    out["Delta_theta_H"] = dH
+    out["theta_TO_est_C"] = out["temp_amb_C"] + out["Delta_theta_TO"]
+    out["theta_HS_est_C"] = out["temp_amb_C"] + out["Delta_theta_TO"] + out["Delta_theta_H"]
+
+    theta_hs = out["theta_HS_est_C"].to_numpy()
+    out["FAA"] = np.exp((15000.0 / 383.0) - (15000.0 / (theta_hs + 273.0)))
+
+    step_h = dt_h_series.fillna(dt_h_default).clip(lower=dt_h_default).to_numpy(dtype=float)
+    out["dt_h_step"] = step_h
+    out["aging_hours_step"] = out["FAA"] * out["dt_h_step"]
+    out["aging_hours_cum"] = out["aging_hours_step"].cumsum()
+    out["life_consumed_pct_cum"] = 100.0 * out["aging_hours_cum"] / float(normal_insulation_life_h)
+    out["remaining_life_pct"] = 100.0 - out["life_consumed_pct_cum"]
+
+    out.attrs["dt_h_default"] = float(dt_h_default)
+    out.attrs["normal_insulation_life_h"] = float(normal_insulation_life_h)
+    out.attrs["thermal_params"] = {
+        "sn_mva": float(sn_mva),
+        "R": float(R),
+        "delta_to_r": float(delta_to_r),
+        "delta_h_r": float(delta_h_r),
+        "tau_to_min": float(tau_to_min),
+        "tau_w_min": float(tau_w_min),
+        "n_exp": float(n_exp),
+        "m_exp": float(m_exp),
+        "forced_tau_to_factor": float(forced_tau_to_factor),
+        "forced_delta_to_factor": float(forced_delta_to_factor),
+        "forced_delta_h_factor": float(forced_delta_h_factor),
+        "normal_insulation_life_h": float(normal_insulation_life_h),
+    }
+    return out
+
+
+
+def summarize_thermal_results(df_sim: pd.DataFrame) -> Dict[str, Any]:
+    dt_h = float(df_sim.attrs.get("dt_h_default", 1.0))
+    normal_life = float(df_sim.attrs.get("normal_insulation_life_h", 180000.0))
+    thermal_params = dict(df_sim.attrs.get("thermal_params", {}))
+
+    total_aging_hours = float(df_sim["aging_hours_step"].sum())
+    life_consumed_pct = 100.0 * total_aging_hours / normal_life
+
+    daily = df_sim.copy()
+    daily["date"] = pd.to_datetime(daily["timestamp"]).dt.date
+    daily = (
+        daily.groupby("date")
+        .agg(
+            charge_mean_pct=("K", lambda s: float(np.mean(s) * 100.0)),
+            charge_max_pct=("K", lambda s: float(np.max(s) * 100.0)),
+            amb_mean=("temp_amb_C", "mean"),
+            theta_TO_mean=("theta_TO_est_C", "mean"),
+            theta_HS_max=("theta_HS_est_C", "max"),
+            theta_HS_p95=("theta_HS_est_C", lambda s: float(pd.Series(s).quantile(0.95))),
+            FAA_max=("FAA", "max"),
+            FAA_mean=("FAA", "mean"),
+            aging_hours=("aging_hours_step", "sum"),
+            fans_share=("etat_ventilateurs", "mean"),
+        )
+        .reset_index()
+    )
+
+    daily["fans_share_pct"] = 100.0 * daily["fans_share"]
+    daily["life_consumed_pct"] = 100.0 * daily["aging_hours"] / normal_life
+    daily["aging_hours_cum"] = daily["aging_hours"].cumsum()
+    daily["life_consumed_pct_cum"] = 100.0 * daily["aging_hours_cum"] / normal_life
+    daily["remaining_life_pct"] = 100.0 - daily["life_consumed_pct_cum"]
+
+    top5 = daily.sort_values("aging_hours", ascending=False).head(5).copy()
+
+    summary = {
+        "theta_hs_max": float(df_sim["theta_HS_est_C"].max()),
+        "theta_hs_p95": float(df_sim["theta_HS_est_C"].quantile(0.95)),
+        "theta_hs_mean": float(df_sim["theta_HS_est_C"].mean()),
+        "faa_max": float(df_sim["FAA"].max()),
+        "faa_mean": float(df_sim["FAA"].mean()),
+        "loss_of_life_hours": total_aging_hours,
+        "loss_of_life_pct": float(life_consumed_pct),
+        "dt_h_default": dt_h,
+    }
+
+    return {
+        "summary": summary,
+        "timeseries": df_sim,
+        "daily": daily,
+        "top5_critical_days": top5,
+        "params": thermal_params,
+    }
+
+
+# ---------------------------------------------------------------------
+# 9) Tables fiabilité / thermique / globales
+# ---------------------------------------------------------------------
+def build_reliability_tables(reliability_result: Dict[str, Any]) -> Dict[str, pd.DataFrame]:
+    tests = reliability_result.get("tests", {})
+    dep = tests.get("dependence", {})
+    decision = reliability_result.get("decision", {})
+    params = reliability_result.get("params", {})
+    goodness = reliability_result.get("goodness", {})
+    indicators = reliability_result.get("indicators", {})
+
+    trend_df = pd.DataFrame(
+        [
+            {
+                "Test": "Mann-Kendall",
+                "Statistique": tests.get("trend_mk", {}).get("z"),
+                "p_value": tests.get("trend_mk", {}).get("p"),
+                "Décision": "Oui" if tests.get("trend_mk", {}).get("has_trend") else "Non",
+                "Direction": tests.get("trend_mk", {}).get("direction"),
+            },
+            {
+                "Test": "Laplace",
+                "Statistique": tests.get("trend_laplace", {}).get("u"),
+                "p_value": tests.get("trend_laplace", {}).get("p"),
+                "Décision": "Oui" if tests.get("trend_laplace", {}).get("has_trend") else "Non",
+                "Direction": tests.get("trend_laplace", {}).get("direction"),
+            },
+            {
+                "Test": "MIL-HDBK-189",
+                "Statistique": tests.get("trend_mil_hdbk_189", {}).get("beta_graph"),
+                "p_value": None,
+                "Décision": tests.get("trend_mil_hdbk_189", {}).get("interpreted_trend"),
+                "Direction": tests.get("trend_mil_hdbk_189", {}).get("interpreted_trend"),
+            },
+            {
+                "Test": "Décision finale",
+                "Statistique": None,
+                "p_value": None,
+                "Décision": "Oui" if decision.get("has_trend") else "Non",
+                "Direction": reliability_result.get("model"),
+            },
+        ]
+    )
+
+    dependence_df = pd.DataFrame(
+        [
+            {
+                "Méthode": "Pearson",
+                "r": dep.get("pearson_r"),
+                "p_value": dep.get("pearson_p"),
+                "Dépendance": "Oui" if (dep.get("pearson_p") is not None and dep.get("pearson_p") < 0.05) else "Non",
+            },
+            {
+                "Méthode": "Spearman",
+                "r": dep.get("spearman_r"),
+                "p_value": dep.get("spearman_p"),
+                "Dépendance": "Oui" if (dep.get("spearman_p") is not None and dep.get("spearman_p") < 0.05) else "Non",
+            },
+            {
+                "Méthode": "Décision finale",
+                "r": dep.get("r"),
+                "p_value": dep.get("p"),
+                "Dépendance": "Oui" if dep.get("has_dep") else "Non",
+            },
+        ]
+    )
+
+    process_df = pd.DataFrame(
+        [
+            {
+                "Tendance": "Oui" if decision.get("has_trend") else "Non",
+                "Dépendance": "Oui" if decision.get("has_dependence") else "Non",
+                "Processus retenu": decision.get("selected_process"),
+                "Justification": decision.get("reason"),
+            }
+        ]
+    )
+
+    rows = []
+    for name, fit in reliability_result.get("candidates", {}).items():
+        rows.append(
+            {
+                "Modèle": name,
+                "Paramètres": str(fit.get("params")),
+                "LogLik": fit.get("loglik"),
+                "AIC": fit.get("aic"),
+                "KS p": fit.get("ks_p"),
+                "Chi2 p": fit.get("chi2_p"),
+                "CvM p": fit.get("cvm_p"),
+                "Retenu": "Oui" if name == reliability_result.get("distribution") else "Non",
+            }
+        )
+    fits_df = pd.DataFrame(rows)
+
+    reliability_summary_df = pd.DataFrame(
+        [
+            {
+                "Processus": reliability_result.get("model"),
+                "Distribution": reliability_result.get("distribution"),
+                "Beta": params.get("beta"),
+                "Eta": params.get("eta"),
+                "Gamma": params.get("gamma"),
+                "Mu": params.get("mu"),
+                "Alpha": params.get("alpha"),
+                "Beta_kernel": params.get("beta_kernel"),
+                "Branch_ratio": params.get("branch_ratio"),
+                "AIC": goodness.get("aic"),
+                "KS p": goodness.get("ks_p"),
+                "Chi2 p": goodness.get("chi2_p"),
+                "CvM p": goodness.get("cvm_p"),
+                "MTTF (h)": indicators.get("theoretical_mttf_h") or indicators.get("empirical_mttf_h"),
+                "MTBF (h)": indicators.get("mtbf_h"),
+                "MTTR (h)": indicators.get("mttr_h"),
+                "Disponibilité": indicators.get("availability_intrinsic"),
+                "Taux de défaillance moyen (1/h)": indicators.get("mean_failure_rate_h"),
+            }
+        ]
+    )
+
+    return {
+        "trend_results": _round_df(trend_df),
+        "dependence_results": _round_df(dependence_df),
+        "process_choice": _round_df(process_df),
+        "fit_candidates": _round_df(fits_df),
+        "reliability_summary": _round_df(reliability_summary_df),
+    }
+
+
+
+def build_thermal_tables(thermal_result: Dict[str, Any]) -> Dict[str, pd.DataFrame]:
+    ts = thermal_result["timeseries"].copy()
+    daily = thermal_result["daily"].copy()
+    top5 = thermal_result["top5_critical_days"].copy()
+    summary = thermal_result["summary"]
+    params = thermal_result.get("params", {})
+
+    table_dataset = pd.DataFrame(
+        [
+            {
+                "Période début": str(ts["timestamp"].min()),
+                "Période fin": str(ts["timestamp"].max()),
+                "Nombre de points": int(len(ts)),
+                "Pas de temps par défaut (h)": summary.get("dt_h_default"),
+                "Charge min (%)": float(ts["K"].min() * 100.0),
+                "Charge max (%)": float(ts["K"].max() * 100.0),
+                "Temp ambiante min (°C)": float(ts["temp_amb_C"].min()),
+                "Temp ambiante max (°C)": float(ts["temp_amb_C"].max()),
+                "Ventilation forcée (% du temps)": float((ts["etat_ventilateurs"] == 1).mean() * 100.0),
+            }
+        ]
+    )
+
+    table_params = pd.DataFrame(
+        [{"Paramètre": k, "Valeur": v} for k, v in params.items()]
+    )
+
+    table_indicators = pd.DataFrame(
+        [
+            {
+                "θHS max (°C)": summary.get("theta_hs_max"),
+                "θHS P95 (°C)": summary.get("theta_hs_p95"),
+                "θHS mean (°C)": summary.get("theta_hs_mean"),
+                "FAA max": summary.get("faa_max"),
+                "FAA mean": summary.get("faa_mean"),
+                "Perte de vie (h)": summary.get("loss_of_life_hours"),
+                "Perte de vie (%)": summary.get("loss_of_life_pct"),
+            }
+        ]
+    )
+
+    thermal_summary = pd.DataFrame(
+        [
+            {
+                "θHS max": summary.get("theta_hs_max"),
+                "θHS P95": summary.get("theta_hs_p95"),
+                "θHS mean": summary.get("theta_hs_mean"),
+                "FAA max": summary.get("faa_max"),
+                "FAA mean": summary.get("faa_mean"),
+                "Loss of life (h)": summary.get("loss_of_life_hours"),
+                "Loss of life (%)": summary.get("loss_of_life_pct"),
+            }
+        ]
+    )
+
+    return {
+        "thermal_table_dataset": _round_df(table_dataset),
+        "thermal_table_params": _round_df(table_params),
+        "thermal_table_indicators": _round_df(table_indicators),
+        "thermal_summary": _round_df(thermal_summary),
+        "thermal_daily": _round_df(daily),
+        "thermal_top5_days": _round_df(top5),
+    }
+
+
+
+def build_global_result_tables(
+    reliability_result: Dict[str, Any],
+    thermal_result: Optional[Dict[str, Any]] = None,
+) -> Dict[str, pd.DataFrame]:
+    tables = {}
+    tables.update(build_reliability_tables(reliability_result))
+    if thermal_result is not None:
+        tables.update(build_thermal_tables(thermal_result))
+    return tables
+
+
+# ---------------------------------------------------------------------
+# 10) Fonction principale intégrée pour le logiciel
+# ---------------------------------------------------------------------
+def analyze_ttf_pipeline(
+    ttf_series: List[float],
+    alpha: float = 0.05,
+    repair_series: Optional[List[float]] = None,
+    thermal_df: Optional[pd.DataFrame] = None,
+    thermal_config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Fonction principale utilisée par le logiciel.
+
+    Entrées :
+    - ttf_series     : série des temps entre défaillances (heures)
+    - alpha          : seuil de significativité pour les tests
+    - repair_series  : série des temps de réparation (heures), optionnelle
+    - thermal_df     : série temporelle thermique, optionnelle
+    - thermal_config : paramètres du modèle thermique dynamique
+
+    Sorties :
+    - reliability : résultats fiabilistes complets
+    - thermal     : résultats thermiques complets si fournis
+    - tables      : tableaux prêts pour pages Streamlit / PDF
+    """
+    reliability = analyze_reliability_only(
+        ttf_series=ttf_series,
+        repair_series=repair_series,
+        alpha=alpha,
+    )
+
+    thermal = None
+    if thermal_df is not None and not thermal_df.empty:
+        cfg = dict(thermal_config or {})
+        df_sim = simulate_thermal_dynamic(thermal_df, **cfg)
+        thermal = summarize_thermal_results(df_sim)
+
+    tables = build_global_result_tables(reliability_result=reliability, thermal_result=thermal)
+
+    return {
+        "reliability": reliability,
+        "thermal": thermal,
+        "tables": tables,
+    }
+
+
+# Alias pratique si plus tard tu veux un nom explicite côté pages
+analyze_integrated_pipeline = analyze_ttf_pipeline

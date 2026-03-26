@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import io
@@ -11,25 +10,31 @@ import pandas as pd
 import streamlit as st
 
 from core.security.auth import require_login
-from core.datahub import set_current_failures_df, get_failures_meta, get_current_failures_df
+from core.datahub import (
+    build_ttf_from_events,
+    clear_current_project_data,
+    get_current_failures_df,
+    get_current_project_data,
+    get_failures_meta,
+    get_project_meta,
+    set_current_failures_df,
+    set_current_project_data,
+)
 
 st.set_page_config(page_title="Sources de données", page_icon="📥", layout="wide")
 require_login()
 
 st.title("📥 Sources de données")
 st.caption(
-    "Charge soit un CSV simple de TTF, soit un fichier Excel projet (.xlsx) multi-feuilles. "
-    "Les TTF dérivés sont synchronisés automatiquement pour les pages Indicateurs / Optimisation / Maintenance."
+    "Importe un CSV simple de TTF ou un fichier Excel projet. Une fois chargé ici, le dataset circule dans "
+    "Indicateurs, Optimisation, Maintenance et Résultats globaux via core.datahub."
 )
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True, parents=True)
-
 DB_PATH = DATA_DIR / "reliability.sqlite"
-PROJECT_DIR = DATA_DIR / "current_project"
-PROJECT_DIR.mkdir(exist_ok=True, parents=True)
-PROJECT_META_PATH = PROJECT_DIR / "project_meta.json"
+
 
 # ------------------------- DB helpers -------------------------
 def _db_conn():
@@ -54,20 +59,22 @@ def init_db():
         cx.commit()
 
 
-def bulk_insert_failures(df: pd.DataFrame, source: str):
+def bulk_insert_failures(df: pd.DataFrame, source: str) -> int:
     if df is None or df.empty:
         return 0
-    df = df.copy()
-    for c in ["equipment_code", "ttf_h", "duree_rep_h"]:
-        if c not in df.columns:
-            df[c] = None
-    df["equipment_code"] = df["equipment_code"].astype(str)
-    df["ttf_h"] = pd.to_numeric(df["ttf_h"], errors="coerce")
-    df["duree_rep_h"] = pd.to_numeric(df["duree_rep_h"], errors="coerce")
-    df = df.dropna(subset=["ttf_h"])
-    df = df[df["ttf_h"] > 0]
 
-    rows = df[["equipment_code", "ttf_h", "duree_rep_h"]].values.tolist()
+    work = df.copy()
+    for c in ["equipment_code", "ttf_h", "duree_rep_h"]:
+        if c not in work.columns:
+            work[c] = None
+
+    work["equipment_code"] = work["equipment_code"].astype(str)
+    work["ttf_h"] = pd.to_numeric(work["ttf_h"], errors="coerce")
+    work["duree_rep_h"] = pd.to_numeric(work["duree_rep_h"], errors="coerce")
+    work = work.dropna(subset=["ttf_h"])
+    work = work[work["ttf_h"] > 0]
+
+    rows = work[["equipment_code", "ttf_h", "duree_rep_h"]].values.tolist()
     with _db_conn() as cx:
         cx.executemany(
             "INSERT INTO failures (equipment_code, ttf_h, duree_rep_h, source) VALUES (?,?,?,?)",
@@ -85,23 +92,14 @@ def clear_db():
 
 init_db()
 
-# ------------------------- Specs projet -------------------------
+
+# ------------------------- Specs / validation -------------------------
 REQUIRED_SIMPLE = ["equipment_code", "ttf_h"]
-PROJECT_SHEETS = {
+PROJECT_REQUIRED = {
     "asset_info": ["asset_id", "asset_name"],
     "events_history": ["event_id", "asset_id", "event_start", "event_type", "is_failure", "is_planned"],
-    "thermal_timeseries": ["timestamp", "asset_id", "ambient_temp_c"],
-    "thermal_params": [
-        "asset_id",
-        "delta_theta_to_r",
-        "delta_theta_h_r",
-        "R",
-        "n_exp",
-        "m_exp",
-        "tau_to_hours",
-        "tau_h_hours",
-        "normal_life_hours",
-    ],
+    "thermal_timeseries": ["timestamp", "asset_id", "temp_amb_C"],
+    "thermal_params": ["asset_id", "R"],
     "maintenance_policies": [
         "policy_id",
         "asset_id",
@@ -114,25 +112,9 @@ PROJECT_SHEETS = {
         "thermal_constraint_type",
         "thermal_limit",
     ],
-    "analysis_settings": ["asset_id", "time_unit", "timezone", "alpha_significance", "analysis_horizon_days"],
+    "analysis_settings": ["asset_id", "alpha_significance", "analysis_horizon_days"],
 }
 
-OPTIONAL_PROJECT_COLS = {
-    "events_history": ["event_end", "downtime_hours", "repair_time_hours", "subsystem", "cost_corrective_usd", "description"],
-    "thermal_timeseries": [
-        "load_factor",
-        "top_oil_rise_c",
-        "hotspot_gradient_c",
-        "top_oil_temp_c",
-        "hotspot_temp_c",
-        "current_a",
-        "load_mva",
-        "fan_status",
-        "pump_status",
-    ],
-    "thermal_params": ["faa_limit", "lol_limit_hours"],
-    "analysis_settings": ["allow_nhpp_powerlaw", "allow_bpp_hawkes"],
-}
 
 # ------------------------- Utils -------------------------
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -154,103 +136,182 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     for k, v in mapping.items():
         if k in cols:
             ren[cols[k]] = v
-    return df.rename(columns=ren)
+    out = df.rename(columns=ren).copy()
+    out.columns = [str(c).strip() for c in out.columns]
+    return out
 
 
-def _coerce_bool01(s: pd.Series) -> pd.Series:
-    if s.dtype == bool:
-        return s.astype(int)
-    mapping = {
-        "1": 1,
-        "0": 0,
-        "true": 1,
-        "false": 0,
-        "yes": 1,
-        "no": 0,
-        "oui": 1,
-        "non": 0,
-        "y": 1,
-        "n": 0,
-    }
-    return s.astype(str).str.strip().str.lower().map(mapping).fillna(pd.to_numeric(s, errors="coerce")).fillna(0).astype(int)
+def _normalize_project_frames(frames: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+    out: Dict[str, pd.DataFrame] = {}
 
+    for raw_name, raw_df in frames.items():
+        name = str(raw_name).strip()
+        df = raw_df.copy()
+        df.columns = [str(c).strip() for c in df.columns]
+        lower = {c.lower().strip(): c for c in df.columns}
+        ren = {}
 
-def _compute_ttf_from_timestamps(df: pd.DataFrame, eq_col: str, ts_col: str) -> pd.DataFrame:
-    tmp = df[[eq_col, ts_col]].dropna().copy()
-    tmp[ts_col] = pd.to_datetime(tmp[ts_col], errors="coerce")
-    tmp = tmp.dropna(subset=[ts_col]).sort_values([eq_col, ts_col])
+        if name == "asset_info":
+            aliases = {
+                "assetid": "asset_id",
+                "id_asset": "asset_id",
+                "nom_actif": "asset_name",
+                "nom": "asset_name",
+                "rated_power_mva": "rated_power_mva",
+                "sn_mva": "rated_power_mva",
+            }
+            for k, v in aliases.items():
+                if k in lower:
+                    ren[lower[k]] = v
+            df = df.rename(columns=ren)
 
-    out = []
-    for eq, g in tmp.groupby(eq_col):
-        t = g[ts_col].tolist()
-        for i in range(1, len(t)):
-            dh = (t[i] - t[i - 1]).total_seconds() / 3600.0
-            if dh > 0:
-                out.append(
-                    {
-                        "equipment_code": str(eq),
-                        "ttf_h": float(dh),
-                        "duree_rep_h": None,
-                        "failure_time": t[i],
-                    }
-                )
-    return pd.DataFrame(out)
+        elif name == "events_history":
+            aliases = {
+                "date_panne": "event_start",
+                "failure_time": "event_start",
+                "failure_date": "event_start",
+                "assetid": "asset_id",
+                "repair_hours": "repair_time_hours",
+                "mttr_h": "repair_time_hours",
+                "downtime_h": "downtime_hours",
+            }
+            for k, v in aliases.items():
+                if k in lower:
+                    ren[lower[k]] = v
+            df = df.rename(columns=ren)
+            for c in ["event_start", "event_end"]:
+                if c in df.columns:
+                    df[c] = pd.to_datetime(df[c], errors="coerce")
+            for c in ["is_failure", "is_planned"]:
+                if c in df.columns:
+                    df[c] = (
+                        df[c]
+                        .astype(str)
+                        .str.strip()
+                        .str.lower()
+                        .map({"1": 1, "0": 0, "true": 1, "false": 0, "yes": 1, "no": 0, "oui": 1, "non": 0})
+                        .fillna(pd.to_numeric(df[c], errors="coerce"))
+                        .fillna(0)
+                        .astype(int)
+                    )
+            for c in ["repair_time_hours", "downtime_hours", "cost_corrective_usd"]:
+                if c in df.columns:
+                    df[c] = pd.to_numeric(df[c], errors="coerce")
 
+        elif name == "thermal_timeseries":
+            aliases = {
+                "ambient_temp_c": "temp_amb_C",
+                "temp_ambiante_c": "temp_amb_C",
+                "temperature_ambiante": "temp_amb_C",
+                "fan_status": "etat_ventilateurs",
+                "fans_status": "etat_ventilateurs",
+                "ventilateurs": "etat_ventilateurs",
+                "load_pct": "charge_pct",
+            }
+            for k, v in aliases.items():
+                if k in lower:
+                    ren[lower[k]] = v
+            df = df.rename(columns=ren)
+            if "timestamp" in df.columns:
+                df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+            for c in [
+                "temp_amb_C",
+                "K",
+                "charge_pct",
+                "load_factor",
+                "load_mva",
+                "etat_ventilateurs",
+                "temp_cuve_C",
+                "current_a",
+                "top_oil_temp_c",
+                "hotspot_temp_c",
+            ]:
+                if c in df.columns:
+                    df[c] = pd.to_numeric(df[c], errors="coerce")
 
-def _build_ttf_from_events(events: pd.DataFrame) -> pd.DataFrame:
-    df = events.copy()
+        elif name == "thermal_params":
+            aliases = {
+                "delta_theta_to_r": "delta_to_r",
+                "delta_theta_h_r": "delta_h_r",
+                "tau_to_hours": "tau_to_hours",
+                "tau_h_hours": "tau_h_hours",
+                "normal_life_hours": "normal_insulation_life_h",
+                "faa_limit": "faa_limit",
+                "lol_limit_hours": "lol_limit_hours",
+                "rated_power_mva": "sn_mva",
+            }
+            for k, v in aliases.items():
+                if k in lower:
+                    ren[lower[k]] = v
+            df = df.rename(columns=ren)
+            for c in df.columns:
+                if c != "asset_id":
+                    df[c] = pd.to_numeric(df[c], errors="ignore")
 
-    for c in ["event_id", "asset_id", "event_start", "event_type", "is_failure", "is_planned"]:
-        if c not in df.columns:
-            raise ValueError(f"Colonne manquante dans events_history: {c}")
+            # Convertit éventuellement des constantes en heures vers minutes pour le moteur thermique
+            if "tau_to_hours" in df.columns and "tau_to_min" not in df.columns:
+                df["tau_to_min"] = pd.to_numeric(df["tau_to_hours"], errors="coerce") * 60.0
+            if "tau_h_hours" in df.columns and "tau_w_min" not in df.columns:
+                df["tau_w_min"] = pd.to_numeric(df["tau_h_hours"], errors="coerce") * 60.0
 
-    if "repair_time_hours" not in df.columns:
-        df["repair_time_hours"] = None
+        elif name == "maintenance_policies":
+            for c in [
+                "interval_days",
+                "reliability_target",
+                "cost_preventive_usd",
+                "cost_corrective_usd",
+                "cost_downtime_usd",
+                "thermal_limit",
+            ]:
+                if c in df.columns:
+                    df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    df["event_start"] = pd.to_datetime(df["event_start"], errors="coerce")
-    df = df.dropna(subset=["event_start"]).copy()
-    df["asset_id"] = df["asset_id"].astype(str)
-    df["is_failure"] = _coerce_bool01(df["is_failure"])
-    df["is_planned"] = _coerce_bool01(df["is_planned"])
-    df["repair_time_hours"] = pd.to_numeric(df["repair_time_hours"], errors="coerce")
+        elif name == "analysis_settings":
+            aliases = {
+                "alpha": "alpha_significance",
+                "horizon_days": "analysis_horizon_days",
+            }
+            for k, v in aliases.items():
+                if k in lower:
+                    ren[lower[k]] = v
+            df = df.rename(columns=ren)
+            if "alpha_significance" in df.columns:
+                df["alpha_significance"] = pd.to_numeric(df["alpha_significance"], errors="coerce")
+            if "analysis_horizon_days" in df.columns:
+                df["analysis_horizon_days"] = pd.to_numeric(df["analysis_horizon_days"], errors="coerce")
 
-    # Uniquement les vraies pannes
-    df = df[df["is_failure"] == 1].copy()
-    df = df.sort_values(["asset_id", "event_start"])
+        out[name] = df
 
-    out = []
-    for asset_id, g in df.groupby("asset_id"):
-        g = g.sort_values("event_start").reset_index(drop=True)
-        for i in range(1, len(g)):
-            dt_h = (g.loc[i, "event_start"] - g.loc[i - 1, "event_start"]).total_seconds() / 3600.0
-            if dt_h > 0:
-                out.append(
-                    {
-                        "equipment_code": str(asset_id),
-                        "ttf_h": float(dt_h),
-                        "duree_rep_h": g.loc[i, "repair_time_hours"],
-                        "failure_time": g.loc[i, "event_start"],
-                        "event_id": g.loc[i, "event_id"],
-                    }
-                )
+    # enrichit sn_mva depuis asset_info si manquant dans thermal_params
+    if "asset_info" in out and "thermal_params" in out:
+        a = out["asset_info"].copy()
+        t = out["thermal_params"].copy()
+        if "asset_id" in a.columns and "asset_id" in t.columns:
+            if "sn_mva" not in t.columns or t["sn_mva"].isna().all():
+                if "rated_power_mva" in a.columns:
+                    merge = a[["asset_id", "rated_power_mva"]].copy()
+                    merge = merge.rename(columns={"rated_power_mva": "sn_mva_from_asset"})
+                    t = t.merge(merge, on="asset_id", how="left")
+                    if "sn_mva" not in t.columns:
+                        t["sn_mva"] = t["sn_mva_from_asset"]
+                    else:
+                        t["sn_mva"] = pd.to_numeric(t["sn_mva"], errors="coerce").fillna(t["sn_mva_from_asset"])
+                    t = t.drop(columns=[c for c in ["sn_mva_from_asset"] if c in t.columns])
+                    out["thermal_params"] = t
 
-    ttf_df = pd.DataFrame(out)
-    if ttf_df.empty:
-        return pd.DataFrame(columns=["equipment_code", "ttf_h", "duree_rep_h", "failure_time", "event_id"])
-    return ttf_df
+    return out
 
 
 def _validate_project_sheets(frames: Dict[str, pd.DataFrame]) -> list[str]:
-    errors = []
+    errors: list[str] = []
 
-    missing_sheets = [s for s in PROJECT_SHEETS if s not in frames]
+    missing_sheets = [s for s in PROJECT_REQUIRED if s not in frames]
     if missing_sheets:
         errors.append(f"Feuilles manquantes: {missing_sheets}")
         return errors
 
-    for sheet_name, required_cols in PROJECT_SHEETS.items():
+    for sheet_name, required_cols in PROJECT_REQUIRED.items():
         df = frames[sheet_name]
-        df.columns = [str(c).strip() for c in df.columns]
         missing_cols = [c for c in required_cols if c not in df.columns]
         if missing_cols:
             errors.append(f"{sheet_name}: colonnes manquantes {missing_cols}")
@@ -258,7 +319,6 @@ def _validate_project_sheets(frames: Dict[str, pd.DataFrame]) -> list[str]:
     if errors:
         return errors
 
-    # Validation events_history
     ev = frames["events_history"].copy()
     ev["event_start"] = pd.to_datetime(ev["event_start"], errors="coerce")
     if ev["event_start"].isna().any():
@@ -271,19 +331,17 @@ def _validate_project_sheets(frames: Dict[str, pd.DataFrame]) -> list[str]:
         if mask.any():
             errors.append("events_history: certaines lignes ont event_end < event_start.")
 
-    # Validation thermal_timeseries
     th = frames["thermal_timeseries"].copy()
     th["timestamp"] = pd.to_datetime(th["timestamp"], errors="coerce")
     if th["timestamp"].isna().any():
         errors.append("thermal_timeseries: certaines dates timestamp sont invalides.")
-    has_direct = {"top_oil_rise_c", "hotspot_gradient_c"}.issubset(set(th.columns))
-    has_load = "load_factor" in th.columns
-    if not (has_direct or has_load):
+
+    has_load_driver = any(c in th.columns for c in ["K", "charge_pct", "load_factor", "load_mva"])
+    if not has_load_driver:
         errors.append(
-            "thermal_timeseries: il faut soit [top_oil_rise_c + hotspot_gradient_c], soit [load_factor]."
+            "thermal_timeseries: il faut au moins une colonne parmi K, charge_pct, load_factor ou load_mva."
         )
 
-    # Cohérence asset_id
     assets = set(frames["asset_info"]["asset_id"].astype(str).dropna().unique())
     for sheet_name in ["events_history", "thermal_timeseries", "thermal_params", "maintenance_policies", "analysis_settings"]:
         current_assets = set(frames[sheet_name]["asset_id"].astype(str).dropna().unique())
@@ -292,61 +350,6 @@ def _validate_project_sheets(frames: Dict[str, pd.DataFrame]) -> list[str]:
             errors.append(f"{sheet_name}: asset_id inconnus par rapport à asset_info: {unknown}")
 
     return errors
-
-
-def _save_project_frames(frames: Dict[str, pd.DataFrame], source_name: str) -> dict:
-    PROJECT_DIR.mkdir(exist_ok=True, parents=True)
-    saved = {}
-    for name, df in frames.items():
-        out = PROJECT_DIR / f"{name}.csv"
-        df.to_csv(out, index=False)
-        saved[name] = str(out)
-
-    meta = {
-        "ok": True,
-        "source": source_name,
-        "sheets": list(frames.keys()),
-        "rows": {k: int(len(v)) for k, v in frames.items()},
-    }
-    PROJECT_META_PATH.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-    st.session_state["project_meta"] = meta
-    st.session_state["project_frames"] = frames
-    return meta
-
-
-def _load_project_meta() -> dict:
-    if PROJECT_META_PATH.exists():
-        try:
-            return json.loads(PROJECT_META_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    return {"ok": False}
-
-
-def _load_project_sheet(sheet_name: str) -> pd.DataFrame:
-    p = PROJECT_DIR / f"{sheet_name}.csv"
-    if p.exists():
-        try:
-            return pd.read_csv(p)
-        except Exception:
-            return pd.DataFrame()
-    return pd.DataFrame()
-
-
-def _clear_project_cache():
-    if PROJECT_DIR.exists():
-        for p in PROJECT_DIR.glob("*.csv"):
-            try:
-                p.unlink()
-            except Exception:
-                pass
-    if PROJECT_META_PATH.exists():
-        try:
-            PROJECT_META_PATH.unlink()
-        except Exception:
-            pass
-    st.session_state.pop("project_meta", None)
-    st.session_state.pop("project_frames", None)
 
 
 def _read_uploaded_file(uploaded_file) -> tuple[str, object]:
@@ -363,7 +366,7 @@ def _read_uploaded_file(uploaded_file) -> tuple[str, object]:
 
 # ------------------------- Header meta -------------------------
 meta = get_failures_meta()
-project_meta = _load_project_meta()
+project_meta = get_project_meta()
 
 cmeta1, cmeta2 = st.columns(2)
 with cmeta1:
@@ -381,20 +384,21 @@ with cmeta2:
             f"feuilles={', '.join(project_meta.get('sheets', []))}"
         )
     else:
-        st.info("Aucun projet Excel complet persistant pour le moment.")
+        st.info("Aucun projet Excel actif pour le moment.")
+
 
 tab_upload, tab_current, tab_mqtt = st.tabs(
     ["📄 Import CSV / Excel", "🗂️ Dataset / projet actif", "📡 Données MQTT (réglages)"]
 )
 
+
 # ------------------------- Upload tab -------------------------
 with tab_upload:
     st.subheader("Importer les données")
     st.caption(
-        "Formats supportés : "
-        "CSV simple (equipment_code, ttf_h[, duree_rep_h]) "
-        "ou Excel projet complet (.xlsx) avec feuilles "
-        "asset_info / events_history / thermal_timeseries / thermal_params / maintenance_policies / analysis_settings."
+        "CSV simple : equipment_code, ttf_h[, duree_rep_h] ; "
+        "Projet Excel : asset_info / events_history / thermal_timeseries / thermal_params / "
+        "maintenance_policies / analysis_settings."
     )
 
     c1, c2 = st.columns(2)
@@ -436,12 +440,23 @@ with tab_upload:
                     )
                     if st.button("🧮 Construire ttf_h", type="primary", use_container_width=True):
                         try:
-                            ttf_df = _compute_ttf_from_timestamps(df_loaded, eq_col, ts_col)
+                            tmp = df_loaded[[eq_col, ts_col]].dropna().copy()
+                            tmp[ts_col] = pd.to_datetime(tmp[ts_col], errors="coerce")
+                            tmp = tmp.dropna(subset=[ts_col]).sort_values([eq_col, ts_col])
+                            out_rows = []
+                            for eq, g in tmp.groupby(eq_col):
+                                t = g[ts_col].tolist()
+                                for i in range(1, len(t)):
+                                    dh = (t[i] - t[i - 1]).total_seconds() / 3600.0
+                                    if dh > 0:
+                                        out_rows.append({"equipment_code": str(eq), "ttf_h": float(dh), "duree_rep_h": None})
+                            ttf_df = pd.DataFrame(out_rows)
+
                             if ttf_df.empty:
                                 st.error("Impossible de construire des TTF (vérifie les dates/format).")
                             else:
                                 res = set_current_failures_df(
-                                    ttf_df[["equipment_code", "ttf_h", "duree_rep_h"]],
+                                    ttf_df,
                                     source_name=f"upload:{up.name}(timestamps)",
                                     persist=True,
                                 )
@@ -478,7 +493,8 @@ with tab_upload:
                             st.success(f"{n} lignes insérées dans {DB_PATH.name}")
 
         elif kind == "xlsx" and isinstance(payload, dict):
-            frames = {str(k).strip(): v.copy() for k, v in payload.items()}
+            frames = _normalize_project_frames({str(k).strip(): v.copy() for k, v in payload.items()})
+
             st.markdown("### Aperçu des feuilles détectées")
             st.write(sorted(frames.keys()))
 
@@ -488,12 +504,12 @@ with tab_upload:
                 for msg in errors:
                     st.write(f"- {msg}")
             else:
-                derived_ttf = _build_ttf_from_events(frames["events_history"])
+                derived_ttf = build_ttf_from_events(frames["events_history"])
+                frames["failures_ttf"] = derived_ttf
 
                 if derived_ttf.empty:
                     st.warning(
-                        "Aucun TTF dérivé depuis events_history. "
-                        "Vérifie qu'il y a au moins 2 pannes par asset_id avec is_failure=1."
+                        "Aucun TTF dérivé depuis events_history. Vérifie qu'il y a au moins 2 pannes par asset_id avec is_failure=1."
                     )
 
                 st.markdown("### Aperçu projet")
@@ -505,31 +521,36 @@ with tab_upload:
 
                 cc1, cc2 = st.columns(2)
                 with cc1:
-                    if st.button("✅ Utiliser ce projet (persister + synchroniser TTF)", type="primary"):
+                    if st.button("✅ Utiliser ce projet (persister + synchroniser tout)", type="primary"):
                         try:
-                            project_info = _save_project_frames(frames, source_name=f"upload:{up.name}")
-                            res = set_current_failures_df(
-                                derived_ttf[["equipment_code", "ttf_h", "duree_rep_h"]],
-                                source_name=f"project:{up.name}:events_history",
+                            res = set_current_project_data(
+                                frames=frames,
+                                source_name=f"upload:{up.name}",
                                 persist=True,
+                                sync_failures=True,
                             )
-                            st.success(
-                                "Projet sauvegardé ✅ | "
-                                f"feuilles={len(project_info['sheets'])} | "
-                                f"TTF synchronisés={res['rows']} lignes | hash={res['hash']}"
-                            )
+                            if res.get("ok"):
+                                st.success(
+                                    "Projet synchronisé ✅ | "
+                                    f"feuilles={len(res.get('sheets', []))} | "
+                                    f"TTF synchronisés={res.get('failures_rows', 0)} | "
+                                    f"hash projet={res.get('hash')}"
+                                )
+                            else:
+                                st.error(res.get("msg", "Erreur inconnue lors de la synchronisation projet."))
                         except Exception as e:
-                            st.error(f"Sauvegarde projet: {e}")
+                            st.error(f"Synchronisation projet: {e}")
                 with cc2:
                     if st.button("⬆️ Envoyer les TTF dérivés dans SQLite", use_container_width=True):
                         try:
                             n = bulk_insert_failures(
-                                derived_ttf[["equipment_code", "ttf_h", "duree_rep_h"]],
+                                derived_ttf,
                                 source=f"project:{up.name}:events_history",
                             )
                             st.success(f"{n} lignes insérées dans {DB_PATH.name}")
                         except Exception as e:
                             st.error(f"SQLite: {e}")
+
 
 # ------------------------- Current tab -------------------------
 with tab_current:
@@ -551,24 +572,33 @@ with tab_current:
                 st.success("Table failures vidée.")
 
     st.divider()
-    st.subheader("Projet Excel actif")
-    project_meta = _load_project_meta()
-    if not project_meta.get("ok"):
-        st.info("Aucun projet Excel persistant.")
+    st.subheader("Projet actif")
+    project_meta = get_project_meta()
+    frames = get_current_project_data()
+
+    if not project_meta.get("ok") or not frames:
+        st.info("Aucun projet complet actif.")
     else:
         st.json(project_meta)
-        available_sheets = project_meta.get("sheets", [])
+        available_sheets = sorted(list(frames.keys()))
         if available_sheets:
-            selected_sheet = st.selectbox("Voir une feuille persistée", options=available_sheets)
-            project_df = _load_project_sheet(selected_sheet)
+            selected_sheet = st.selectbox("Voir une feuille active", options=available_sheets)
+            project_df = frames.get(selected_sheet, pd.DataFrame())
             if project_df.empty:
-                st.warning("Feuille persistée introuvable ou vide.")
+                st.warning("Feuille active vide.")
             else:
                 st.dataframe(project_df.head(50), use_container_width=True, hide_index=True)
 
-        if st.button("🗑️ Supprimer le projet Excel persistant", use_container_width=True):
-            _clear_project_cache()
-            st.success("Projet persistant supprimé.")
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("🗑️ Supprimer le projet actif", use_container_width=True):
+                clear_current_project_data(clear_failures=False)
+                st.success("Projet actif supprimé.")
+        with c2:
+            if st.button("🗑️ Supprimer projet + TTF actif", use_container_width=True):
+                clear_current_project_data(clear_failures=True)
+                st.success("Projet actif et dataset TTF supprimés.")
+
 
 # ------------------------- MQTT tab -------------------------
 with tab_mqtt:

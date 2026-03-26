@@ -1,19 +1,37 @@
-# pages/2_Indicateurs.py (ou ton nom réel)
 from __future__ import annotations
 
+from io import BytesIO
 from pathlib import Path
 import math
+from typing import Any, Dict, Optional
+
 import numpy as np
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import streamlit as st
+from scipy import stats as sst
 
 from core.security.auth import require_login
 from core.datahub import get_current_failures_df, get_failures_meta
-from core.reliability.weibull import R, F, pdf, hazard, fit_weibull
 from core.reliability.organigram import analyze_ttf_pipeline
+
+# Optional datahub accessors for project/thermal context
+try:
+    from core.datahub import get_current_project_data  # type: ignore
+except Exception:
+    get_current_project_data = None
+
+try:
+    from core.datahub import get_current_thermal_df  # type: ignore
+except Exception:
+    get_current_thermal_df = None
+
+try:
+    from core.datahub import get_current_thermal_params  # type: ignore
+except Exception:
+    get_current_thermal_params = None
 
 try:
     from core.reliability.reporting_merged import export_merged_report_pdf
@@ -26,12 +44,19 @@ else:
 st.set_page_config(page_title="Indicateurs", page_icon="📊", layout="wide")
 require_login()
 
-st.title("📊 Indicateurs — Fiabilité")
+st.title("📊 Indicateurs — Fiabilité & Thermique")
+st.caption(
+    "Cette page exploite le nouveau pipeline intégré : tests de tendance, dépendance, "
+    "choix du processus, ajustement, indicateurs fiabilistes et, si disponible, modélisation thermique."
+)
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 
-# ---------- Helpers ----------
-def fnum(x, nd=2, default="—"):
+
+# ---------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------
+def fnum(x: Any, nd: int = 2, default: str = "—") -> str:
     try:
         if x is None:
             return default
@@ -42,179 +67,507 @@ def fnum(x, nd=2, default="—"):
     except Exception:
         return default
 
-def _pipeline_str(pipe: dict) -> str:
-    model = pipe.get("model", "RP")
-    dist = pipe.get("distribution", "weibull_2p")
-    mk = (pipe.get("tests", {}) or {}).get("trend_mk", {})
-    dep = (pipe.get("tests", {}) or {}).get("dependence", {})
-    good = pipe.get("goodness", {}) or {}
+
+
+def _series_to_list(s: pd.Series) -> Optional[list[float]]:
+    vals = pd.to_numeric(s, errors="coerce").dropna()
+    vals = vals[vals > 0]
+    if vals.empty:
+        return None
+    return vals.astype(float).tolist()
+
+
+
+def _extract_thermal_context(eq: str) -> tuple[Optional[pd.DataFrame], Optional[Dict[str, Any]]]:
+    thermal_df: Optional[pd.DataFrame] = None
+    thermal_cfg: Optional[Dict[str, Any]] = None
+
+    # 1) project_data (preferred if available)
+    try:
+        if callable(get_current_project_data):
+            proj = get_current_project_data()
+        else:
+            proj = st.session_state.get("project_data")
+    except Exception:
+        proj = st.session_state.get("project_data")
+
+    if isinstance(proj, dict):
+        raw_thermal = proj.get("thermal_timeseries")
+        raw_params = proj.get("thermal_params")
+        if isinstance(raw_thermal, pd.DataFrame) and not raw_thermal.empty:
+            asset_col = "asset_id" if "asset_id" in raw_thermal.columns else "equipment_code" if "equipment_code" in raw_thermal.columns else None
+            thermal_df = raw_thermal.copy()
+            if asset_col:
+                thermal_df = thermal_df[thermal_df[asset_col].astype(str) == str(eq)].copy()
+            if thermal_df.empty:
+                thermal_df = None
+        if isinstance(raw_params, pd.DataFrame) and not raw_params.empty:
+            param_row = raw_params.copy()
+            asset_col = "asset_id" if "asset_id" in param_row.columns else "equipment_code" if "equipment_code" in param_row.columns else None
+            if asset_col:
+                param_row = param_row[param_row[asset_col].astype(str) == str(eq)].copy()
+            if param_row.empty:
+                param_row = raw_params.head(1).copy()
+            if not param_row.empty:
+                row = param_row.iloc[0].to_dict()
+                row.pop("asset_id", None)
+                row.pop("equipment_code", None)
+                thermal_cfg = {k: v for k, v in row.items() if pd.notna(v)}
+
+    # 2) dedicated optional accessors
+    if thermal_df is None:
+        try:
+            if callable(get_current_thermal_df):
+                raw = get_current_thermal_df()
+                if isinstance(raw, pd.DataFrame) and not raw.empty:
+                    asset_col = "asset_id" if "asset_id" in raw.columns else "equipment_code" if "equipment_code" in raw.columns else None
+                    thermal_df = raw.copy()
+                    if asset_col:
+                        thermal_df = thermal_df[thermal_df[asset_col].astype(str) == str(eq)].copy()
+                    if thermal_df.empty:
+                        thermal_df = None
+        except Exception:
+            thermal_df = thermal_df
+
+    if thermal_cfg is None:
+        try:
+            if callable(get_current_thermal_params):
+                raw_cfg = get_current_thermal_params(eq)
+                if isinstance(raw_cfg, dict) and raw_cfg:
+                    thermal_cfg = raw_cfg
+        except Exception:
+            thermal_cfg = thermal_cfg
+
+    # 3) session-state fallbacks
+    if thermal_df is None:
+        raw = st.session_state.get("thermal_df")
+        if isinstance(raw, pd.DataFrame) and not raw.empty:
+            asset_col = "asset_id" if "asset_id" in raw.columns else "equipment_code" if "equipment_code" in raw.columns else None
+            thermal_df = raw.copy()
+            if asset_col:
+                thermal_df = thermal_df[thermal_df[asset_col].astype(str) == str(eq)].copy()
+            if thermal_df.empty:
+                thermal_df = None
+
+    if thermal_cfg is None:
+        raw_cfg = st.session_state.get("thermal_config")
+        if isinstance(raw_cfg, dict) and raw_cfg:
+            thermal_cfg = raw_cfg
+
+    return thermal_df, thermal_cfg
+
+
+
+def _get_dist_and_params(reliability: Dict[str, Any]):
+    model = reliability.get("model")
+    if model != "RP":
+        return None, None
+    name = reliability.get("distribution")
+    params = (reliability.get("params") or {}).get("raw")
+    if not params:
+        return None, None
+    if name == "expon":
+        return sst.expon, params
+    if name == "norm":
+        return sst.norm, params
+    if name == "lognorm":
+        return sst.lognorm, params
+    if name in {"weibull_2p", "weibull_3p"}:
+        return sst.weibull_min, params
+    return None, None
+
+
+
+def _compute_curve(reliability: Dict[str, Any], t: np.ndarray, curve: str) -> Optional[np.ndarray]:
+    dist, params = _get_dist_and_params(reliability)
+    if dist is None or params is None:
+        return None
+    try:
+        if curve == "R":
+            y = dist.sf(t, *params)
+        elif curve == "F":
+            y = dist.cdf(t, *params)
+        elif curve == "pdf":
+            y = dist.pdf(t, *params)
+        elif curve == "hazard":
+            sf = dist.sf(t, *params)
+            yy = dist.pdf(t, *params)
+            y = np.divide(yy, sf, out=np.full_like(yy, np.nan, dtype=float), where=sf > 1e-12)
+        else:
+            return None
+        return np.asarray(y, dtype=float)
+    except Exception:
+        return None
+
+
+
+def _pipeline_str(result: Dict[str, Any]) -> str:
+    rel = result.get("reliability", {}) or {}
+    tests = rel.get("tests", {}) or {}
+    mk = tests.get("trend_mk", {}) or {}
+    lap = tests.get("trend_laplace", {}) or {}
+    dep = tests.get("dependence", {}) or {}
+    good = rel.get("goodness", {}) or {}
+    dec = rel.get("decision", {}) or {}
     return (
         f"TTF>0 → MK(p={fnum(mk.get('p'),3)}, dir={mk.get('direction','none')}) "
-        f"→ Dep(r={fnum(dep.get('r'),3)}, p={fnum(dep.get('p'),3)}) "
-        f"→ Model={model} ; Dist={dist} ; KS p={fnum(good.get('ks_p'),3)} ; Chi2 p={fnum(good.get('chi2_p'),3)}"
+        f"→ Laplace(p={fnum(lap.get('p'),3)}, dir={lap.get('direction','none')}) "
+        f"→ Dep(Spearman r={fnum(dep.get('spearman_r'),3)}, p={fnum(dep.get('spearman_p'),3)}) "
+        f"→ Process={rel.get('model','?')} ; Dist={rel.get('distribution','?')} "
+        f"; KS p={fnum(good.get('ks_p'),3)} ; Chi2 p={fnum(good.get('chi2_p'),3)} ; "
+        f"Décision={dec.get('reason','—')}"
     )
 
-# ---------- Dataset officiel ----------
+
+
+def _export_tables_xlsx(result_by_eq: Dict[str, Dict[str, Any]]) -> bytes:
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        summary_rows = []
+        for eq, result in result_by_eq.items():
+            for name, table in (result.get("tables") or {}).items():
+                if isinstance(table, pd.DataFrame) and not table.empty:
+                    sheet = f"{eq}_{name}"[:31]
+                    table.to_excel(writer, sheet_name=sheet, index=False)
+            rel = result.get("reliability", {})
+            ind = rel.get("indicators", {}) or {}
+            summary_rows.append(
+                {
+                    "equipment_code": eq,
+                    "model": rel.get("model"),
+                    "distribution": rel.get("distribution"),
+                    "MTTF_h": ind.get("theoretical_mttf_h") or ind.get("empirical_mttf_h"),
+                    "MTBF_h": ind.get("mtbf_h"),
+                    "MTTR_h": ind.get("mttr_h"),
+                    "availability": ind.get("availability_intrinsic"),
+                }
+            )
+        if summary_rows:
+            pd.DataFrame(summary_rows).to_excel(writer, sheet_name="summary", index=False)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+# ---------------------------------------------------------------------
+# Dataset actif
+# ---------------------------------------------------------------------
 meta = get_failures_meta()
 df_src = get_current_failures_df()
 
 if df_src.empty:
-    st.error("Aucun dataset actif. Va sur « Sources de données » et synchronise un CSV.")
+    st.error("Aucun dataset actif. Va sur « Sources de données » et synchronise un dataset.")
     st.stop()
 
 st.success(f"Dataset actif ✅ | rows={meta.get('rows')} | hash={meta.get('hash')} | source={meta.get('source')}")
 
-eqs_all = sorted(df_src["equipment_code"].unique().tolist())
-sel = st.multiselect("Équipements", options=eqs_all, default=eqs_all[: min(5, len(eqs_all))])
+if "equipment_code" not in df_src.columns or "ttf_h" not in df_src.columns:
+    st.error("Le dataset actif doit contenir au minimum les colonnes `equipment_code` et `ttf_h`.")
+    st.stop()
+
+controls = st.columns([2, 1])
+with controls[0]:
+    eqs_all = sorted(df_src["equipment_code"].astype(str).unique().tolist())
+    sel = st.multiselect("Équipements", options=eqs_all, default=eqs_all[: min(5, len(eqs_all))])
+with controls[1]:
+    alpha = st.number_input("Seuil alpha", min_value=0.001, max_value=0.20, value=0.05, step=0.005)
+
 if not sel:
     st.info("Sélectionne au moins un équipement.")
     st.stop()
 
-# ---------- Fit + Pipeline ----------
-class _WB:
-    def __init__(self, beta, eta, gamma=0.0):
-        self.beta = float(beta)
-        self.eta = float(eta)
-        self.gamma = float(gamma or 0.0)
 
-fits: dict[str, _WB] = {}
-pipe_by: dict[str, dict] = {}
-metrics_rows: list[dict] = []
+# ---------------------------------------------------------------------
+# Analyse intégrée par équipement
+# ---------------------------------------------------------------------
+results_by: Dict[str, Dict[str, Any]] = {}
+summary_rows: list[dict[str, Any]] = []
+curve_ready_eqs: list[str] = []
+skipped_curve_eqs: list[str] = []
 
 for eq in sel:
-    ttfs = df_src.loc[df_src["equipment_code"] == eq, "ttf_h"].values
-    if len(ttfs) < 3:
+    g = df_src[df_src["equipment_code"].astype(str) == str(eq)].copy()
+    ttf_list = _series_to_list(g["ttf_h"])
+    if not ttf_list or len(ttf_list) < 3:
         continue
+
+    repair_list = None
+    if "duree_rep_h" in g.columns:
+        repair_list = _series_to_list(g["duree_rep_h"])
+
+    thermal_df, thermal_cfg = _extract_thermal_context(eq)
+
     try:
-        wb = fit_weibull(ttfs)
-        fits[eq] = _WB(wb.beta, wb.eta, getattr(wb, "gamma", 0.0))
+        result = analyze_ttf_pipeline(
+            ttf_series=ttf_list,
+            alpha=float(alpha),
+            repair_series=repair_list,
+            thermal_df=thermal_df,
+            thermal_config=thermal_cfg,
+        )
+        results_by[str(eq)] = result
 
-        pipe = analyze_ttf_pipeline(ttfs.tolist())
-        pipe_by[eq] = pipe
+        rel = result["reliability"]
+        ind = rel.get("indicators", {}) or {}
+        therm = result.get("thermal")
+        therm_summary = (therm or {}).get("summary", {}) if therm else {}
 
-        mtbf = float(np.mean(ttfs))
-        metrics_rows.append({
-            "equipment_code": eq,
-            "n_ttf": int(len(ttfs)),
-            "MTBF": mtbf,
-            "beta": float(fits[eq].beta),
-            "eta": float(fits[eq].eta),
-            "gamma": float(fits[eq].gamma),
-            "model": pipe.get("model", "?"),
-            "distribution": pipe.get("distribution", "?"),
-            "ks_p": (pipe.get("goodness", {}) or {}).get("ks_p"),
-            "chi2_p": (pipe.get("goodness", {}) or {}).get("chi2_p"),
-        })
-    except Exception:
-        continue
+        summary_rows.append(
+            {
+                "equipment_code": eq,
+                "n_ttf": int(rel.get("cleaned_n", 0)),
+                "model": rel.get("model"),
+                "distribution": rel.get("distribution"),
+                "MTTF_h": ind.get("theoretical_mttf_h") or ind.get("empirical_mttf_h"),
+                "MTBF_h": ind.get("mtbf_h"),
+                "MTTR_h": ind.get("mttr_h"),
+                "availability": ind.get("availability_intrinsic"),
+                "AIC": (rel.get("goodness") or {}).get("aic"),
+                "KS_p": (rel.get("goodness") or {}).get("ks_p"),
+                "Chi2_p": (rel.get("goodness") or {}).get("chi2_p"),
+                "CvM_p": (rel.get("goodness") or {}).get("cvm_p"),
+                "beta": (rel.get("params") or {}).get("beta"),
+                "eta": (rel.get("params") or {}).get("eta"),
+                "gamma": (rel.get("params") or {}).get("gamma"),
+                "theta_HS_max": therm_summary.get("theta_hs_max"),
+                "FAA_max": therm_summary.get("faa_max"),
+                "loss_of_life_pct": therm_summary.get("loss_of_life_pct"),
+            }
+        )
 
-if not fits:
-    st.error("Pas assez de TTF (≥3) pour les équipements sélectionnés.")
+        if rel.get("model") == "RP" and rel.get("distribution") in {"expon", "norm", "lognorm", "weibull_2p", "weibull_3p"}:
+            curve_ready_eqs.append(str(eq))
+        else:
+            skipped_curve_eqs.append(str(eq))
+    except Exception as e:
+        st.warning(f"Analyse impossible pour {eq}: {e}")
+
+if not results_by:
+    st.error("Pas assez de TTF exploitables (≥3) pour les équipements sélectionnés.")
     st.stop()
 
-# ---------- Domaine temps ----------
-tmax = float(df_src[df_src["equipment_code"].isin(sel)]["ttf_h"].max())
-tmax = max(1000.0, tmax if np.isfinite(tmax) and tmax > 0 else 1000.0)
-t = np.linspace(0, tmax, 300)
+summary_df = pd.DataFrame(summary_rows).sort_values("equipment_code").reset_index(drop=True)
+detail_eq = st.selectbox("Équipement à détailler", options=list(results_by.keys()), index=0)
+detail_result = results_by[detail_eq]
+detail_tables = detail_result.get("tables", {}) or {}
+detail_rel = detail_result.get("reliability", {}) or {}
+detail_therm = detail_result.get("thermal")
 
-def multi_plot(ax, fun, title, ylabel):
-    for eq, ft in fits.items():
-        try:
-            y = fun(t, ft)
-            ax.plot(t, y, label=f"{eq} (β={ft.beta:.2f}, η={ft.eta:.1f}h)", linewidth=2)
-        except Exception:
-            continue
-    ax.set_title(title)
-    ax.set_xlabel("Temps (h)")
-    ax.set_ylabel(ylabel)
-    ax.grid(True, alpha=0.3)
-    ax.legend(fontsize=8)
 
-# ---------- Graphiques ----------
-tabR, tabF, tabf, tabh, tabG = st.tabs(["R(t)", "F(t)", "f(t)", "h(t)", "🧭 Organigramme"])
+# ---------------------------------------------------------------------
+# Synthèse
+# ---------------------------------------------------------------------
+st.subheader("📋 Synthèse globale")
+metric_cols = st.columns(4)
+with metric_cols[0]:
+    st.metric("Équipements analysés", len(results_by))
+with metric_cols[1]:
+    st.metric("TTF total", int(summary_df["n_ttf"].sum()))
+with metric_cols[2]:
+    avail_mean = summary_df["availability"].dropna()
+    st.metric("Disponibilité moyenne", fnum(avail_mean.mean(), 4) if not avail_mean.empty else "—")
+with metric_cols[3]:
+    theta_max = summary_df["theta_HS_max"].dropna()
+    st.metric("θHS max observé", fnum(theta_max.max(), 2) if not theta_max.empty else "—")
 
-with tabR:
-    fig, ax = plt.subplots()
-    multi_plot(ax, R, "Fiabilité R(t)", "R(t)")
-    st.pyplot(fig, clear_figure=True)
+st.dataframe(summary_df, use_container_width=True, hide_index=True)
 
-with tabF:
-    fig, ax = plt.subplots()
-    multi_plot(ax, F, "Répartition F(t)", "F(t)")
-    st.pyplot(fig, clear_figure=True)
 
-with tabf:
-    fig, ax = plt.subplots()
-    multi_plot(ax, pdf, "Densité f(t)", "f(t)")
-    st.pyplot(fig, clear_figure=True)
+# ---------------------------------------------------------------------
+# Tabs
+# ---------------------------------------------------------------------
+main_tabs = st.tabs([
+    "📈 Courbes fiabilistes",
+    "🧭 Tests & organigramme",
+    "🌡️ Thermique",
+    "📄 Exports",
+])
 
-with tabh:
-    fig, ax = plt.subplots()
-    multi_plot(ax, hazard, "Taux de défaillance h(t)", "h(t)")
-    st.pyplot(fig, clear_figure=True)
+# ---------- Courbes ----------
+with main_tabs[0]:
+    st.caption("Les courbes analytiques R(t), F(t), f(t), h(t) sont tracées pour les équipements RP avec loi paramétrique iid retenue.")
+    if skipped_curve_eqs:
+        st.info(
+            "Courbes analytiques non tracées pour : "
+            + ", ".join(skipped_curve_eqs)
+            + " (processus NHPP/BPP ou loi non paramétrique iid)."
+        )
 
-with tabG:
-    for eq in sel:
-        with st.expander(f"Trace organigramme — {eq}", expanded=False):
-            pipe = pipe_by.get(eq, {})
-            if not pipe:
-                st.info("Pas de trace disponible pour cet équipement.")
+    tmax = float(df_src[df_src["equipment_code"].astype(str).isin(list(results_by.keys()))]["ttf_h"].max())
+    tmax = max(1000.0, tmax if np.isfinite(tmax) and tmax > 0 else 1000.0)
+    t = np.linspace(1e-6, tmax, 300)
+
+    def multi_plot(ax, curve: str, title: str, ylabel: str):
+        plotted = 0
+        for eq in curve_ready_eqs:
+            rel = results_by[eq]["reliability"]
+            y = _compute_curve(rel, t, curve)
+            if y is None:
                 continue
+            ax.plot(t, y, label=f"{eq} ({rel.get('distribution')})", linewidth=2)
+            plotted += 1
+        ax.set_title(title)
+        ax.set_xlabel("Temps (h)")
+        ax.set_ylabel(ylabel)
+        ax.grid(True, alpha=0.3)
+        if plotted:
+            ax.legend(fontsize=8)
+        else:
+            ax.text(0.5, 0.5, "Aucune courbe disponible", ha="center", va="center", transform=ax.transAxes)
 
-            st.write(f"- Modèle: **{pipe.get('model','?')}**")
-            st.write(f"- Distribution: **{pipe.get('distribution','?')}**")
+    curve_tabs = st.tabs(["R(t)", "F(t)", "f(t)", "h(t)"])
+    with curve_tabs[0]:
+        fig, ax = plt.subplots()
+        multi_plot(ax, "R", "Fiabilité R(t)", "R(t)")
+        st.pyplot(fig, clear_figure=True)
+    with curve_tabs[1]:
+        fig, ax = plt.subplots()
+        multi_plot(ax, "F", "Fonction de répartition F(t)", "F(t)")
+        st.pyplot(fig, clear_figure=True)
+    with curve_tabs[2]:
+        fig, ax = plt.subplots()
+        multi_plot(ax, "pdf", "Densité f(t)", "f(t)")
+        st.pyplot(fig, clear_figure=True)
+    with curve_tabs[3]:
+        fig, ax = plt.subplots()
+        multi_plot(ax, "hazard", "Taux de défaillance h(t)", "h(t)")
+        st.pyplot(fig, clear_figure=True)
 
-            mk = (pipe.get("tests", {}) or {}).get("trend_mk", {})
-            dep = (pipe.get("tests", {}) or {}).get("dependence", {})
-            good = pipe.get("goodness", {}) or {}
-            prm = pipe.get("params", {}) or {}
+# ---------- Tests & Organigramme ----------
+with main_tabs[1]:
+    st.subheader(f"Détail — {detail_eq}")
+    st.code(_pipeline_str(detail_result), language="text")
 
-            st.write(f"- MK: p={fnum(mk.get('p'),3)} • direction={mk.get('direction','none')}")
-            st.write(f"- Dépendance: r={fnum(dep.get('r'),3)} • p={fnum(dep.get('p'),3)} • méthode={dep.get('method','?')}")
-            st.write(f"- Goodness: KS p={fnum(good.get('ks_p'),3)} • Chi2 p={fnum(good.get('chi2_p'),3)} • AIC={fnum(good.get('aic'),2)}")
+    rel_tabs = st.tabs([
+        "Tendance",
+        "Dépendance",
+        "Processus",
+        "Ajustements",
+        "Résumé fiabiliste",
+        "JSON brut",
+    ])
+    with rel_tabs[0]:
+        st.dataframe(detail_tables.get("trend_results", pd.DataFrame()), use_container_width=True, hide_index=True)
+    with rel_tabs[1]:
+        st.dataframe(detail_tables.get("dependence_results", pd.DataFrame()), use_container_width=True, hide_index=True)
+    with rel_tabs[2]:
+        st.dataframe(detail_tables.get("process_choice", pd.DataFrame()), use_container_width=True, hide_index=True)
+    with rel_tabs[3]:
+        st.dataframe(detail_tables.get("fit_candidates", pd.DataFrame()), use_container_width=True, hide_index=True)
+    with rel_tabs[4]:
+        st.dataframe(detail_tables.get("reliability_summary", pd.DataFrame()), use_container_width=True, hide_index=True)
+    with rel_tabs[5]:
+        st.json(detail_result)
 
-            if prm.get("beta") is not None:
-                st.write(f"- Weibull: β={fnum(prm.get('beta'),3)} • η={fnum(prm.get('eta'),1)} h • γ={fnum(prm.get('gamma'),1)}")
+# ---------- Thermique ----------
+with main_tabs[2]:
+    if detail_therm is None:
+        st.info(
+            "Aucune série thermique disponible pour cet équipement. La page fonctionne déjà pour la partie fiabilité ; "
+            "la partie thermique apparaîtra dès que `Sources` synchronisera `thermal_timeseries` et `thermal_params` dans le datahub ou la session."
+        )
+    else:
+        therm_tabs = st.tabs([
+            "Synthèse thermique",
+            "Tables thermique",
+            "Courbes thermique",
+            "Journaliers & top 5",
+        ])
+        with therm_tabs[0]:
+            st.dataframe(detail_tables.get("thermal_summary", pd.DataFrame()), use_container_width=True, hide_index=True)
+        with therm_tabs[1]:
+            st.markdown("**Jeu de données**")
+            st.dataframe(detail_tables.get("thermal_table_dataset", pd.DataFrame()), use_container_width=True, hide_index=True)
+            st.markdown("**Paramètres**")
+            st.dataframe(detail_tables.get("thermal_table_params", pd.DataFrame()), use_container_width=True, hide_index=True)
+            st.markdown("**Indicateurs**")
+            st.dataframe(detail_tables.get("thermal_table_indicators", pd.DataFrame()), use_container_width=True, hide_index=True)
+        with therm_tabs[2]:
+            ts = detail_therm["timeseries"].copy()
+            ts["timestamp"] = pd.to_datetime(ts["timestamp"])
 
-            st.code(_pipeline_str(pipe), language="text")
-            with st.expander("Détails bruts (JSON)", expanded=False):
-                st.json(pipe)
+            fig1, ax1 = plt.subplots(figsize=(11, 4))
+            ax1.plot(ts["timestamp"], ts["theta_HS_est_C"], label="θHS estimée")
+            ax1.plot(ts["timestamp"], ts["theta_TO_est_C"], label="θTO estimée")
+            ax1.set_title(f"Températures estimées — {detail_eq}")
+            ax1.set_xlabel("Temps")
+            ax1.set_ylabel("Température (°C)")
+            ax1.grid(True, alpha=0.3)
+            ax1.legend()
+            st.pyplot(fig1, clear_figure=True)
 
-# ---------- Tableau synthèse ----------
-st.divider()
-st.subheader("📋 Tableau synthèse MTBF + β/η/γ (+ modèle/loi)")
-dfm = pd.DataFrame(metrics_rows).sort_values("equipment_code").reset_index(drop=True)
-st.dataframe(dfm, use_container_width=True, hide_index=True)
+            fig2, ax2 = plt.subplots(figsize=(11, 4))
+            ax2.plot(ts["timestamp"], ts["FAA"], label="FAA")
+            ax2.set_title(f"Facteur d'accélération du vieillissement — {detail_eq}")
+            ax2.set_xlabel("Temps")
+            ax2.set_ylabel("FAA")
+            ax2.grid(True, alpha=0.3)
+            ax2.legend()
+            st.pyplot(fig2, clear_figure=True)
 
-# ---------- Export ----------
-st.divider()
-st.subheader("📄 Rapport complet (analyse + indicateurs + courbes)")
+            fig3, ax3 = plt.subplots(figsize=(11, 4))
+            ax3.plot(ts["timestamp"], ts["life_consumed_pct_cum"], label="Vie consommée cumulée (%)")
+            ax3.plot(ts["timestamp"], ts["remaining_life_pct"], label="Vie restante (%)")
+            ax3.set_title(f"Perte de vie cumulée / vie restante — {detail_eq}")
+            ax3.set_xlabel("Temps")
+            ax3.set_ylabel("Pourcentage (%)")
+            ax3.grid(True, alpha=0.3)
+            ax3.legend()
+            st.pyplot(fig3, clear_figure=True)
+        with therm_tabs[3]:
+            st.markdown("**Résumé journalier**")
+            st.dataframe(detail_tables.get("thermal_daily", pd.DataFrame()), use_container_width=True, hide_index=True)
+            st.markdown("**Top 5 jours critiques**")
+            st.dataframe(detail_tables.get("thermal_top5_days", pd.DataFrame()), use_container_width=True, hide_index=True)
 
-if export_merged_report_pdf is None:
-    st.info("Module `core.reliability.reporting_merged` non détecté.")
-    if _REPORT_ERR:
-        st.caption(f"Détail import: {_REPORT_ERR}")
-else:
-    df_sel = df_src[df_src["equipment_code"].isin(sel)].copy()
-    if st.button("📄 Générer rapport complet", type="primary"):
-        try:
-            path = export_merged_report_pdf(
-                df=df_sel,
-                out_dir=str(BASE_DIR / "reports"),
-                title="Rapport complet — Analyse & Indicateurs",
-            )
-            st.session_state["last_report_path"] = path
-            st.success(f"PDF généré : {path}")
-        except Exception as e:
-            st.error(f"PDF : {e}")
+# ---------- Exports ----------
+with main_tabs[3]:
+    st.subheader("Téléchargements")
+    xlsx_bytes = _export_tables_xlsx(results_by)
+    st.download_button(
+        "📥 Télécharger les tableaux Excel",
+        data=xlsx_bytes,
+        file_name="indicateurs_tables.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
 
-    pdf_path = st.session_state.get("last_report_path")
-    if pdf_path and Path(pdf_path).exists():
-        with open(pdf_path, "rb") as f:
-            st.download_button(
-                "📥 Télécharger le rapport PDF",
-                data=f,
-                file_name=Path(pdf_path).name,
-                mime="application/pdf",
-                use_container_width=True,
-            )
+    if export_merged_report_pdf is None:
+        st.info("Module `core.reliability.reporting_merged` non détecté ou incompatible.")
+        if _REPORT_ERR:
+            st.caption(f"Détail import: {_REPORT_ERR}")
+    else:
+        df_sel = df_src[df_src["equipment_code"].astype(str).isin(sel)].copy()
+        if st.button("📄 Générer rapport PDF indicateurs", type="primary"):
+            try:
+                try:
+                    path = export_merged_report_pdf(
+                        df=df_sel,
+                        out_dir=str(BASE_DIR / "reports"),
+                        title="Rapport complet — Indicateurs",
+                        analysis_results=results_by,
+                    )
+                except TypeError:
+                    path = export_merged_report_pdf(
+                        df=df_sel,
+                        out_dir=str(BASE_DIR / "reports"),
+                        title="Rapport complet — Indicateurs",
+                    )
+                st.session_state["last_report_path"] = path
+                st.success(f"PDF généré : {path}")
+            except Exception as e:
+                st.error(f"PDF : {e}")
+
+        pdf_path = st.session_state.get("last_report_path")
+        if pdf_path and Path(pdf_path).exists():
+            with open(pdf_path, "rb") as f:
+                st.download_button(
+                    "📥 Télécharger le rapport PDF",
+                    data=f,
+                    file_name=Path(pdf_path).name,
+                    mime="application/pdf",
+                    use_container_width=True,
+                )
+
+st.info(
+    "Suite logique : après cette page, il faudra ajuster `Optimisation`, `Maintenance` et le module PDF pour exploiter les mêmes `tables` retournées par le pipeline intégré."
+)
