@@ -4,7 +4,7 @@ from pathlib import Path
 import io
 import math
 import hashlib
-from typing import Any, Optional, Dict, List
+from typing import Any, Optional, Dict
 
 import numpy as np
 import pandas as pd
@@ -19,12 +19,18 @@ from core.reliability.policy import suggested_actions
 from core.reliability.organigram import analyze_ttf_pipeline
 from core.reliability.optimize import propose_intervals_cost_and_reliability
 from core.security.auth import require_login
-from core.datahub import (
-    get_current_failures_df,
-    get_failures_meta,
-    get_project_meta,
-    get_pipeline_inputs,
-)
+from core.datahub import get_current_failures_df, get_failures_meta, get_project_meta
+
+try:
+    from core.datahub import get_pipeline_inputs
+except Exception:
+    def get_pipeline_inputs(asset_id: Optional[str] = None) -> Dict[str, Any]:
+        return {
+            "asset_id": asset_id,
+            "thermal_df": None,
+            "thermal_config": None,
+            "alpha": 0.05,
+        }
 
 export_optimization_report_pdf = None
 _pdf_import_error = None
@@ -47,6 +53,8 @@ st.title("🧠 Optimisation")
 # -------------------------------------------------------------------
 def _safe_num(x: Any, default: Optional[float] = None) -> Optional[float]:
     try:
+        if x is None:
+            return default
         v = float(x)
         return v if np.isfinite(v) else default
     except Exception:
@@ -77,6 +85,45 @@ def _df_hash(df: pd.DataFrame) -> str:
     if df is None or df.empty:
         return "empty"
     return hashlib.md5(df.to_csv(index=False).encode("utf-8")).hexdigest()
+
+
+def _sanitize_thermal_config(cfg: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(cfg, dict) or not cfg:
+        return None
+
+    allowed = {
+        "sn_mva",
+        "R",
+        "delta_to_r",
+        "delta_h_r",
+        "tau_to_min",
+        "tau_w_min",
+        "n_exp",
+        "m_exp",
+        "forced_tau_to_factor",
+        "forced_delta_to_factor",
+        "forced_delta_h_factor",
+        "normal_insulation_life_h",
+        "dt_hours",
+    }
+
+    out: Dict[str, Any] = {}
+    for k, v in cfg.items():
+        if k in allowed and pd.notna(v):
+            out[k] = v
+    return out or None
+
+
+def _sanitize_thermal_df(df: Any) -> Optional[pd.DataFrame]:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return None
+
+    out = df.copy()
+    out.columns = [str(c).strip() for c in out.columns]
+    for c in ["asset_id", "equipment_code"]:
+        if c in out.columns:
+            out = out.drop(columns=[c])
+    return out if not out.empty else None
 
 
 def _thermal_status_label(
@@ -149,7 +196,6 @@ def _optimization_note(eta_h: Any, t_cost: Any, t_r: Any, t_rec: Any) -> str:
         parts.append(f"T_cost = {cost_v:.1f} h.")
     if eta_v is not None:
         parts.append(f"η = {eta_v:.1f} h.")
-
         ratio = rec_v / max(eta_v, 1e-9)
         if ratio < 0.5:
             parts.append("L’intervalle retenu est conservateur par rapport à η.")
@@ -226,7 +272,7 @@ with c0:
     selected_eqs = st.multiselect("Équipements", eqs_all, default=default_eqs if default_eqs else eqs_all)
 with c1:
     alpha_default = 0.05
-    if meta_proj.get("ok") and selected_eqs:
+    if selected_eqs:
         try:
             bundle0 = get_pipeline_inputs(asset_id=str(selected_eqs[0]))
             alpha_default = float(bundle0.get("alpha", 0.05) or 0.05)
@@ -281,17 +327,23 @@ for eq in selected_eqs:
         rr = _series_to_list(g["duree_rep_h"])
         repair_series = rr if rr else None
 
-    bundle = get_pipeline_inputs(asset_id=str(eq))
-    thermal_df = bundle.get("thermal_df")
-    thermal_cfg = bundle.get("thermal_config")
+    try:
+        bundle = get_pipeline_inputs(asset_id=str(eq))
+        if not isinstance(bundle, dict):
+            bundle = {}
+    except Exception:
+        bundle = {}
+
+    thermal_df = _sanitize_thermal_df(bundle.get("thermal_df")) if use_thermal_constraint else None
+    thermal_cfg = _sanitize_thermal_config(bundle.get("thermal_config")) if use_thermal_constraint else None
 
     try:
         pipe = analyze_ttf_pipeline(
             ttf_series=ttf_series,
             alpha=float(alpha),
             repair_series=repair_series,
-            thermal_df=thermal_df if use_thermal_constraint else None,
-            thermal_config=thermal_cfg if use_thermal_constraint else None,
+            thermal_df=thermal_df,
+            thermal_config=thermal_cfg,
         )
     except Exception as e:
         pipe = {
@@ -391,14 +443,15 @@ for eq, ft in fits.items():
             "eta_h": eta_main,
             "gamma_h": gamma_main,
 
-            "beta_weibull": beta_weibull,
-            "eta_weibull_h": eta_weibull,
-            "gamma_weibull_h": gamma_weibull,
+            "beta_weibull_ref": beta_weibull,
+            "eta_weibull_ref_h": eta_weibull,
+            "gamma_weibull_ref_h": gamma_weibull,
 
             "theta_HS_max": theta_hs_max,
             "FAA_max": faa_max,
             "loss_of_life_pct": lol_pct,
             "thermal_status": thermal_status,
+            "thermal_ok": thermal_ok,
 
             "T_R_h": _safe_num(t_r),
             "T_cost_h": _safe_num(t_cost),
@@ -468,6 +521,9 @@ with tabs[1]:
         "beta",
         "eta_h",
         "gamma_h",
+        "beta_weibull_ref",
+        "eta_weibull_ref_h",
+        "gamma_weibull_ref_h",
         "T_R_h",
         "T_cost_h",
         "T_recommended_h",
@@ -492,11 +548,11 @@ with tabs[2]:
     tmax = max(etas) * 1.6 if etas else 1000.0
 
     maybe_itv = []
-    for eq in fits.keys():
-        if _is_pos_number(df_out.loc[df_out["equipment_code"] == eq, "T_R_h"].iloc[0] if eq in df_out["equipment_code"].values else None):
-            maybe_itv.append(float(df_out.loc[df_out["equipment_code"] == eq, "T_R_h"].iloc[0]))
-        if _is_pos_number(df_out.loc[df_out["equipment_code"] == eq, "T_cost_h"].iloc[0] if eq in df_out["equipment_code"].values else None):
-            maybe_itv.append(float(df_out.loc[df_out["equipment_code"] == eq, "T_cost_h"].iloc[0]))
+    for _, rr in df_out.iterrows():
+        if _is_pos_number(rr.get("T_R_h")):
+            maybe_itv.append(float(rr["T_R_h"]))
+        if _is_pos_number(rr.get("T_cost_h")):
+            maybe_itv.append(float(rr["T_cost_h"]))
 
     if maybe_itv:
         tmax = max(tmax, max(maybe_itv) * 1.2)
@@ -513,7 +569,7 @@ with tabs[2]:
         mask = t > gamma
         y[mask] = np.exp(-(((t[mask] - gamma) / max(eta, 1e-9)) ** max(beta, 1e-9)))
         proc = ((org_results.get(eq, {}) or {}).get("reliability", {}) or {}).get("model", "?")
-        ax.plot(t, y, linewidth=2, label=f"{eq} | {proc} | β={beta:.2f}, η={eta:.1f}")
+        ax.plot(t, y, linewidth=2, label=f"{eq} | {proc} | βw={beta:.2f}, ηw={eta:.1f}")
 
     ax.grid(True, alpha=0.3)
     ax.set_xlabel("Temps (h)")
@@ -528,7 +584,6 @@ with tabs[3]:
     sel_eq = st.selectbox("Équipement", options=df_out["equipment_code"].tolist())
     row = df_out[df_out["equipment_code"] == sel_eq].iloc[0].to_dict()
     pipe = org_results.get(sel_eq, {}) or {}
-    rel = pipe.get("reliability", {}) or {}
     thermal = pipe.get("thermal")
     tables = pipe.get("tables", {}) or {}
 
@@ -550,7 +605,7 @@ with tabs[3]:
     st.info(row.get("optimization_note", "—"))
 
     st.markdown("#### Actions suggérées")
-    for a in suggested_actions(float(row["beta_weibull"]) if _is_pos_number(row.get("beta_weibull")) else 1.0):
+    for a in suggested_actions(float(row["beta_weibull_ref"]) if _is_pos_number(row.get("beta_weibull_ref")) else 1.0):
         st.markdown(f"- {a}")
 
     subtabs = st.tabs(["Fiabilité", "Thermique", "Tableaux exportables"])

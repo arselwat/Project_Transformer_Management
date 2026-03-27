@@ -14,8 +14,19 @@ import streamlit as st
 from scipy import stats as sst
 
 from core.security.auth import require_login
-from core.datahub import get_current_failures_df, get_failures_meta, get_pipeline_inputs
+from core.datahub import get_current_failures_df, get_failures_meta
 from core.reliability.organigram import analyze_ttf_pipeline
+
+try:
+    from core.datahub import get_pipeline_inputs
+except Exception:
+    def get_pipeline_inputs(asset_id: Optional[str] = None) -> Dict[str, Any]:
+        return {
+            "asset_id": asset_id,
+            "thermal_df": None,
+            "thermal_config": None,
+            "alpha": 0.05,
+        }
 
 try:
     from core.reliability.reporting_merged import export_merged_report_pdf
@@ -53,6 +64,62 @@ def _series_to_list(s: pd.Series) -> Optional[list[float]]:
     if vals.empty:
         return None
     return vals.astype(float).tolist()
+
+
+def _sanitize_thermal_config(cfg: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(cfg, dict) or not cfg:
+        return None
+
+    allowed = {
+        "sn_mva",
+        "R",
+        "delta_to_r",
+        "delta_h_r",
+        "tau_to_min",
+        "tau_w_min",
+        "n_exp",
+        "m_exp",
+        "forced_tau_to_factor",
+        "forced_delta_to_factor",
+        "forced_delta_h_factor",
+        "normal_insulation_life_h",
+        "dt_hours",
+    }
+
+    out: Dict[str, Any] = {}
+    for k, v in cfg.items():
+        if k in allowed and pd.notna(v):
+            out[k] = v
+    return out or None
+
+
+def _sanitize_thermal_df(df: Any) -> Optional[pd.DataFrame]:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return None
+
+    out = df.copy()
+    out.columns = [str(c).strip() for c in out.columns]
+
+    for c in ["asset_id", "equipment_code"]:
+        if c in out.columns:
+            out = out.drop(columns=[c])
+
+    return out if not out.empty else None
+
+
+def _get_pipeline_bundle(eq: str) -> Dict[str, Any]:
+    try:
+        bundle = get_pipeline_inputs(asset_id=str(eq))
+        if not isinstance(bundle, dict):
+            bundle = {}
+    except Exception:
+        bundle = {}
+
+    bundle["thermal_df"] = _sanitize_thermal_df(bundle.get("thermal_df"))
+    bundle["thermal_config"] = _sanitize_thermal_config(bundle.get("thermal_config"))
+    bundle.setdefault("alpha", 0.05)
+    bundle.setdefault("asset_id", str(eq))
+    return bundle
 
 
 def _get_dist_and_params(reliability: Dict[str, Any]):
@@ -120,7 +187,7 @@ def _export_tables_xlsx(result_by_eq: Dict[str, Dict[str, Any]]) -> bytes:
                     "MTTF_h": ind.get("theoretical_mttf_h") or ind.get("empirical_mttf_h"),
                     "MTBF_h": ind.get("mtbf_h"),
                     "MTTR_h": ind.get("mttr_h"),
-                    "availability": ind.get("availability_intrinsic"),
+                    "availability_pct": None if ind.get("availability_intrinsic") is None else 100.0 * float(ind.get("availability_intrinsic")),
                 }
             )
 
@@ -177,7 +244,7 @@ for eq in selected_eqs:
     if "duree_rep_h" in g.columns:
         repair_list = _series_to_list(g["duree_rep_h"])
 
-    bundle = get_pipeline_inputs(asset_id=str(eq))
+    bundle = _get_pipeline_bundle(str(eq))
     thermal_df = bundle.get("thermal_df")
     thermal_cfg = bundle.get("thermal_config")
 
@@ -249,12 +316,7 @@ with m4:
     hs = summary_df["theta_HS_max"].dropna()
     st.metric("θHS max", fnum(hs.max(), 2) if not hs.empty else "—")
 
-st.dataframe(summary_df, use_container_width=True, hide_index=True)
 
-
-# -------------------------------------------------------------------
-# Tabs
-# -------------------------------------------------------------------
 tabs = st.tabs([
     "Tendance",
     "Dépendance",
@@ -283,15 +345,26 @@ with tabs[1]:
 with tabs[2]:
     st.subheader(f"Fiabilité — {detail_eq}")
 
-    df_process = detail_tables.get("process_choice", pd.DataFrame())
-    if not df_process.empty:
-        st.dataframe(df_process, use_container_width=True, hide_index=True)
+    rel_view = summary_df[summary_df["equipment_code"] == detail_eq][[
+        "equipment_code",
+        "model",
+        "distribution",
+        "MTTF_h",
+        "MTBF_h",
+        "MTTR_h",
+        "availability_pct",
+        "beta",
+        "eta_h",
+        "gamma_h",
+    ]].copy()
+    st.dataframe(rel_view, use_container_width=True, hide_index=True)
 
-    df_rel = detail_tables.get("reliability_summary", pd.DataFrame())
-    if df_rel.empty:
-        st.info("Aucun tableau de fiabilité.")
-    else:
-        st.dataframe(df_rel, use_container_width=True, hide_index=True)
+    with st.expander("Voir le choix du processus"):
+        df_process = detail_tables.get("process_choice", pd.DataFrame())
+        if df_process.empty:
+            st.info("Aucun tableau de processus.")
+        else:
+            st.dataframe(df_process, use_container_width=True, hide_index=True)
 
     with st.expander("Voir les candidats / ajustements"):
         df_fit = detail_tables.get("fit_candidates", pd.DataFrame())
@@ -303,19 +376,20 @@ with tabs[2]:
 with tabs[3]:
     st.subheader(f"Thermique — {detail_eq}")
 
-    if detail_therm is None:
+    therm_view = summary_df[summary_df["equipment_code"] == detail_eq][[
+        "equipment_code",
+        "theta_HS_max",
+        "FAA_max",
+        "loss_of_life_pct",
+    ]].copy()
+
+    if therm_view[["theta_HS_max", "FAA_max", "loss_of_life_pct"]].isna().all().all():
         st.info("Aucune donnée thermique disponible pour cet équipement.")
     else:
-        df_therm = detail_tables.get("thermal_summary", pd.DataFrame())
-        if not df_therm.empty:
-            st.dataframe(df_therm, use_container_width=True, hide_index=True)
-
-        df_ind = detail_tables.get("thermal_table_indicators", pd.DataFrame())
-        if not df_ind.empty:
-            st.dataframe(df_ind, use_container_width=True, hide_index=True)
+        st.dataframe(therm_view, use_container_width=True, hide_index=True)
 
         with st.expander("Voir plus de détails thermiques"):
-            for key in ["thermal_table_dataset", "thermal_table_params", "thermal_daily", "thermal_top5_days"]:
+            for key in ["thermal_summary", "thermal_table_dataset", "thermal_table_params", "thermal_table_indicators", "thermal_daily", "thermal_top5_days"]:
                 dfx = detail_tables.get(key, pd.DataFrame())
                 if isinstance(dfx, pd.DataFrame) and not dfx.empty:
                     st.markdown(f"**{key}**")
@@ -426,14 +500,14 @@ with tabs[5]:
                 try:
                     path = export_merged_report_pdf(
                         df=df_sel,
-                        out_dir=str(BASE_DIR / "reports"),
+                        out_dir=str(Path(__file__).resolve().parents[1] / "reports"),
                         title="Rapport — Indicateurs",
                         analysis_results=results_by,
                     )
                 except TypeError:
                     path = export_merged_report_pdf(
                         df=df_sel,
-                        out_dir=str(BASE_DIR / "reports"),
+                        out_dir=str(Path(__file__).resolve().parents[1] / "reports"),
                         title="Rapport — Indicateurs",
                     )
 

@@ -11,7 +11,6 @@ import streamlit as st
 
 from core.security.auth import require_login
 from core.datahub import (
-    build_ttf_from_events,
     clear_current_project_data,
     get_current_failures_df,
     get_current_project_data,
@@ -35,7 +34,6 @@ DB_PATH = DATA_DIR / "reliability.sqlite"
 # ============================================================
 # SQLite
 # ============================================================
-
 def _db_conn():
     DB_PATH.parent.mkdir(exist_ok=True, parents=True)
     return sqlite3.connect(DB_PATH)
@@ -95,9 +93,8 @@ init_db()
 
 
 # ============================================================
-# Validation
+# Validation / normalisation
 # ============================================================
-
 REQUIRED_SIMPLE = ["equipment_code", "ttf_h"]
 
 PROJECT_REQUIRED = {
@@ -121,16 +118,34 @@ PROJECT_REQUIRED = {
 }
 
 
+def _read_csv_flex_from_bytes(raw: bytes) -> pd.DataFrame:
+    attempts = [
+        lambda: pd.read_csv(io.BytesIO(raw)),
+        lambda: pd.read_csv(io.BytesIO(raw), engine="python", on_bad_lines="skip", sep=None),
+        lambda: pd.read_csv(io.BytesIO(raw), sep=";", engine="python", on_bad_lines="skip"),
+    ]
+    for fn in attempts:
+        try:
+            df = fn()
+            df.columns = [str(c).strip() for c in df.columns]
+            return df
+        except Exception:
+            continue
+    raise ValueError("Impossible de lire le CSV.")
+
+
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     mapping = {
         "equipment": "equipment_code",
         "equipement": "equipment_code",
         "code_equipement": "equipment_code",
         "eqp": "equipment_code",
+        "asset_id": "equipment_code",
         "ttf": "ttf_h",
         "ttf_hours": "ttf_h",
         "mttr_h": "duree_rep_h",
         "repair_hours": "duree_rep_h",
+        "repair_time_hours": "duree_rep_h",
         "failure_time": "failure_time",
         "failure_date": "failure_time",
         "date_panne": "failure_time",
@@ -173,6 +188,46 @@ def _coerce_bool01(s: pd.Series) -> pd.Series:
         .fillna(0)
         .astype(int)
     )
+
+
+def build_ttf_from_events(events: pd.DataFrame) -> pd.DataFrame:
+    df = events.copy()
+    needed = {"event_id", "asset_id", "event_start", "is_failure"}
+
+    if df.empty or not needed.issubset(df.columns):
+        return pd.DataFrame(columns=["equipment_code", "ttf_h", "duree_rep_h", "failure_time", "event_id"])
+
+    if "repair_time_hours" not in df.columns:
+        df["repair_time_hours"] = None
+
+    df["event_start"] = pd.to_datetime(df["event_start"], errors="coerce")
+    df = df.dropna(subset=["event_start"]).copy()
+
+    df["asset_id"] = df["asset_id"].astype(str)
+    df["is_failure"] = _coerce_bool01(df["is_failure"])
+    df["repair_time_hours"] = pd.to_numeric(df["repair_time_hours"], errors="coerce")
+
+    df = df[df["is_failure"] == 1].sort_values(["asset_id", "event_start"]).reset_index(drop=True)
+
+    out = []
+    for asset_id, g in df.groupby("asset_id"):
+        g = g.sort_values("event_start").reset_index(drop=True)
+        for i in range(1, len(g)):
+            dt_h = (g.loc[i, "event_start"] - g.loc[i - 1, "event_start"]).total_seconds() / 3600.0
+            if dt_h > 0:
+                out.append(
+                    {
+                        "equipment_code": str(asset_id),
+                        "ttf_h": float(dt_h),
+                        "duree_rep_h": g.loc[i, "repair_time_hours"],
+                        "failure_time": g.loc[i, "event_start"],
+                        "event_id": g.loc[i, "event_id"],
+                    }
+                )
+
+    if not out:
+        return pd.DataFrame(columns=["equipment_code", "ttf_h", "duree_rep_h", "failure_time", "event_id"])
+    return pd.DataFrame(out)
 
 
 def _normalize_project_frames(frames: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
@@ -314,7 +369,6 @@ def _normalize_project_frames(frames: Dict[str, pd.DataFrame]) -> Dict[str, pd.D
 
         out[name] = df
 
-    # enrichit sn_mva si possible
     if "asset_info" in out and "thermal_params" in out:
         a = out["asset_info"].copy()
         t = out["thermal_params"].copy()
@@ -355,6 +409,7 @@ def _validate_project_sheets(frames: Dict[str, pd.DataFrame]) -> list[str]:
         errors.append("events_history: certaines dates event_start sont invalides.")
     if ev["event_id"].astype(str).duplicated().any():
         errors.append("events_history: event_id contient des doublons.")
+
     if "event_end" in ev.columns:
         ev["event_end"] = pd.to_datetime(ev["event_end"], errors="coerce")
         bad = ev["event_end"].notna() & ev["event_start"].notna() & (ev["event_end"] < ev["event_start"])
@@ -388,7 +443,7 @@ def _read_uploaded_file(uploaded_file) -> tuple[str, object]:
     raw = uploaded_file.read()
 
     if suffix == ".csv":
-        return "csv", pd.read_csv(io.BytesIO(raw))
+        return "csv", _read_csv_flex_from_bytes(raw)
 
     if suffix == ".xlsx":
         xls = pd.ExcelFile(io.BytesIO(raw))
@@ -401,7 +456,6 @@ def _read_uploaded_file(uploaded_file) -> tuple[str, object]:
 # ============================================================
 # Header
 # ============================================================
-
 meta = get_failures_meta()
 project_meta = get_project_meta()
 
@@ -417,16 +471,12 @@ with m2:
     else:
         st.info("Aucun projet actif")
 
-
-tab_upload, tab_current, tab_mqtt = st.tabs(
-    ["Import", "Actif", "MQTT"]
-)
+tab_upload, tab_current, tab_mqtt = st.tabs(["Import", "Actif", "MQTT"])
 
 
 # ============================================================
 # Import
 # ============================================================
-
 with tab_upload:
     up = st.file_uploader("Déposer un fichier CSV ou XLSX", type=["csv", "xlsx"])
     has_timestamps = st.toggle("CSV avec horodatages au lieu de ttf_h", value=False)
@@ -526,8 +576,7 @@ with tab_upload:
                 if derived_ttf.empty:
                     st.warning("Aucun TTF dérivé depuis events_history.")
 
-                sheet_names = list(frames.keys())
-                preview_sheet = st.selectbox("Prévisualiser", options=sheet_names)
+                preview_sheet = st.selectbox("Prévisualiser", options=list(frames.keys()))
                 st.dataframe(frames[preview_sheet].head(30), use_container_width=True, hide_index=True)
 
                 st.markdown("#### TTF dérivés")
@@ -568,7 +617,6 @@ with tab_upload:
 # ============================================================
 # Actif
 # ============================================================
-
 with tab_current:
     st.subheader("Dataset actif")
     cur = get_current_failures_df()
@@ -580,7 +628,8 @@ with tab_current:
         c1, c2 = st.columns(2)
         with c1:
             if st.button("Synchroniser dataset actif vers SQLite", use_container_width=True):
-                n = bulk_insert_failures(cur, source=str(meta.get("source", "session")))
+                source_name = str(get_failures_meta().get("source", "session"))
+                n = bulk_insert_failures(cur, source=source_name)
                 st.success(f"{n} lignes insérées")
         with c2:
             if st.button("Vider SQLite (failures)", use_container_width=True):
@@ -590,13 +639,13 @@ with tab_current:
     st.divider()
 
     st.subheader("Projet actif")
-    project_meta = get_project_meta()
+    current_project_meta = get_project_meta()
     frames = get_current_project_data()
 
-    if not project_meta.get("ok") or not frames:
+    if not current_project_meta.get("ok") or not frames:
         st.info("Aucun projet actif")
     else:
-        st.json(project_meta)
+        st.json(current_project_meta)
 
         available_sheets = sorted(list(frames.keys()))
         if available_sheets:
@@ -621,7 +670,6 @@ with tab_current:
 # ============================================================
 # MQTT
 # ============================================================
-
 with tab_mqtt:
     mqtt_cfg_file = BASE_DIR / "config" / "mqtt.json"
 
