@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 import io
-import math
 import hashlib
 from typing import Any, Optional, Dict
 
@@ -20,6 +19,7 @@ from core.reliability.organigram import analyze_ttf_pipeline
 from core.reliability.optimize import propose_intervals_cost_and_reliability
 from core.security.auth import require_login
 from core.datahub import get_current_failures_df, get_failures_meta, get_project_meta
+from core.ui import render_shell, render_page_header
 
 try:
     from core.datahub import get_pipeline_inputs
@@ -42,10 +42,15 @@ except Exception as e:
     export_optimization_report_pdf = None
 
 
-st.set_page_config(page_title="Optimisation maintenance", page_icon="🧠", layout="wide")
+st.set_page_config(page_title="Optimisation", page_icon="🧠", layout="wide")
 require_login()
 
-st.title("🧠 Optimisation")
+render_shell("pages/3_Optimisation_verified.py")
+render_page_header(
+    "Optimisation",
+    "Intervalles recommandés, coût, fiabilité et contrainte thermique.",
+    "🧠",
+)
 
 
 # -------------------------------------------------------------------
@@ -262,7 +267,7 @@ with s2:
 
 
 # -------------------------------------------------------------------
-# Contrôles utilisateur
+# Contrôles
 # -------------------------------------------------------------------
 eqs_all = sorted(df_src["equipment_code"].unique().tolist())
 default_eqs = eqs_all[: min(5, len(eqs_all))] if eqs_all else []
@@ -426,39 +431,32 @@ for eq, ft in fits.items():
             "equipment_code": eq,
             "model": rel.get("model"),
             "distribution": rel.get("distribution"),
-
             "mk_p": mk.get("p"),
             "mk_direction": mk.get("direction"),
             "laplace_p": lap.get("p"),
             "laplace_direction": lap.get("direction"),
             "spearman_r": dep.get("spearman_r"),
             "spearman_p": dep.get("spearman_p"),
-
             "MTTF_h": indicators.get("theoretical_mttf_h") or indicators.get("empirical_mttf_h"),
             "MTBF_h": indicators.get("mtbf_h"),
             "MTTR_h": indicators.get("mttr_h"),
             "availability_pct": None if indicators.get("availability_intrinsic") is None else 100.0 * float(indicators.get("availability_intrinsic")),
-
             "beta": beta_main,
             "eta_h": eta_main,
             "gamma_h": gamma_main,
-
             "beta_weibull_ref": beta_weibull,
             "eta_weibull_ref_h": eta_weibull,
             "gamma_weibull_ref_h": gamma_weibull,
-
             "theta_HS_max": theta_hs_max,
             "FAA_max": faa_max,
             "loss_of_life_pct": lol_pct,
             "thermal_status": thermal_status,
             "thermal_ok": thermal_ok,
-
             "T_R_h": _safe_num(t_r),
             "T_cost_h": _safe_num(t_cost),
             "R(T_cost)": _safe_num(r_cost),
             "C_min_per_h": _safe_num(c_min),
             "T_recommended_h": _safe_num(t_rec),
-
             "maintenance_type": maintenance_type,
             "decision_reason": decision.get("reason"),
             "optimization_note": _optimization_note(eta_main, t_cost, t_r, t_rec),

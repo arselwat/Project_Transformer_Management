@@ -56,6 +56,9 @@ FAILURES_CSV = DATA_DIR / "failures_saved.csv"
 OPTIM_CSV = DATA_DIR / "last_optimization.csv"
 
 
+# =========================================================
+# Helpers
+# =========================================================
 def _read_csv_flex(src) -> pd.DataFrame:
     def _try_read(s, **kw):
         try:
@@ -80,6 +83,7 @@ def _read_csv_flex(src) -> pd.DataFrame:
         df = _try_read(src, sep=";", engine="python", on_bad_lines="skip")
     if df is None:
         return pd.DataFrame()
+
     df.columns = [str(c).strip() for c in df.columns]
     return df
 
@@ -241,7 +245,10 @@ def _load_project_context(uploaded_xlsx=None) -> Dict[str, pd.DataFrame]:
     return out
 
 
-def _extract_thermal_for_eq(sheets: Dict[str, pd.DataFrame], eq: str) -> Tuple[Optional[pd.DataFrame], Optional[Dict[str, Any]]]:
+def _extract_thermal_for_eq(
+    sheets: Dict[str, pd.DataFrame],
+    eq: str,
+) -> Tuple[Optional[pd.DataFrame], Optional[Dict[str, Any]]]:
     if not sheets:
         return None, None
 
@@ -307,7 +314,11 @@ def _load_optimization_df() -> pd.DataFrame:
     return out
 
 
-def _build_virtual_pm_plan_from_optimization(opt_df: pd.DataFrame, start_date: date, within_days: int):
+def _build_virtual_pm_plan_from_optimization(
+    opt_df: pd.DataFrame,
+    start_date: date,
+    within_days: int,
+):
     if opt_df is None or opt_df.empty:
         return pd.DataFrame(), pd.DataFrame()
 
@@ -575,15 +586,25 @@ def _xlsx_bytes(global_tables: Dict[str, pd.DataFrame], detail_tables: Dict[str,
     return buff.getvalue()
 
 
-with st.sidebar:
-    st.markdown("### Options")
-    up_fail = st.file_uploader("TTF CSV optionnel", type=["csv"])
-    up_project = st.file_uploader("Projet Excel optionnel", type=["xlsx"])
+# =========================================================
+# Contrôles page
+# =========================================================
+ctrl1, ctrl2, ctrl3, ctrl4 = st.columns([1, 1, 1, 1])
+with ctrl1:
+    up_fail = st.file_uploader("TTF CSV optionnel", type=["csv"], key="global_up_fail")
+with ctrl2:
+    up_project = st.file_uploader("Projet Excel optionnel", type=["xlsx"], key="global_up_project")
+with ctrl3:
     alpha = st.slider("Seuil alpha", 0.01, 0.10, 0.05, 0.01)
+with ctrl4:
     within_days = st.slider("Fenêtre maintenance (jours)", 7, 365, 30, 1)
-    start_dt = st.date_input("Date de référence", value=date.today())
+
+start_dt = st.date_input("Date de référence", value=date.today())
 
 
+# =========================================================
+# Chargement données
+# =========================================================
 df_fail = _load_failures_df(up_fail)
 if df_fail.empty:
     st.error("Aucun dataset TTF disponible.")
@@ -602,12 +623,16 @@ else:
 
 c1, c2, c3 = st.columns(3)
 with c1:
-    st.markdown(f'<div class="status-box">TTF actifs : {len(df_fail)} lignes</div>', unsafe_allow_html=True)
+    st.info(f"TTF actifs : {len(df_fail)} lignes")
 with c2:
-    st.markdown(f'<div class="status-box">Projet thermique : {"Oui" if bool(project_sheets) else "Non"}</div>', unsafe_allow_html=True)
+    st.info(f"Projet thermique : {'Oui' if bool(project_sheets) else 'Non'}")
 with c3:
-    st.markdown(f'<div class="status-box">Optimisation : {"Oui" if not opt_df.empty else "Non"}</div>', unsafe_allow_html=True)
+    st.info(f"Optimisation : {'Oui' if not opt_df.empty else 'Non'}")
 
+
+# =========================================================
+# Analyse globale
+# =========================================================
 with st.spinner("Analyse globale..."):
     results_by_eq: Dict[str, Dict[str, Any]] = {}
     detail_tables_by_eq: Dict[str, Dict[str, pd.DataFrame]] = {}
@@ -747,6 +772,10 @@ global_tables = {
     "final_decision": final_decision_df,
 }
 
+
+# =========================================================
+# KPIs
+# =========================================================
 k1, k2, k3, k4, k5 = st.columns(5)
 with k1:
     st.metric("Équipements analysés", len(summary_df))
@@ -759,6 +788,10 @@ with k4:
 with k5:
     st.metric("NHPP détectés", int((summary_df["model"].astype(str).str.upper() == "NHPP").sum()))
 
+
+# =========================================================
+# Onglets
+# =========================================================
 tab1, tab2, tab3 = st.tabs(["Vue synthèse", "Traçabilité par équipement", "Exports"])
 
 with tab1:

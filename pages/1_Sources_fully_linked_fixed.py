@@ -19,11 +19,17 @@ from core.datahub import (
     set_current_failures_df,
     set_current_project_data,
 )
+from core.ui import render_shell, render_page_header
 
 st.set_page_config(page_title="Sources de données", page_icon="📥", layout="wide")
 require_login()
 
-st.title("📥 Sources de données")
+render_shell("pages/1_Sources_fully_linked_fixed.py")
+render_page_header(
+    "Sources de données",
+    "Importer les jeux de données qui alimentent l’analyse, l’optimisation et la maintenance.",
+    "📥",
+)
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
@@ -454,38 +460,36 @@ def _read_uploaded_file(uploaded_file) -> tuple[str, object]:
 
 
 # ============================================================
-# Header
+# Résumé
 # ============================================================
 meta = get_failures_meta()
 project_meta = get_project_meta()
 
-m1, m2 = st.columns(2)
-with m1:
-    if meta.get("ok"):
-        st.success(f"Dataset actif | rows={meta['rows']} | hash={meta['hash']}")
-    else:
-        st.info("Aucun dataset actif")
-with m2:
-    if project_meta.get("ok"):
-        st.success(f"Projet actif | hash={project_meta.get('hash', '')}")
-    else:
-        st.info("Aucun projet actif")
+k1, k2, k3 = st.columns(3)
+with k1:
+    st.metric("Lignes TTF actives", meta.get("rows", 0) if meta.get("ok") else 0)
+with k2:
+    st.metric("Projet actif", "Oui" if project_meta.get("ok") else "Non")
+with k3:
+    st.metric("Base SQLite", "Prête")
 
-tab_upload, tab_current, tab_mqtt = st.tabs(["Import", "Actif", "MQTT"])
+tab_upload, tab_current, tab_mqtt = st.tabs(["Importer", "Données actives", "MQTT"])
 
 
 # ============================================================
-# Import
+# Importer
 # ============================================================
 with tab_upload:
-    up = st.file_uploader("Déposer un fichier CSV ou XLSX", type=["csv", "xlsx"])
-    has_timestamps = st.toggle("CSV avec horodatages au lieu de ttf_h", value=False)
+    st.subheader("Importer un fichier")
+
+    up = st.file_uploader("Fichier CSV ou XLSX", type=["csv", "xlsx"])
+    has_timestamps = st.toggle("Construire les TTF à partir d’horodatages", value=False)
 
     if up is not None:
         try:
             kind, payload = _read_uploaded_file(up)
         except Exception as e:
-            st.error(f"Lecture du fichier: {e}")
+            st.error(f"Lecture du fichier : {e}")
             kind, payload = None, None
 
         if kind == "csv" and isinstance(payload, pd.DataFrame):
@@ -534,12 +538,12 @@ with tab_upload:
                                 st.success(f"Dataset synchronisé | rows={res['rows']} | hash={res['hash']}")
                                 st.dataframe(ttf_df.head(30), use_container_width=True, hide_index=True)
                         except Exception as e:
-                            st.error(f"Construction TTF: {e}")
+                            st.error(f"Construction TTF : {e}")
 
             else:
                 missing = [c for c in REQUIRED_SIMPLE if c not in df_loaded.columns]
                 if missing:
-                    st.warning(f"Colonnes manquantes: {missing}")
+                    st.warning(f"Colonnes manquantes : {missing}")
                 else:
                     if "duree_rep_h" not in df_loaded.columns:
                         df_loaded["duree_rep_h"] = None
@@ -576,7 +580,7 @@ with tab_upload:
                 if derived_ttf.empty:
                     st.warning("Aucun TTF dérivé depuis events_history.")
 
-                preview_sheet = st.selectbox("Prévisualiser", options=list(frames.keys()))
+                preview_sheet = st.selectbox("Prévisualiser une feuille", options=list(frames.keys()))
                 st.dataframe(frames[preview_sheet].head(30), use_container_width=True, hide_index=True)
 
                 st.markdown("#### TTF dérivés")
@@ -600,7 +604,7 @@ with tab_upload:
                             else:
                                 st.error(res.get("msg", "Erreur inconnue"))
                         except Exception as e:
-                            st.error(f"Synchronisation projet: {e}")
+                            st.error(f"Synchronisation projet : {e}")
 
                 with b2:
                     if st.button("Envoyer les TTF dans SQLite", use_container_width=True):
@@ -611,14 +615,14 @@ with tab_upload:
                             )
                             st.success(f"{n} lignes insérées")
                         except Exception as e:
-                            st.error(f"SQLite: {e}")
+                            st.error(f"SQLite : {e}")
 
 
 # ============================================================
-# Actif
+# Données actives
 # ============================================================
 with tab_current:
-    st.subheader("Dataset actif")
+    st.subheader("Dataset TTF actif")
     cur = get_current_failures_df()
     if cur.empty:
         st.info("Aucun dataset actif")
@@ -645,8 +649,6 @@ with tab_current:
     if not current_project_meta.get("ok") or not frames:
         st.info("Aucun projet actif")
     else:
-        st.json(current_project_meta)
-
         available_sheets = sorted(list(frames.keys()))
         if available_sheets:
             selected_sheet = st.selectbox("Voir une feuille", options=available_sheets)
@@ -671,6 +673,7 @@ with tab_current:
 # MQTT
 # ============================================================
 with tab_mqtt:
+    st.subheader("Paramètres MQTT")
     mqtt_cfg_file = BASE_DIR / "config" / "mqtt.json"
 
     def load_mqtt():
@@ -701,7 +704,7 @@ with tab_mqtt:
         eqp = st.text_input("Équipement", cfg.get("equipement", "tr_230_20"))
     with c2:
         topic_base = st.text_input("Topic base", cfg.get("topic_base", "lab/transfo"))
-        st.caption("Ex: lab/transfo/{site}/{equipement}/measures")
+        st.caption("Exemple : lab/transfo/{site}/{equipement}/measures")
 
     if st.button("Enregistrer paramètres MQTT", type="primary", use_container_width=True):
         new_cfg = {

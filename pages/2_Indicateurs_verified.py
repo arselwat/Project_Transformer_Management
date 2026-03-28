@@ -16,6 +16,7 @@ from scipy import stats as sst
 from core.security.auth import require_login
 from core.datahub import get_current_failures_df, get_failures_meta
 from core.reliability.organigram import analyze_ttf_pipeline
+from core.ui import render_shell, render_page_header
 
 try:
     from core.datahub import get_pipeline_inputs
@@ -40,7 +41,12 @@ else:
 st.set_page_config(page_title="Indicateurs", page_icon="📊", layout="wide")
 require_login()
 
-st.title("📊 Indicateurs")
+render_shell("pages/2_Indicateurs_verified.py")
+render_page_header(
+    "Indicateurs",
+    "Tests de tendance, dépendance, paramètres fiabilistes, thermique et courbes.",
+    "📊",
+)
 
 
 # -------------------------------------------------------------------

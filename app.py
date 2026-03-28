@@ -9,6 +9,7 @@ from core.security.auth import login_form
 from core.datahub import get_current_failures_df, get_failures_meta, get_project_meta
 from core.ui import render_shell, render_page_header
 
+
 st.set_page_config(
     page_title="Fiabilité & maintenance des transformateurs",
     page_icon="⚡",
@@ -49,15 +50,14 @@ def _fmt(v, nd: int = 2, fallback: str = "n/a") -> str:
 
 
 def _module_card(title: str, desc: str, rel_path: str, icon: str):
-    with st.container():
-        st.markdown('<div class="module-card">', unsafe_allow_html=True)
-        st.markdown(f'<div class="module-title">{icon} {title}</div>', unsafe_allow_html=True)
-        st.markdown(f'<div class="module-desc">{desc}</div>', unsafe_allow_html=True)
-        if _page_exists(rel_path):
-            st.page_link(rel_path, label="Ouvrir", icon=icon)
-        else:
-            st.caption("Page non disponible")
-        st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown('<div class="module-card">', unsafe_allow_html=True)
+    st.markdown(f'<div class="module-title">{icon} {title}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="module-desc">{desc}</div>', unsafe_allow_html=True)
+    if _page_exists(rel_path):
+        st.page_link(rel_path, label="Ouvrir", icon=icon)
+    else:
+        st.caption("Page non disponible")
+    st.markdown("</div>", unsafe_allow_html=True)
 
 
 fail_df = get_current_failures_df()

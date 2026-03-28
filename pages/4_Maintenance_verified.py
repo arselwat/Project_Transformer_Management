@@ -10,6 +10,7 @@ import pandas as pd
 import streamlit as st
 
 from core.security.auth import require_login
+from core.ui import render_shell, render_page_header
 
 try:
     from core.maintenance.reporting_plus import export_pm_plan_with_kits_pdf
@@ -18,6 +19,17 @@ except Exception as e:
     _PM_REPORT_ERR = str(e)
 else:
     _PM_REPORT_ERR = None
+
+
+st.set_page_config(page_title="Maintenance", page_icon="🛠️", layout="wide")
+require_login()
+
+render_shell("pages/4_Maintenance_verified.py")
+render_page_header(
+    "Maintenance",
+    "Planning issu de l’optimisation, échéances et recommandation finale.",
+    "🛠️",
+)
 
 
 # -------------------------------------------------------------------
@@ -306,13 +318,8 @@ def build_virtual_pm_plan_from_optimization(
 
 
 # -------------------------------------------------------------------
-# UI
+# Chargement
 # -------------------------------------------------------------------
-st.set_page_config(page_title="Maintenance", page_icon="🛠️", layout="wide")
-require_login()
-
-st.title("🛠️ Maintenance")
-
 df_opt = st.session_state.get("optimization_df")
 if not isinstance(df_opt, pd.DataFrame) or df_opt.empty:
     df_opt = _load_optimization_fallback()
@@ -327,6 +334,10 @@ df_opt.columns = [str(c).strip() for c in df_opt.columns]
 h = _hash_df(df_opt)
 st.success(f"Optimisation synchronisée | rows={len(df_opt)} | hash={h}")
 
+
+# -------------------------------------------------------------------
+# Contrôles
+# -------------------------------------------------------------------
 c1, c2, c3, c4, c5 = st.columns(5)
 with c1:
     within = st.slider("Fenêtre tâches dues (jours)", 7, 365, 14, 1)
@@ -382,7 +393,8 @@ tabs = st.tabs([
 with tabs[0]:
     st.subheader("Commentaires maintenance")
     if rows_all:
-        df_comm = pd.DataFrame(rows_all)[
+        df_all_rows = pd.DataFrame(rows_all)
+        df_comm = df_all_rows[
             [c for c in [
                 "equipment_code",
                 "maintenance_type",
@@ -392,7 +404,7 @@ with tabs[0]:
                 "eta_h",
                 "thermal_status",
                 "maintenance_comment",
-            ] if c in pd.DataFrame(rows_all).columns]
+            ] if c in df_all_rows.columns]
         ].copy()
         df_comm = df_comm.drop_duplicates(subset=["equipment_code"]).sort_values("equipment_code")
         st.dataframe(df_comm, use_container_width=True, hide_index=True)
