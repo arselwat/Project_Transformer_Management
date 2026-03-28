@@ -140,7 +140,7 @@ with r2[1]:
     _module_card(
         "Résultat global",
         "Traçabilité complète de la décision.",
-        "pages/5_Resultat_analyse_optimisation_Maintenance.py",
+        "pages/5_Resultat_analyse_optimisation_Maintenance_fixed.py",
         "📋",
     )
 with r2[2]:
