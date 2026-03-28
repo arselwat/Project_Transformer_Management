@@ -162,63 +162,69 @@ if not mode_multi:
             st.caption("Code")
             st.write(code)
 
-    left, right = st.columns([1.3, 1])
-    with left:
-        st.subheader("Contrôle")
-        c1, c2, c3 = st.columns(3)
-        with c1:
+    top1, top2 = st.columns([1.2, 1])
+    with top1:
+        st.subheader("Commande")
+        b1, b2, b3 = st.columns(3)
+        with b1:
             if st.button("Démarrer", type="primary", key=f"start_{code}", disabled=st.session_state.running_map[code]):
                 st.session_state.running_map[code] = True
-        with c2:
+        with b2:
             if st.button("Arrêter", key=f"stop_{code}", disabled=not st.session_state.running_map[code]):
                 st.session_state.running_map[code] = False
-        with c3:
+        with b3:
             if st.button("Reset thermique", key=f"reset_{code}"):
                 eng.s.T_oil = eng.c.Tamb
                 eng.s.T_hotspot = eng.c.Tamb
                 eng.s.fan1_on = eng.s.fan2_on = False
                 st.info("Thermique ramenée à l’ambiante.")
 
-    with right:
-        st.subheader("Cadence & fenêtre")
+    with top2:
+        st.subheader("Cadence")
         hz = st.slider("Fréquence d’update (Hz)", 1, 10, 3, 1, key="rt_hz_one")
         max_pts = st.number_input("Points gardés", min_value=60, max_value=2000, value=300, step=60, key="rt_maxpts_one")
 
-    with st.sidebar:
-        st.markdown("### Entrées")
-        load_pct = st.slider("Charge (%)", 0, 200, 50, 1, key=f"ld_{code}")
-        pf_prim = st.slider("Facteur de puissance PF (%)", 50, 100, 95, 1, key=f"pf_{code}") / 100.0
-        Tamb = st.slider("Température ambiante (°C)", 0, 60, 30, 1, key=f"ta_{code}")
-        freq_hz = st.slider("Fréquence (Hz)", 49, 51, 50, 1, key=f"fq_{code}")
+    with st.container(border=True):
+        st.subheader("Entrées de simulation")
+        s1, s2, s3, s4 = st.columns(4)
+        with s1:
+            load_pct = st.slider("Charge (%)", 0, 200, 50, 1, key=f"ld_{code}")
+        with s2:
+            pf_prim = st.slider("Facteur de puissance PF (%)", 50, 100, 95, 1, key=f"pf_{code}") / 100.0
+        with s3:
+            Tamb = st.slider("Température ambiante (°C)", 0, 60, 30, 1, key=f"ta_{code}")
+        with s4:
+            freq_hz = st.slider("Fréquence (Hz)", 49, 51, 50, 1, key=f"fq_{code}")
 
-        st.markdown("### Ventilation")
-        fan_mode = st.radio("Mode", ["AUTO", "MAN"], horizontal=True, key=f"fanmode_{code}")
-        colf1, colf2 = st.columns(2)
-        with colf1:
+    with st.container(border=True):
+        st.subheader("Ventilation")
+        v1, v2, v3 = st.columns(3)
+        with v1:
+            fan_mode = st.radio("Mode", ["AUTO", "MAN"], horizontal=True, key=f"fanmode_{code}")
+        with v2:
             fan1 = st.toggle("Stage 1", value=False, disabled=(fan_mode == "AUTO"), key=f"f1_{code}")
-        with colf2:
+        with v3:
             fan2 = st.toggle("Stage 2", value=False, disabled=(fan_mode == "AUTO"), key=f"f2_{code}")
 
-        with st.expander("Seuils & tests avancés", expanded=False):
-            p = eng.p
-            c1s, c2s = st.columns(2)
-            with c1s:
-                p.TEMP_WARN = st.number_input("TEMP_WARN (°C)", 60.0, 140.0, float(p.TEMP_WARN), 1.0, key=f"tw_{code}")
-                p.PF_WARN = st.number_input("PF_WARN", 0.5, 1.0, float(p.PF_WARN), 0.01, key=f"pfw_{code}", format="%.2f")
-                p.I1_WARN_MULT = st.number_input("I1_WARN_MULT (×In)", 1.0, 3.0, float(p.I1_WARN_MULT), 0.05, key=f"i1_{code}")
-            with c2s:
-                p.TEMP_ALARM = st.number_input("TEMP_ALARM (°C)", 80.0, 160.0, float(p.TEMP_ALARM), 1.0, key=f"tal_{code}")
-                p.OVERLOAD_MULT = st.number_input("OVERLOAD_MULT (×Sn)", 0.8, 2.0, float(p.OVERLOAD_MULT), 0.05, key=f"ov_{code}")
-                p.MU_MIN = st.number_input("Viscosité min μ (Pa·s)", 0.001, 0.2, float(p.MU_MIN), 0.001, key=f"mu_{code}", format="%.3f")
+    with st.expander("Seuils & tests avancés", expanded=False):
+        p = eng.p
+        c1s, c2s = st.columns(2)
+        with c1s:
+            p.TEMP_WARN = st.number_input("TEMP_WARN (°C)", 60.0, 140.0, float(p.TEMP_WARN), 1.0, key=f"tw_{code}")
+            p.PF_WARN = st.number_input("PF_WARN", 0.5, 1.0, float(p.PF_WARN), 0.01, key=f"pfw_{code}", format="%.2f")
+            p.I1_WARN_MULT = st.number_input("I1_WARN_MULT (×In)", 1.0, 3.0, float(p.I1_WARN_MULT), 0.05, key=f"i1_{code}")
+        with c2s:
+            p.TEMP_ALARM = st.number_input("TEMP_ALARM (°C)", 80.0, 160.0, float(p.TEMP_ALARM), 1.0, key=f"tal_{code}")
+            p.OVERLOAD_MULT = st.number_input("OVERLOAD_MULT (×Sn)", 0.8, 2.0, float(p.OVERLOAD_MULT), 0.05, key=f"ov_{code}")
+            p.MU_MIN = st.number_input("Viscosité min μ (Pa·s)", 0.001, 0.2, float(p.MU_MIN), 0.001, key=f"mu_{code}", format="%.3f")
 
-            st.markdown("**Tests**")
-            a1, a2 = st.columns(2)
-            with a1:
-                st.checkbox("Forcer TEMP_HIGH", value=False, key=f"ft_{code}")
-                st.checkbox("Forcer OVERCURRENT", value=False, key=f"fi_{code}")
-            with a2:
-                st.checkbox("Forcer PF LOW", value=False, key=f"fp_{code}")
-                st.checkbox("Forcer DIP VOLT", value=False, key=f"fd_{code}")
+        t1, t2 = st.columns(2)
+        with t1:
+            st.checkbox("Forcer TEMP_HIGH", value=False, key=f"ft_{code}")
+            st.checkbox("Forcer OVERCURRENT", value=False, key=f"fi_{code}")
+        with t2:
+            st.checkbox("Forcer PF LOW", value=False, key=f"fp_{code}")
+            st.checkbox("Forcer DIP VOLT", value=False, key=f"fd_{code}")
 
     def _tick_one():
         if not st.session_state.running_map[code]:
@@ -281,9 +287,9 @@ if not mode_multi:
 
     _tick_one()
 
-    cA, cB, cC = st.columns(3)
+    cA, cB = st.columns(2)
     with cA:
-        if st.button("Exporter mesures CSV", key="exp_meas_one"):
+        if st.button("Exporter mesures CSV", key="exp_meas_one", use_container_width=True):
             df = pd.DataFrame(st.session_state.rt_data_map[code])
             if df.empty:
                 st.warning("Aucune donnée.")
@@ -293,7 +299,7 @@ if not mode_multi:
                 st.success(f"Export → {MEAS_CSV}")
 
     with cB:
-        if st.button("Ouvrir journal événements", key="see_evt_one"):
+        if st.button("Ouvrir journal événements", key="see_evt_one", use_container_width=True):
             if EVT_CSV.exists():
                 st.code(EVT_CSV.read_text(encoding="utf-8")[-4000:], language="text")
             else:
@@ -480,7 +486,7 @@ else:
         options=codes,
         default=codes[:min(3, len(codes))],
         max_selections=3,
-        key="rt_sel_multi"
+        key="rt_sel_multi",
     )
 
     if not sel_codes:
@@ -505,6 +511,9 @@ else:
             "equipment": rec.get("name") or code,
             "equipment_code": code,
         }
+
+    hz = st.slider("Fréquence d’update (Hz)", 1, 10, 2, 1, key="rt_hz_multi")
+    max_pts = st.number_input("Points gardés", 60, 2000, 300, 60, key="rt_maxpts_multi")
 
     cTop = st.columns(len(sel_codes))
     for i, code in enumerate(sel_codes):
@@ -534,7 +543,6 @@ else:
             f2 = st.toggle(f"F2 {code}", value=False, disabled=(fan_mode == "AUTO"), key=f"f2_{code}")
 
             eng = st.session_state.engines[code]
-
             base_load = np.clip(float(load) * (1.0 + 0.03 * np.random.randn()), 0.0, 200.0)
             base_pf = np.clip(float(pf) + 0.01 * np.random.randn(), 0.5, 1.0)
             base_Tamb = np.clip(float(amb) + 1.0 * np.random.randn(), 0.0, 60.0)
@@ -548,9 +556,6 @@ else:
                 fan2_force=bool(f2),
             )
 
-    hz = st.slider("Fréquence d’update (Hz)", 1, 10, 2, 1, key="rt_hz_multi")
-    max_pts = st.number_input("Points gardés", 60, 2000, 300, 60, key="rt_maxpts_multi")
-
     def _tick_multi():
         target_dt = 1.0 / max(int(hz), 1)
         now_m = time.monotonic()
@@ -558,6 +563,7 @@ else:
             for code in sel_codes:
                 if not st.session_state.running_map[code]:
                     continue
+
                 eng = st.session_state.engines[code]
                 m, E = eng.step(target_dt)
                 buf = st.session_state.rt_data_map[code]
@@ -604,7 +610,7 @@ else:
 
             st.plotly_chart(
                 px.line(df, x="t", y=["p_net_MW", "t_core"], title=f"{code} — P nette (MW) & θhs (°C)"),
-                use_container_width=True
+                use_container_width=True,
             )
 
             last = df.iloc[-1]
