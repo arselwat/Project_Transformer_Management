@@ -15,7 +15,7 @@ NAV_ITEMS = [
     ("pages/2_Indicateurs_verified.py", "Indicateurs", "📊"),
     ("pages/3_Optimisation_verified.py", "Optimisation", "🧠"),
     ("pages/4_Maintenance_verified.py", "Maintenance", "🛠️"),
-    ("pages/5_Resultat_analyse_optimisation_Maintenance.py", "Résultat global", "📋"),
+    ("pages/5_Resultat_analyse_optimisation_Maintenance_fixed.py", "Résultat global", "📋"),
     ("pages/6_Stock.py", "Stock", "📦"),
     ("pages/7_Transformateurs.py", "Transformateurs", "🔌"),
     ("pages/8_Visualisation_temps_reel.py", "Temps réel", "📡"),
