@@ -64,6 +64,18 @@ def format_number(value: Any, decimals: int = 2, default: str = "—") -> str:
         return default
 
 
+def safe_float(value: Any, default: Optional[float] = None) -> Optional[float]:
+    try:
+        if value is None:
+            return default
+        numeric_value = float(value)
+        if math.isnan(numeric_value) or math.isinf(numeric_value):
+            return default
+        return numeric_value
+    except Exception:
+        return default
+
+
 def series_to_positive_list(series: pd.Series) -> Optional[list[float]]:
     numeric_values = pd.to_numeric(series, errors="coerce").dropna()
     numeric_values = numeric_values[numeric_values > 0]
@@ -165,6 +177,79 @@ DISPLAY_COLUMN_NAMES = {
     "laplace_direction": "Sens du test de Laplace",
     "spearman_r": "Coefficient de Spearman",
     "spearman_p": "Valeur p du test de Spearman",
+    "Test": "Test",
+    "Statistique": "Statistique du test",
+    "p_value": "Valeur p",
+    "Décision": "Décision",
+    "Direction": "Sens",
+    "Méthode": "Méthode",
+    "r": "Coefficient",
+    "Dépendance": "Dépendance détectée",
+    "Tendance": "Tendance détectée",
+    "Direction tendance": "Sens global de la tendance",
+    "Processus retenu": "Processus retenu",
+    "Variant": "Variant du processus",
+    "Hypothèse entité": "Hypothèse sur l’entité",
+    "Justification": "Justification",
+    "Modèle": "Modèle candidat",
+    "Paramètres": "Paramètres",
+    "Méthode estimation": "Méthode d’estimation",
+    "LogLik": "Log-vraisemblance",
+    "AIC": "Critère d'information d’Akaike",
+    "KS p": "Valeur p du test de Kolmogorov-Smirnov",
+    "Chi2 p": "Valeur p du test du chi carré",
+    "CvM p": "Valeur p du test de Cramér-von Mises",
+    "Acceptée": "Ajustement accepté",
+    "Retenue": "Modèle retenu",
+    "Processus": "Processus retenu",
+    "Distribution": "Loi retenue",
+    "Eta": "Paramètre êta",
+    "Gamma": "Paramètre gamma",
+    "Lambda_HPP (1/h)": "Taux constant du processus homogène (1/h)",
+    "Mu": "Taux de base",
+    "Alpha": "Paramètre alpha",
+    "Beta_kernel": "Paramètre bêta du noyau",
+    "Branch_ratio": "Ratio de branchement",
+    "Ajustement accepté": "Ajustement accepté",
+    "MTTF (h)": "Temps moyen avant défaillance (heures)",
+    "MTBF (h)": "Temps moyen entre défaillances (heures)",
+    "MTTR (h)": "Temps moyen de réparation (heures)",
+    "Disponibilité": "Disponibilité intrinsèque",
+    "Taux de défaillance moyen (1/h)": "Taux moyen de défaillance (1/h)",
+    "Période début": "Début de la période",
+    "Période fin": "Fin de la période",
+    "Nombre de points": "Nombre de points",
+    "Pas de temps par défaut (h)": "Pas de temps par défaut (heures)",
+    "Charge min (%)": "Charge minimale (%)",
+    "Charge max (%)": "Charge maximale (%)",
+    "Temp ambiante min (°C)": "Température ambiante minimale (°C)",
+    "Temp ambiante max (°C)": "Température ambiante maximale (°C)",
+    "Ventilation forcée (% du temps)": "Ventilation forcée (% du temps)",
+    "Paramètre": "Paramètre",
+    "Valeur": "Valeur",
+    "θHS max (°C)": "Température maximale du point chaud (°C)",
+    "θHS P95 (°C)": "Température du point chaud au quantile 95 % (°C)",
+    "θHS mean (°C)": "Température moyenne du point chaud (°C)",
+    "FAA max": "Facteur maximal d’accélération du vieillissement",
+    "FAA mean": "Facteur moyen d’accélération du vieillissement",
+    "Perte de vie (h)": "Perte de vie (heures)",
+    "Perte de vie (%)": "Perte de vie (%)",
+    "θHS max": "Température maximale du point chaud",
+    "θHS P95": "Température du point chaud au quantile 95 %",
+    "θHS mean": "Température moyenne du point chaud",
+    "Loss of life (h)": "Perte de vie (heures)",
+    "Loss of life (%)": "Perte de vie (%)",
+    "date": "Date",
+    "charge_mean_pct": "Charge moyenne (%)",
+    "charge_max_pct": "Charge maximale (%)",
+    "amb_mean": "Température ambiante moyenne (°C)",
+    "theta_TO_mean": "Température top-oil moyenne (°C)",
+    "theta_HS_max": "Température maximale du point chaud (°C)",
+    "theta_HS_p95": "Température du point chaud au quantile 95 % (°C)",
+    "aging_hours": "Heures de vieillissement",
+    "fans_share": "Part du temps avec ventilateurs actifs",
+    "fans_share_pct": "Part du temps avec ventilateurs actifs (%)",
+    "life_consumed_pct": "Perte de vie (%)",
 }
 
 
@@ -215,7 +300,7 @@ def get_distribution_and_parameters(reliability_result: Dict[str, Any]):
     return None, None
 
 
-def compute_reliability_curve(
+def compute_rp_curve(
     reliability_result: Dict[str, Any],
     time_axis: np.ndarray,
     curve_name: str,
@@ -225,13 +310,13 @@ def compute_reliability_curve(
         return None
 
     try:
-        if curve_name == "reliability":
+        if curve_name == "non_event_probability":
             values = distribution_object.sf(time_axis, *distribution_parameters)
-        elif curve_name == "cumulative_distribution":
+        elif curve_name == "cumulative_probability":
             values = distribution_object.cdf(time_axis, *distribution_parameters)
         elif curve_name == "density":
             values = distribution_object.pdf(time_axis, *distribution_parameters)
-        elif curve_name == "failure_rate":
+        elif curve_name == "intensity":
             survival_values = distribution_object.sf(time_axis, *distribution_parameters)
             density_values = distribution_object.pdf(time_axis, *distribution_parameters)
             values = np.divide(
@@ -240,11 +325,208 @@ def compute_reliability_curve(
                 out=np.full_like(density_values, np.nan, dtype=float),
                 where=survival_values > 1e-12,
             )
+        elif curve_name == "cumulative_events":
+            indicators = reliability_result.get("indicators", {}) or {}
+            mean_time_between_failures = safe_float(
+                indicators.get("theoretical_mttf_h") or indicators.get("empirical_mttf_h"),
+                None,
+            )
+            if mean_time_between_failures is None or mean_time_between_failures <= 0:
+                return None
+            values = time_axis / mean_time_between_failures
         else:
             return None
+
         return np.asarray(values, dtype=float)
     except Exception:
         return None
+
+
+def compute_nhpp_curve(
+    reliability_result: Dict[str, Any],
+    time_axis: np.ndarray,
+    curve_name: str,
+) -> Optional[np.ndarray]:
+    parameters = reliability_result.get("params", {}) or {}
+    beta_value = safe_float(parameters.get("beta"), None)
+    eta_value = safe_float(parameters.get("eta"), None)
+    if beta_value is None or eta_value is None or beta_value <= 0 or eta_value <= 0:
+        return None
+
+    safe_time_axis = np.maximum(time_axis, 1e-6)
+    cumulative_mean = (safe_time_axis / eta_value) ** beta_value
+    intensity = (beta_value / eta_value) * ((safe_time_axis / eta_value) ** (beta_value - 1.0))
+    non_event_probability = np.exp(-cumulative_mean)
+    cumulative_probability = 1.0 - non_event_probability
+    density = intensity * non_event_probability
+
+    if curve_name == "non_event_probability":
+        return non_event_probability
+    if curve_name == "cumulative_probability":
+        return cumulative_probability
+    if curve_name == "density":
+        return density
+    if curve_name == "intensity":
+        return intensity
+    if curve_name == "cumulative_events":
+        return cumulative_mean
+
+    return None
+
+
+def compute_bpp_curve(
+    reliability_result: Dict[str, Any],
+    time_axis: np.ndarray,
+    ttf_series: list[float],
+    curve_name: str,
+) -> Optional[np.ndarray]:
+    parameters = reliability_result.get("params", {}) or {}
+    mu_value = safe_float(parameters.get("mu"), None)
+    alpha_value = safe_float(parameters.get("alpha"), None)
+    beta_kernel_value = safe_float(parameters.get("beta_kernel"), None)
+
+    if mu_value is None or alpha_value is None or beta_kernel_value is None:
+        return None
+    if mu_value < 0 or alpha_value < 0 or beta_kernel_value <= 0:
+        return None
+
+    event_times = np.cumsum(np.asarray(ttf_series, dtype=float))
+    if event_times.size == 0:
+        return None
+
+    safe_time_axis = np.maximum(time_axis, 1e-6)
+    intensity = np.full_like(safe_time_axis, fill_value=mu_value, dtype=float)
+
+    for event_time in event_times:
+        mask = safe_time_axis >= event_time
+        if np.any(mask):
+            intensity[mask] += alpha_value * np.exp(-beta_kernel_value * (safe_time_axis[mask] - event_time))
+
+    cumulative_intensity = np.zeros_like(safe_time_axis, dtype=float)
+    if len(safe_time_axis) > 1:
+        delta = np.diff(safe_time_axis)
+        trapezoids = 0.5 * (intensity[1:] + intensity[:-1]) * delta
+        cumulative_intensity[1:] = np.cumsum(trapezoids)
+
+    non_event_probability = np.exp(-cumulative_intensity)
+    cumulative_probability = 1.0 - non_event_probability
+    density = intensity * non_event_probability
+
+    if curve_name == "non_event_probability":
+        return non_event_probability
+    if curve_name == "cumulative_probability":
+        return cumulative_probability
+    if curve_name == "density":
+        return density
+    if curve_name == "intensity":
+        return intensity
+    if curve_name == "cumulative_events":
+        return cumulative_intensity
+
+    return None
+
+
+def compute_model_based_curve(
+    reliability_result: Dict[str, Any],
+    ttf_series: list[float],
+    time_axis: np.ndarray,
+    curve_name: str,
+) -> Optional[np.ndarray]:
+    model_name = str(reliability_result.get("model") or "").upper()
+
+    if model_name == "RP":
+        return compute_rp_curve(reliability_result, time_axis, curve_name)
+    if model_name == "NHPP":
+        return compute_nhpp_curve(reliability_result, time_axis, curve_name)
+    if model_name == "BPP":
+        return compute_bpp_curve(reliability_result, time_axis, ttf_series, curve_name)
+
+    return None
+
+
+def build_curve_explanation(
+    reliability_result: Dict[str, Any],
+    curve_name: str,
+) -> str:
+    model_name = str(reliability_result.get("model") or "").upper()
+
+    if curve_name == "non_event_probability":
+        if model_name == "RP":
+            return (
+                "Cette courbe représente la probabilité qu’aucune défaillance ne survienne avant un temps donné. "
+                "Dans un processus de renouvellement, elle correspond à la fonction classique de fiabilité."
+            )
+        if model_name == "NHPP":
+            return (
+                "Cette courbe représente ici la probabilité qu’aucun événement ne soit observé jusqu’au temps considéré "
+                "dans un processus de Poisson non homogène. Ce n’est pas une fiabilité au sens strict d’un système non réparable, "
+                "mais une probabilité de non-apparition d’événement."
+            )
+        return (
+            "Cette courbe représente une probabilité conditionnelle de non-apparition d’un nouvel événement, "
+            "calculée à partir de l’intensité estimée du processus avec dépendance."
+        )
+
+    if curve_name == "cumulative_probability":
+        if model_name == "RP":
+            return (
+                "Cette courbe représente la probabilité cumulée qu’une défaillance soit déjà survenue avant le temps considéré."
+            )
+        if model_name == "NHPP":
+            return (
+                "Cette courbe représente la probabilité cumulée d’avoir observé au moins un événement jusqu’au temps considéré "
+                "dans le processus non homogène."
+            )
+        return (
+            "Cette courbe représente une probabilité cumulée conditionnelle d’apparition d’au moins un événement "
+            "dans le processus avec dépendance."
+        )
+
+    if curve_name == "density":
+        if model_name == "RP":
+            return (
+                "Cette courbe montre où se concentrent les durées les plus probables entre deux défaillances."
+            )
+        if model_name == "NHPP":
+            return (
+                "Cette courbe représente la densité du premier événement dans un processus non homogène. "
+                "Elle combine l’intensité instantanée et la probabilité de n’avoir encore rien observé avant cet instant."
+            )
+        return (
+            "Cette courbe représente une densité conditionnelle du premier nouvel événement selon l’intensité estimée du processus avec dépendance."
+        )
+
+    if curve_name == "intensity":
+        if model_name == "RP":
+            return (
+                "Cette courbe représente le taux instantané de défaillance : plus il est élevé, plus le risque immédiat de défaillance est fort."
+            )
+        if model_name == "NHPP":
+            return (
+                "Cette courbe représente l’intensité instantanée d’apparition des événements dans le temps. "
+                "Elle montre si le processus s’accélère ou ralentit."
+            )
+        return (
+            "Cette courbe représente l’intensité conditionnelle du processus avec dépendance : "
+            "elle dépend du fond de processus et de l’effet des événements passés."
+        )
+
+    if curve_name == "cumulative_events":
+        if model_name == "RP":
+            return (
+                "Cette courbe donne une approximation du nombre cumulé moyen d’événements, "
+                "obtenue en divisant le temps par la durée moyenne entre défaillances."
+            )
+        if model_name == "NHPP":
+            return (
+                "Cette courbe représente le nombre cumulé moyen d’événements attendu selon le modèle non homogène."
+            )
+        return (
+            "Cette courbe représente l’intensité cumulée du processus avec dépendance, "
+            "qui sert ici d’approximation du cumul attendu des événements."
+        )
+
+    return "Courbe non documentée."
 
 
 def export_tables_to_excel(results_by_equipment: Dict[str, Dict[str, Any]]) -> bytes:
@@ -351,6 +633,39 @@ if "equipment_code" not in source_dataframe.columns or "ttf_h" not in source_dat
     st.error("Le jeu de données doit contenir au moins les colonnes equipment_code et ttf_h.")
     st.stop()
 
+with st.expander("Comprendre les principales variables affichées sur cette page", expanded=False):
+    st.markdown(
+        """
+**Temps moyen avant défaillance** : durée moyenne attendue avant une panne.
+
+**Temps moyen entre défaillances** : durée moyenne séparant deux défaillances successives.
+
+**Temps moyen de réparation** : durée moyenne nécessaire pour remettre l’équipement en service.
+
+**Disponibilité intrinsèque** : part du temps où l’équipement est disponible.
+
+**Paramètre bêta** : décrit la forme du vieillissement.
+- inférieur à 1 : défauts précoces
+- proche de 1 : comportement aléatoire
+- supérieur à 1 : usure
+
+**Paramètre êta** : durée de vie caractéristique estimée.
+
+**Paramètre gamma** : éventuel décalage temporel dans le modèle.
+
+**Température du point chaud** : température estimée dans la zone la plus chaude du transformateur.
+
+**Facteur d’accélération du vieillissement** : indicateur montrant à quel point la chaleur accélère le vieillissement de l’isolation.
+
+**Perte de vie** : part estimée de la durée de vie déjà consommée.
+
+**Processus retenu** :
+- RP : renouvellement avec durées supposées indépendantes
+- NHPP : processus évolutif dans le temps
+- BPP : processus avec dépendance entre événements
+        """
+    )
+
 select_col_1, select_col_2 = st.columns([2, 1])
 with select_col_1:
     all_equipment_codes = sorted(source_dataframe["equipment_code"].astype(str).unique().tolist())
@@ -379,14 +694,16 @@ if not selected_equipment_codes:
 # -------------------------------------------------------------------
 results_by_equipment: Dict[str, Dict[str, Any]] = {}
 summary_rows: list[dict[str, Any]] = []
-equipment_ready_for_reliability_curves: list[str] = []
-equipment_without_reliability_curves: list[str] = []
+ttf_series_by_equipment: Dict[str, list[float]] = {}
+equipment_without_curves: list[str] = []
 
 for equipment_code in selected_equipment_codes:
     equipment_dataframe = source_dataframe[source_dataframe["equipment_code"].astype(str) == str(equipment_code)].copy()
     time_to_failure_list = series_to_positive_list(equipment_dataframe["ttf_h"])
     if not time_to_failure_list or len(time_to_failure_list) < 3:
         continue
+
+    ttf_series_by_equipment[str(equipment_code)] = time_to_failure_list
 
     repair_time_list = None
     if "duree_rep_h" in equipment_dataframe.columns:
@@ -434,10 +751,8 @@ for equipment_code in selected_equipment_codes:
         }
     )
 
-    if reliability_result.get("model") == "RP" and reliability_result.get("distribution") in {"expon", "norm", "lognorm", "weibull_2p", "weibull_3p"}:
-        equipment_ready_for_reliability_curves.append(str(equipment_code))
-    else:
-        equipment_without_reliability_curves.append(str(equipment_code))
+    if str(reliability_result.get("model") or "").upper() not in {"RP", "NHPP", "BPP"}:
+        equipment_without_curves.append(str(equipment_code))
 
 if not results_by_equipment:
     st.error("Pas assez de temps entre défaillances exploitables (au moins 3 valeurs positives).")
@@ -461,7 +776,9 @@ metric_col_1, metric_col_2, metric_col_3, metric_col_4 = st.columns(4)
 with metric_col_1:
     st.metric("Nombre d’équipements analysés", len(results_by_equipment))
 with metric_col_2:
-    total_failure_count = int(len(source_dataframe[source_dataframe["equipment_code"].astype(str).isin(list(results_by_equipment.keys()))]))
+    total_failure_count = int(
+        len(source_dataframe[source_dataframe["equipment_code"].astype(str).isin(list(results_by_equipment.keys()))])
+    )
     st.metric("Nombre total d’enregistrements de défaillance", total_failure_count)
 with metric_col_3:
     availability_series = summary_dataframe["availability_pct"].dropna()
@@ -483,7 +800,8 @@ page_tabs = st.tabs([
     "Dépendance",
     "Fiabilité",
     "Thermique",
-    "Courbes",
+    "Courbes fiabilistes",
+    "Courbes thermiques",
     "Téléchargements",
 ])
 
@@ -594,31 +912,91 @@ with page_tabs[4]:
             )
 
 with page_tabs[5]:
-    st.subheader("Courbes")
+    st.subheader("Courbes fiabilistes")
 
-    if equipment_without_reliability_curves:
+    if equipment_without_curves:
         st.info(
-            "Les courbes analytiques de fiabilité ne sont pas disponibles pour : "
-            + ", ".join(equipment_without_reliability_curves)
+            "Certaines courbes n’ont pas pu être construites pour : "
+            + ", ".join(equipment_without_curves)
         )
 
-    maximum_time_value = float(source_dataframe[source_dataframe["equipment_code"].astype(str).isin(list(results_by_equipment.keys()))]["ttf_h"].max())
-    maximum_time_value = max(1000.0, maximum_time_value if np.isfinite(maximum_time_value) and maximum_time_value > 0 else 1000.0)
-    time_axis = np.linspace(1e-6, maximum_time_value, 300)
+    maximum_time_candidates = []
+    for equipment_code, ttf_series in ttf_series_by_equipment.items():
+        if ttf_series:
+            maximum_time_candidates.append(float(np.max(np.asarray(ttf_series, dtype=float))))
+            maximum_time_candidates.append(float(np.sum(np.asarray(ttf_series, dtype=float))))
 
-    def plot_multiple_reliability_curves(axis, curve_name: str, title: str, y_label: str):
+        reliability_result = (results_by_equipment.get(equipment_code, {}) or {}).get("reliability", {}) or {}
+        parameters = reliability_result.get("params", {}) or {}
+        eta_value = safe_float(parameters.get("eta"), None)
+        if eta_value is not None and eta_value > 0:
+            maximum_time_candidates.append(eta_value * 2.0)
+
+    maximum_time_value = max(maximum_time_candidates) if maximum_time_candidates else 1000.0
+    maximum_time_value = max(100.0, maximum_time_value)
+    time_axis = np.linspace(1e-6, maximum_time_value, 400)
+
+    selected_reliability_result = (results_by_equipment.get(selected_equipment_for_detail, {}) or {}).get("reliability", {}) or {}
+
+    curve_definitions = [
+        (
+            "non_event_probability",
+            "Probabilité de non-événement",
+            "Probabilité",
+            "Cette courbe remplace l’ancienne courbe R(t) lorsqu’on n’est pas dans un cas classique de renouvellement. "
+            "Elle reste donc utilisable pour RP, NHPP et BPP.",
+        ),
+        (
+            "cumulative_probability",
+            "Probabilité cumulée d’apparition d’au moins un événement",
+            "Probabilité cumulée",
+            "Cette courbe montre à quel rythme la probabilité d’observer au moins un événement augmente avec le temps.",
+        ),
+        (
+            "density",
+            "Densité de probabilité ou densité du premier événement",
+            "Densité",
+            "Cette courbe aide à voir dans quelles zones de temps les événements sont les plus concentrés.",
+        ),
+        (
+            "intensity",
+            "Taux ou intensité de défaillance",
+            "Intensité",
+            "Cette courbe montre le niveau instantané de risque ou d’intensité du processus.",
+        ),
+        (
+            "cumulative_events",
+            "Nombre cumulé attendu d’événements",
+            "Cumul attendu",
+            "Cette courbe montre le volume attendu d’événements au fur et à mesure du temps.",
+        ),
+    ]
+
+    def plot_multiple_model_curves(
+        axis,
+        curve_name: str,
+        title: str,
+        y_label: str,
+    ):
         plotted_count = 0
-        for equipment_code in equipment_ready_for_reliability_curves:
-            reliability_result = results_by_equipment[equipment_code]["reliability"]
-            curve_values = compute_reliability_curve(reliability_result, time_axis, curve_name)
+        for equipment_code, result in results_by_equipment.items():
+            reliability_result = result.get("reliability", {}) or {}
+            equipment_ttf_series = ttf_series_by_equipment.get(equipment_code, [])
+            curve_values = compute_model_based_curve(
+                reliability_result=reliability_result,
+                ttf_series=equipment_ttf_series,
+                time_axis=time_axis,
+                curve_name=curve_name,
+            )
             if curve_values is None:
                 continue
-            axis.plot(
-                time_axis,
-                curve_values,
-                label=f"{equipment_code} ({reliability_result.get('distribution')})",
-                linewidth=2,
+
+            label = (
+                f"{equipment_code} | "
+                f"{reliability_result.get('model', '—')} | "
+                f"{reliability_result.get('distribution', '—')}"
             )
+            axis.plot(time_axis, curve_values, label=label, linewidth=2)
             plotted_count += 1
 
         axis.set_title(title)
@@ -637,11 +1015,35 @@ with page_tabs[5]:
                 transform=axis.transAxes,
             )
 
-    curve_tabs = st.tabs([
-        "Fiabilité",
-        "Fonction de répartition",
+    reliability_curve_tabs = st.tabs([
+        "Probabilité de non-événement",
+        "Probabilité cumulée",
         "Densité",
-        "Taux de défaillance",
+        "Intensité",
+        "Nombre cumulé attendu",
+    ])
+
+    for curve_tab, curve_definition in zip(reliability_curve_tabs, curve_definitions):
+        curve_name, title, y_label, generic_explanation = curve_definition
+        with curve_tab:
+            figure, axis = plt.subplots(figsize=(10, 5))
+            plot_multiple_model_curves(axis, curve_name, title, y_label)
+            st.pyplot(figure, clear_figure=True)
+            st.caption(generic_explanation)
+            st.caption(
+                f"Lecture pour l’équipement sélectionné ({selected_equipment_for_detail}) : "
+                + build_curve_explanation(selected_reliability_result, curve_name)
+            )
+
+with page_tabs[6]:
+    st.subheader("Courbes thermiques")
+
+    thermal_timeseries = (selected_thermal_result or {}).get("timeseries")
+    if isinstance(thermal_timeseries, pd.DataFrame) and not thermal_timeseries.empty:
+        thermal_timeseries = thermal_timeseries.copy()
+        thermal_timeseries["timestamp"] = pd.to_datetime(thermal_timeseries["timestamp"])
+
+    thermal_curve_tabs = st.tabs([
         "Température ambiante",
         "Charge",
         "État des ventilateurs",
@@ -655,32 +1057,7 @@ with page_tabs[5]:
         "Perte de vie cumulée et vie résiduelle",
     ])
 
-    with curve_tabs[0]:
-        figure, axis = plt.subplots()
-        plot_multiple_reliability_curves(axis, "reliability", "Courbe de fiabilité", "Fiabilité")
-        st.pyplot(figure, clear_figure=True)
-
-    with curve_tabs[1]:
-        figure, axis = plt.subplots()
-        plot_multiple_reliability_curves(axis, "cumulative_distribution", "Fonction de répartition", "Probabilité cumulée")
-        st.pyplot(figure, clear_figure=True)
-
-    with curve_tabs[2]:
-        figure, axis = plt.subplots()
-        plot_multiple_reliability_curves(axis, "density", "Densité de probabilité", "Densité")
-        st.pyplot(figure, clear_figure=True)
-
-    with curve_tabs[3]:
-        figure, axis = plt.subplots()
-        plot_multiple_reliability_curves(axis, "failure_rate", "Taux instantané de défaillance", "Taux de défaillance")
-        st.pyplot(figure, clear_figure=True)
-
-    thermal_timeseries = (selected_thermal_result or {}).get("timeseries")
-    if isinstance(thermal_timeseries, pd.DataFrame) and not thermal_timeseries.empty:
-        thermal_timeseries = thermal_timeseries.copy()
-        thermal_timeseries["timestamp"] = pd.to_datetime(thermal_timeseries["timestamp"])
-
-    with curve_tabs[4]:
+    with thermal_curve_tabs[0]:
         if thermal_timeseries is None or thermal_timeseries.empty:
             st.info("Aucune courbe thermique disponible.")
         else:
@@ -691,8 +1068,9 @@ with page_tabs[5]:
                 "Température ambiante au cours du temps",
                 "Température (°C)",
             )
+            st.caption("Cette courbe montre l’évolution de la température ambiante autour de l’équipement.")
 
-    with curve_tabs[5]:
+    with thermal_curve_tabs[1]:
         if thermal_timeseries is None or thermal_timeseries.empty:
             st.info("Aucune courbe thermique disponible.")
         else:
@@ -704,6 +1082,7 @@ with page_tabs[5]:
                     "Charge du transformateur au cours du temps",
                     "Charge (%)",
                 )
+                st.caption("Cette courbe montre le pourcentage de charge supporté par l’équipement.")
             else:
                 plot_single_series(
                     thermal_timeseries,
@@ -712,8 +1091,9 @@ with page_tabs[5]:
                     "Facteur de charge au cours du temps",
                     "Facteur de charge",
                 )
+                st.caption("Cette courbe montre le facteur de charge utilisé pour le calcul thermique.")
 
-    with curve_tabs[6]:
+    with thermal_curve_tabs[2]:
         if thermal_timeseries is None or thermal_timeseries.empty:
             st.info("Aucune courbe thermique disponible.")
         else:
@@ -724,8 +1104,9 @@ with page_tabs[5]:
                 "État des ventilateurs au cours du temps",
                 "État des ventilateurs",
             )
+            st.caption("Cette courbe indique les périodes où les ventilateurs sont actifs ou inactifs.")
 
-    with curve_tabs[7]:
+    with thermal_curve_tabs[3]:
         if thermal_timeseries is None or thermal_timeseries.empty:
             st.info("Aucune courbe thermique disponible.")
         else:
@@ -736,8 +1117,9 @@ with page_tabs[5]:
                 "Élévation de température top-oil au cours du temps",
                 "Élévation de température (°C)",
             )
+            st.caption("Cette courbe montre l’élévation de température de l’huile au-dessus de la température ambiante.")
 
-    with curve_tabs[8]:
+    with thermal_curve_tabs[4]:
         if thermal_timeseries is None or thermal_timeseries.empty:
             st.info("Aucune courbe thermique disponible.")
         else:
@@ -748,8 +1130,9 @@ with page_tabs[5]:
                 "Élévation de température du point chaud au cours du temps",
                 "Élévation de température (°C)",
             )
+            st.caption("Cette courbe montre l’élévation supplémentaire dans la zone la plus chaude du transformateur.")
 
-    with curve_tabs[9]:
+    with thermal_curve_tabs[5]:
         if thermal_timeseries is None or thermal_timeseries.empty:
             st.info("Aucune courbe thermique disponible.")
         else:
@@ -760,8 +1143,9 @@ with page_tabs[5]:
                 "Température top-oil estimée au cours du temps",
                 "Température (°C)",
             )
+            st.caption("Cette courbe montre la température estimée de l’huile.")
 
-    with curve_tabs[10]:
+    with thermal_curve_tabs[6]:
         if thermal_timeseries is None or thermal_timeseries.empty:
             st.info("Aucune courbe thermique disponible.")
         else:
@@ -772,8 +1156,9 @@ with page_tabs[5]:
                 "Température du point chaud estimée au cours du temps",
                 "Température (°C)",
             )
+            st.caption("Cette courbe montre la température estimée dans la zone la plus chaude du transformateur.")
 
-    with curve_tabs[11]:
+    with thermal_curve_tabs[7]:
         if thermal_timeseries is None or thermal_timeseries.empty:
             st.info("Aucune courbe thermique disponible.")
         else:
@@ -784,8 +1169,9 @@ with page_tabs[5]:
                 "Facteur d’accélération du vieillissement au cours du temps",
                 "Facteur",
             )
+            st.caption("Plus cette courbe monte, plus la chaleur accélère le vieillissement de l’isolation.")
 
-    with curve_tabs[12]:
+    with thermal_curve_tabs[8]:
         if thermal_timeseries is None or thermal_timeseries.empty:
             st.info("Aucune courbe thermique disponible.")
         else:
@@ -796,8 +1182,9 @@ with page_tabs[5]:
                 "Heures de vieillissement sur chaque pas de temps",
                 "Heures de vieillissement",
             )
+            st.caption("Cette courbe montre la contribution de chaque pas de temps au vieillissement total.")
 
-    with curve_tabs[13]:
+    with thermal_curve_tabs[9]:
         if thermal_timeseries is None or thermal_timeseries.empty:
             st.info("Aucune courbe thermique disponible.")
         else:
@@ -808,14 +1195,18 @@ with page_tabs[5]:
                 "Heures de vieillissement cumulées",
                 "Heures de vieillissement cumulées",
             )
+            st.caption("Cette courbe montre l’accumulation progressive du vieillissement au cours du temps.")
 
-    with curve_tabs[14]:
+    with thermal_curve_tabs[10]:
         if thermal_timeseries is None or thermal_timeseries.empty:
             st.info("Aucune courbe thermique disponible.")
         else:
             dual_figure, dual_axis = plt.subplots(figsize=(9, 4))
 
-            plot_dataframe = thermal_timeseries[["timestamp", "life_consumed_pct_cum", "remaining_life_pct"]].dropna(how="all").copy()
+            plot_dataframe = thermal_timeseries[
+                ["timestamp", "life_consumed_pct_cum", "remaining_life_pct"]
+            ].dropna(how="all").copy()
+
             if plot_dataframe.empty:
                 st.info("Aucune donnée disponible pour cette courbe.")
             else:
@@ -840,8 +1231,11 @@ with page_tabs[5]:
                 dual_axis.grid(True, alpha=0.3)
                 dual_axis.legend()
                 st.pyplot(dual_figure, clear_figure=True)
+                st.caption(
+                    "Cette courbe compare la part de vie déjà consommée et la part de vie restante estimée."
+                )
 
-with page_tabs[6]:
+with page_tabs[7]:
     st.subheader("Téléchargements")
 
     excel_bytes = export_tables_to_excel(results_by_equipment)
@@ -858,7 +1252,9 @@ with page_tabs[6]:
         if report_error_message:
             st.caption(report_error_message)
     else:
-        selected_source_dataframe = source_dataframe[source_dataframe["equipment_code"].astype(str).isin(selected_equipment_codes)].copy()
+        selected_source_dataframe = source_dataframe[
+            source_dataframe["equipment_code"].astype(str).isin(selected_equipment_codes)
+        ].copy()
 
         if st.button("Générer le PDF", type="primary", use_container_width=True):
             try:
