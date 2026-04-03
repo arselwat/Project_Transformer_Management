@@ -1,19 +1,25 @@
+# core/reliability/reporting_merged.py
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Optional, Dict, Any, List
+from io import BytesIO
 import math
 
 import numpy as np
 import pandas as pd
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
 try:
-    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.pagesizes import A4
     from reportlab.lib import colors
-    from reportlab.lib.units import mm
-    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.lib.enums import TA_LEFT, TA_CENTER
+    from reportlab.lib.units import cm, mm
+    from reportlab.lib.styles import getSampleStyleSheet
     from reportlab.platypus import (
         SimpleDocTemplate,
         Paragraph,
@@ -21,428 +27,368 @@ try:
         Table,
         TableStyle,
         PageBreak,
+        Image,
     )
     HAVE_REPORTLAB = True
 except Exception:
     HAVE_REPORTLAB = False
 
-try:
-    from core.reliability.unify import compute_bundle, UnifyOptions
-except Exception:
-    compute_bundle = None
-    UnifyOptions = None
+from core.reliability.unify import compute_bundle, UnifyOptions, UnifyBundle
+from core.reliability.weibull import R, F, pdf, hazard
 
 
-# ============================================================
-# Helpers
-# ============================================================
-def _san(value: Any) -> str:
-    text = "" if value is None else str(value)
-    return (
-        text.replace("’", "'")
-        .replace("‘", "'")
-        .replace("“", '"')
-        .replace("”", '"')
-        .replace("–", "-")
-        .replace("—", "-")
-        .replace("≤", "<=")
-        .replace("≥", ">=")
-        .replace("β", "beta")
-        .replace("η", "eta")
-        .replace("γ", "gamma")
-        .replace("θ", "theta")
-        .replace("°", " deg")
-        .replace("\u00A0", " ")
-    )
-
-
-def _safe_float(value: Any, default: Optional[float] = None) -> Optional[float]:
+def _fmt(x, nd=2, dash="—"):
     try:
-        if value is None:
-            return default
-        v = float(value)
-        if math.isnan(v) or math.isinf(v):
-            return default
-        return v
+        if x is None:
+            return dash
+        if isinstance(x, float) and (math.isnan(x) or math.isinf(x)):
+            return dash
+        return f"{float(x):.{nd}f}"
     except Exception:
-        return default
-
-
-def _fmt(value: Any, nd: int = 2, dash: str = "—") -> str:
-    v = _safe_float(value, None)
-    if v is None:
         return dash
-    return f"{v:.{nd}f}"
 
 
-def _compact(value: Any, max_len: int = 120) -> str:
-    text = _san(value).replace("\n", " ").strip()
-    if len(text) <= max_len:
-        return text
-    return text[: max_len - 3] + "..."
-
-
-def _require_reportlab():
-    if not HAVE_REPORTLAB:
-        raise RuntimeError("ReportLab n’est pas disponible. Installe reportlab puis relance.")
-
-
-def _auto_col_widths(data: List[List[Any]], total_width: float) -> List[float]:
-    if not data:
-        return []
-
-    ncols = max(len(r) for r in data)
-    lengths = [8] * ncols
-
-    for row in data[:40]:
-        for i in range(ncols):
-            cell = row[i] if i < len(row) else ""
-            lengths[i] = max(lengths[i], min(len(str(cell)), 50))
-
-    weights = [max(x, 8) for x in lengths]
-    s = sum(weights) if sum(weights) > 0 else ncols
-    widths = [(w / s) * total_width for w in weights]
-
-    min_w = 18 * mm
-    max_w = 85 * mm
-    widths = [min(max(w, min_w), max_w) for w in widths]
-
-    total = sum(widths)
-    if total > total_width:
-        ratio = total_width / total
-        widths = [w * ratio for w in widths]
-
-    return widths
-
-
-def _mk_table(data: List[List[Any]], total_width: float, font_size: int = 8) -> "Table":
+def _mk_table(data: List[List[Any]], col_widths=None, font_size=8, avail_width=None):
+    """
+    Table ReportLab robuste:
+    - wrap automatique via Paragraph
+    - scale automatique si col_widths dépasse la largeur dispo (A4)
+    - repeatRows=1 pour répéter l’en-tête si la table déborde sur plusieurs pages
+    """
     styles = getSampleStyleSheet()
+    cell_style = styles["BodyText"]
+    cell_style.fontName = "Helvetica"
+    cell_style.fontSize = font_size
+    cell_style.leading = font_size + 2
 
-    body_style = ParagraphStyle(
-        name=f"body_{font_size}_{len(data)}",
-        fontName="Helvetica",
-        fontSize=font_size,
-        leading=max(9, int(font_size * 1.3)),
-        alignment=TA_LEFT,
-        wordWrap="CJK",
-    )
+    # wrap cellules (sauf si déjà Flowable)
+    wrapped: List[List[Any]] = []
+    for row in data:
+        new_row = []
+        for c in row:
+            if HAVE_REPORTLAB and not hasattr(c, "wrapOn"):
+                txt = "" if c is None else str(c)
+                new_row.append(Paragraph(txt, cell_style))
+            else:
+                new_row.append(c)
+        wrapped.append(new_row)
 
-    head_style = ParagraphStyle(
-        name=f"head_{font_size}_{len(data)}",
-        fontName="Helvetica-Bold",
-        fontSize=max(font_size, 8),
-        leading=max(10, int(font_size * 1.3)),
-        alignment=TA_CENTER,
-        wordWrap="CJK",
-    )
+    # largeur dispo (A4 - marges) si non fournie
+    if avail_width is None:
+        try:
+            avail_width = A4[0] - (14 * mm + 14 * mm)  # mêmes marges que le doc
+        except Exception:
+            avail_width = None
 
-    wrapped = []
-    for row_idx, row in enumerate(data):
-        style = head_style if row_idx == 0 else body_style
-        wrapped.append([Paragraph(_san(c).replace("\n", "<br/>"), style) for c in row])
+    # colWidths
+    if col_widths is None and avail_width:
+        ncol = len(wrapped[0]) if wrapped else 1
+        col_widths = [avail_width / max(ncol, 1)] * ncol
 
-    tbl = Table(
-        wrapped,
-        repeatRows=1,
-        colWidths=_auto_col_widths(data, total_width=total_width),
-        splitByRow=1,
-    )
-    tbl.setStyle(
+    # scale si trop large
+    if avail_width and col_widths:
+        total = float(sum(col_widths))
+        if total > avail_width and total > 0:
+            k = avail_width / total
+            col_widths = [w * k for w in col_widths]
+
+    t = Table(wrapped, colWidths=col_widths, repeatRows=1)
+    t.setStyle(
         TableStyle(
             [
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#355CBB")),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#7390CF")),
                 ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#D1D5DB")),
+
+                ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#D1D5DB")),
                 ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("LEFTPADDING", (0, 0), (-1, -1), 3),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+                ("FONTSIZE", (0, 0), (-1, -1), font_size),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F9FAFB")]),
+
+                ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 4),
                 ("TOPPADDING", (0, 0), (-1, -1), 3),
                 ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
-                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F8FAFC")]),
             ]
         )
     )
-    return tbl
+    return t
 
 
-def _get_rel(result: Dict[str, Any]) -> Dict[str, Any]:
-    return (result.get("reliability", {}) if isinstance(result, dict) else {}) or {}
+class _WB:
+    def __init__(self, beta: float, eta: float, gamma: float = 0.0):
+        self.beta = float(beta)
+        self.eta = float(eta)
+        self.gamma = float(gamma or 0.0)
 
 
-def _get_thermal(result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    thermal = result.get("thermal") if isinstance(result, dict) else None
-    return thermal if isinstance(thermal, dict) else None
+def _fig_to_rl_image(fig, width_mm=170):
+    bio = BytesIO()
+    fig.savefig(bio, format="png", dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    bio.seek(0)
+    img = Image(bio)
+    w = width_mm * mm
+    ratio = img.imageHeight / max(img.imageWidth, 1)
+    img.drawWidth = w
+    img.drawHeight = w * ratio
+    return img
 
 
-def _get_summary_rows(analysis_results: Dict[str, Dict[str, Any]]) -> List[List[Any]]:
-    data = [[
-        "Équipement",
-        "Processus",
-        "Loi",
-        "Tendance",
-        "Dépendance",
-        "beta",
-        "eta (h)",
-        "gamma (h)",
-        "MTBF (h)",
-        "MTTR (h)",
-        "Disponibilité (%)",
-    ]]
-
-    for eq, result in sorted(analysis_results.items()):
-        rel = _get_rel(result)
-        indicators = rel.get("indicators", {}) or {}
-        tests = rel.get("tests", {}) or {}
-        decision = rel.get("decision", {}) or {}
-        params = rel.get("params", {}) or {}
-
-        availability = None
-        if indicators.get("availability_intrinsic") is not None:
-            availability = 100.0 * float(indicators.get("availability_intrinsic"))
-
-        data.append([
-            _san(eq),
-            _san(rel.get("model", "—")),
-            _san(rel.get("distribution", "—")),
-            "Oui" if decision.get("has_trend") else "Non",
-            "Oui" if decision.get("has_dependence") else "Non",
-            _fmt(params.get("beta"), 3),
-            _fmt(params.get("eta"), 1),
-            _fmt(params.get("gamma"), 1),
-            _fmt(indicators.get("mtbf_h"), 1),
-            _fmt(indicators.get("mttr_h"), 1),
-            _fmt(availability, 2),
-        ])
-
-    return data
+def _equip_time_grid(eq: str, bundle: UnifyBundle, fit: _WB) -> np.ndarray:
+    try:
+        ttf_eq = bundle.ttf.loc[bundle.ttf["equipment_code"] == eq, "ttf_h"]
+        tmax_data = float(ttf_eq.max()) if not ttf_eq.empty else 0.0
+    except Exception:
+        tmax_data = 0.0
+    tmax = max(100.0, tmax_data * 1.2, fit.eta * 1.5)
+    return np.linspace(0.0, tmax, 400)
 
 
-def _get_thermal_rows(analysis_results: Dict[str, Dict[str, Any]]) -> List[List[Any]]:
-    data = [[
-        "Équipement",
-        "Température max du point chaud (degC)",
-        "FAA max",
-        "Perte de vie (%)",
-    ]]
+def _plot_panel(eq: str, fit: _WB, t: np.ndarray):
+    yR = R(t, fit)
+    yF = F(t, fit)
+    yf = pdf(t, fit)
+    yh = hazard(t, fit)
 
-    found = False
-    for eq, result in sorted(analysis_results.items()):
-        thermal = _get_thermal(result)
-        summary = (thermal or {}).get("summary", {}) if thermal else {}
-        if not summary:
-            continue
+    fig, axes = plt.subplots(2, 2, figsize=(10, 6))
+    axes = axes.ravel()
 
-        found = True
-        data.append([
-            _san(eq),
-            _fmt(summary.get("theta_hs_max"), 2),
-            _fmt(summary.get("faa_max"), 3),
-            _fmt(summary.get("loss_of_life_pct"), 3),
-        ])
+    axes[0].plot(t, yR, linewidth=2)
+    axes[0].set_title("Fiabilité R(t)")
+    axes[0].set_xlabel("Temps (h)")
+    axes[0].set_ylabel("R(t)")
+    axes[0].grid(True, alpha=.3)
 
-    if not found:
-        return [["Information"], ["Aucune donnée thermique exploitable"]]
-    return data
+    axes[1].plot(t, yF, linewidth=2)
+    axes[1].set_title("Répartition F(t)")
+    axes[1].set_xlabel("Temps (h)")
+    axes[1].set_ylabel("F(t)")
+    axes[1].grid(True, alpha=.3)
+
+    axes[2].plot(t, yf, linewidth=2)
+    axes[2].set_title("Densité f(t)")
+    axes[2].set_xlabel("Temps (h)")
+    axes[2].set_ylabel("f(t)")
+    axes[2].grid(True, alpha=.3)
+
+    axes[3].plot(t, yh, linewidth=2)
+    axes[3].set_title("Taux de défaillance h(t)")
+    axes[3].set_xlabel("Temps (h)")
+    axes[3].set_ylabel("h(t)")
+    axes[3].grid(True, alpha=.3)
+
+    fig.tight_layout()
+    return _fig_to_rl_image(fig, width_mm=170)
 
 
-def _build_trend_table(result: Dict[str, Any]) -> List[List[Any]]:
-    rel = _get_rel(result)
-    tests = rel.get("tests", {}) or {}
+def _maintenance_type(beta: float) -> str:
+    if beta < 0.9:
+        return "Corrective + fiabilisation (jeunesse)"
+    if beta <= 1.1:
+        return "Conditionnelle / inspection (aléatoire)"
+    return "Préventive planifiée (âge) (usure)"
+
+
+def _pipe_line(pipe: dict) -> str:
+    if not isinstance(pipe, dict) or not pipe:
+        return "Trace indisponible."
+    model = pipe.get("model", "RP")
+    dist = pipe.get("distribution", "weibull_2p")
+    good = pipe.get("goodness", {}) or {}
+    tests = pipe.get("tests", {}) or {}
     mk = tests.get("trend_mk", {}) or {}
-    lap = tests.get("trend_laplace", {}) or {}
-    combined = tests.get("trend_combined", {}) or {}
+    dep = tests.get("dependence", {}) or {}
+    return (
+        f"TTF>0 → MK(p={_fmt(mk.get('p'),3)}, dir={mk.get('direction','none')}) "
+        f"→ Dep(r={_fmt(dep.get('r'),3)}, p={_fmt(dep.get('p'),3)}) "
+        f"→ Model={model} ; Dist={dist} ; KS p={_fmt(good.get('ks_p'),3)} ; Chi2 p={_fmt(good.get('chi2_p'),3)}"
+    )
 
-    return [
-        ["Élément", "Valeur", "Lecture"],
-        ["Mann-Kendall", f"z={_fmt(mk.get('z'),3)} ; p={_fmt(mk.get('p'),4)}", "Détecte une tendance globale."],
-        ["Laplace", f"u={_fmt(lap.get('u'),3)} ; p={_fmt(lap.get('p'),4)}", "Confirme ou non une évolution dans le temps."],
-        ["Décision finale", "Oui" if combined.get("has_trend") else "Non", f"Sens : {_san(combined.get('direction', 'none'))}"],
+
+def _per_eq_section(eq: str, mdf: pd.DataFrame, bundle: UnifyBundle) -> List[Any]:
+    styles = getSampleStyleSheet()
+    elems: List[Any] = []
+
+    row = mdf.loc[mdf["equipment_code"] == eq]
+    if row.empty:
+        elems.append(Paragraph(f"Équipement : <b>{eq}</b>", styles["Heading3"]))
+        elems.append(Paragraph("Aucune donnée exploitable.", styles["Normal"]))
+        return elems
+
+    r = row.iloc[0].to_dict()
+    beta = float(r.get("beta")) if r.get("beta") is not None else float("nan")
+    eta = float(r.get("eta")) if r.get("eta") is not None else float("nan")
+    gamma = float(r.get("gamma") or 0.0)
+
+    pipe = (bundle.pipeline_by_eq or {}).get(eq, {}) or {}
+
+    # ---- Header
+    elems.append(Paragraph(f"Équipement : <b>{eq}</b>", styles["Heading2"]))
+    elems.append(Paragraph(_pipe_line(pipe), styles["Normal"]))
+    elems.append(Spacer(1, 6))
+
+    # ---- AVANT (analyse)
+    try:
+        n_ttf = int(bundle.ttf.loc[bundle.ttf["equipment_code"] == eq, "ttf_h"].size)
+    except Exception:
+        n_ttf = 0
+
+    # MTTF théorique Weibull (γ + η Γ(1+1/β))
+    mttf_th = None
+    try:
+        if np.isfinite(beta) and beta > 0 and np.isfinite(eta) and eta > 0:
+            mttf_th = gamma + eta * math.gamma(1.0 + 1.0 / beta)
+    except Exception:
+        mttf_th = None
+
+    avant = [
+        ["Mesure (avant optimisation)", "Valeur"],
+        ["n TTF", _fmt(n_ttf, 0)],
+        ["MTBF empirique (h)", _fmt(r.get("MTBF"), 1)],
+        ["MTTR (h)", _fmt(r.get("MTTR"), 1)],
+        ["β", _fmt(beta, 3)],
+        ["η (h)", _fmt(eta, 1)],
+        ["γ (h)", _fmt(gamma, 1)],
+        ["MTTF théorique (h)", _fmt(mttf_th, 1)],
+        ["Type maintenance (β)", _maintenance_type(beta)],
     ]
+    elems.append(_mk_table(avant, [8.5 * cm, 8.5 * cm]))
+    elems.append(Spacer(1, 8))
 
+    # ---- APRÈS (optimisation)
+    interval_opt = r.get("interval_opt_h")
+    if interval_opt is None or (isinstance(interval_opt, float) and math.isnan(interval_opt)):
+        try:
+            interval_opt = (bundle.optim or {}).get(eq, {}).get("interval_opt_h")
+        except Exception:
+            interval_opt = None
 
-def _build_dependence_table(result: Dict[str, Any]) -> List[List[Any]]:
-    rel = _get_rel(result)
-    dep = (rel.get("tests", {}) or {}).get("dependence", {}) or {}
-
-    return [
-        ["Élément", "Valeur", "Lecture"],
-        ["Pearson", f"r={_fmt(dep.get('pearson_r'),3)} ; p={_fmt(dep.get('pearson_p'),4)}", "Dépendance linéaire."],
-        ["Spearman", f"r={_fmt(dep.get('spearman_r'),3)} ; p={_fmt(dep.get('spearman_p'),4)}", "Dépendance monotone."],
-        ["Décision finale", "Oui" if dep.get("has_dep") else "Non", f"Force : {_san(dep.get('strength', '—'))}"],
+    apres = [
+        ["Mesure (après optimisation)", "Valeur"],
+        ["Intervalle optimisé (h)", _fmt(interval_opt, 1)],
+        ["R* (fiabilité cible)", _fmt(getattr(bundle, "R_target", None), 2)],
+        ["MTBF optimisé (h)", _fmt(r.get("MTBF_opt"), 1)],
+        ["MTTR optimisé (h)", _fmt(r.get("MTTR_opt"), 1)],
     ]
+    elems.append(_mk_table(apres, [8.5 * cm, 8.5 * cm]))
+    elems.append(Spacer(1, 10))
 
+    # ---- Courbes (R,F,f,h)
+    try:
+        fit = _WB(beta=float(beta), eta=float(eta), gamma=float(gamma))
+        t = _equip_time_grid(eq, bundle, fit)
+        elems.append(_plot_panel(eq, fit, t))
+    except Exception:
+        pass
 
-def _build_model_table(result: Dict[str, Any]) -> List[List[Any]]:
-    rel = _get_rel(result)
-    decision = rel.get("decision", {}) or {}
-
-    return [
-        ["Paramètre", "Valeur"],
-        ["Processus retenu", _san(rel.get("model", "—"))],
-        ["Variant", _san(rel.get("process_variant", "—"))],
-        ["Loi retenue", _san(rel.get("distribution", "—"))],
-        ["Justification", _compact(decision.get("reason", "—"), 120)],
-    ]
-
-
-def _build_fit_table(result: Dict[str, Any]) -> List[List[Any]]:
-    rel = _get_rel(result)
-    goodness = rel.get("goodness", {}) or {}
-
-    return [
-        ["Indicateur", "Valeur", "Lecture"],
-        ["AIC", _fmt(goodness.get("aic"), 3), "Plus faible = meilleur compromis ajustement / complexité."],
-        ["Kolmogorov-Smirnov p", _fmt(goodness.get("ks_p"), 4), "Plus la p-valeur est élevée, plus l’ajustement est acceptable."],
-        ["Chi carré p", _fmt(goodness.get("chi2_p"), 4), "Vérification complémentaire de l’ajustement."],
-        ["Cramér-von Mises p", _fmt(goodness.get("cvm_p"), 4), "Vérification complémentaire de la qualité d’ajustement."],
-        ["Ajustement accepté", _san(goodness.get("accepted", "—")), "Décision finale sur l’acceptabilité statistique."],
-    ]
-
-
-def _build_parameter_table(result: Dict[str, Any]) -> List[List[Any]]:
-    rel = _get_rel(result)
-    indicators = rel.get("indicators", {}) or {}
-    params = rel.get("params", {}) or {}
-
-    availability = None
-    if indicators.get("availability_intrinsic") is not None:
-        availability = 100.0 * float(indicators.get("availability_intrinsic"))
-
-    return [
-        ["Paramètre", "Valeur", "Lecture"],
-        ["beta", _fmt(params.get("beta"), 3), "Décrit la phase de vie du système."],
-        ["eta (h)", _fmt(params.get("eta"), 1), "Durée de vie caractéristique."],
-        ["gamma (h)", _fmt(params.get("gamma"), 1), "Décalage éventuel du modèle."],
-        ["MTTF (h)", _fmt(indicators.get("theoretical_mttf_h") or indicators.get("empirical_mttf_h"), 1), "Temps moyen avant défaillance."],
-        ["MTBF (h)", _fmt(indicators.get("mtbf_h"), 1), "Temps moyen entre défaillances."],
-        ["MTTR (h)", _fmt(indicators.get("mttr_h"), 1), "Temps moyen de réparation."],
-        ["Disponibilité (%)", _fmt(availability, 2), "Part du temps où l’équipement reste disponible."],
-    ]
-
-
-def _build_thermal_table(result: Dict[str, Any]) -> List[List[Any]]:
-    thermal = _get_thermal(result)
-    summary = (thermal or {}).get("summary", {}) if thermal else {}
-
-    if not summary:
-        return [["Information"], ["Aucune donnée thermique exploitable"]]
-
-    return [
-        ["Paramètre thermique", "Valeur", "Lecture"],
-        ["Température max du point chaud (degC)", _fmt(summary.get("theta_hs_max"), 2), "Température maximale estimée dans la zone la plus chaude."],
-        ["FAA max", _fmt(summary.get("faa_max"), 3), "Accélération maximale du vieillissement thermique."],
-        ["Perte de vie (%)", _fmt(summary.get("loss_of_life_pct"), 3), "Part estimée de vie déjà consommée."],
-    ]
-
-
-def _analysis_results_from_bundle(df: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
-    if compute_bundle is None or UnifyOptions is None:
-        raise RuntimeError("Impossible de reconstruire les résultats : module unify indisponible.")
-
-    bundle = compute_bundle(session_df=df, options=UnifyOptions(force_weibull_2p=True, R_target=0.80))
-    out: Dict[str, Dict[str, Any]] = {}
-    for eq, pipe in (bundle.pipeline_by_eq or {}).items():
-        if isinstance(pipe, dict):
-            out[str(eq)] = pipe
-    return out
+    elems.append(Spacer(1, 10))
+    return elems
 
 
 def export_merged_report_pdf(
     df: Optional[pd.DataFrame] = None,
     out_dir: str = "reports",
-    title: str = "Rapport des indicateurs",
-    analysis_results: Optional[Dict[str, Dict[str, Any]]] = None,
-    options=None,
+    title: str = "Rapport complet — Analyse & Optimisation",
+    options: Optional[UnifyOptions] = None,
 ) -> str:
-    _require_reportlab()
+    if not HAVE_REPORTLAB:
+        raise RuntimeError("ReportLab non disponible. Installe: pip install reportlab")
 
-    if analysis_results is None:
-        if df is None or getattr(df, "empty", True):
-            raise RuntimeError("Aucune donnée disponible pour générer le rapport des indicateurs.")
-        analysis_results = _analysis_results_from_bundle(df)
+    # options par défaut
+    opt = options or UnifyOptions(force_weibull_2p=True, R_target=0.80)
+    bundle = compute_bundle(session_df=df, options=opt)
 
-    if not analysis_results:
-        raise RuntimeError("Aucun résultat exploitable pour générer le rapport des indicateurs.")
+    if bundle.metrics_df.empty:
+        raise RuntimeError("Aucune métrique exploitable pour générer le rapport.")
 
-    out_dir_path = Path(out_dir)
-    out_dir_path.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir_path / f"report_indicateurs_{datetime.now().strftime('%Y%m%d-%H%M')}.pdf"
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    fpath = out / f"report_analyse_optim_{datetime.now().strftime('%Y%m%d-%H%M')}.pdf"
 
-    styles = getSampleStyleSheet()
     doc = SimpleDocTemplate(
-        str(out_path),
-        pagesize=landscape(A4),
-        topMargin=14 * mm,
-        bottomMargin=12 * mm,
-        leftMargin=10 * mm,
-        rightMargin=10 * mm,
-        title=_san(title),
+        str(fpath),
+        pagesize=A4,
+        rightMargin=14 * mm,
+        leftMargin=14 * mm,
+        topMargin=16 * mm,
+        bottomMargin=14 * mm,
     )
-    usable_width = landscape(A4)[0] - (doc.leftMargin + doc.rightMargin)
-
+    styles = getSampleStyleSheet()
     story: List[Any] = []
 
-    # --------------------------------------------------------
-    # Couverture
-    # --------------------------------------------------------
-    story.append(Paragraph(_san(title), styles["Title"]))
-    story.append(Paragraph(_san(datetime.now().strftime("%d/%m/%Y %H:%M")), styles["Normal"]))
+    # ---- Couverture
+    story.append(Paragraph(title, styles["Title"]))
+    story.append(Paragraph(datetime.now().strftime("%d/%m/%Y %H:%M"), styles["Normal"]))
     story.append(Spacer(1, 10))
 
-    story.append(Paragraph("Ce rapport présente uniquement les indicateurs utiles à la lecture des résultats : tendance, dépendance, modèle retenu, paramètres fiabilistes et synthèse thermique.", styles["BodyText"]))
+    # ---- Récap synthèse global
+    mdf = bundle.metrics_df.copy()
+    eqs = sorted(mdf["equipment_code"].dropna().astype(str).unique().tolist())
+
+    story.append(Paragraph("Synthèse globale", styles["Heading2"]))
+    story.append(Paragraph(f"Nombre d’équipements : {len(eqs)}", styles["Normal"]))
+    story.append(Paragraph(f"Nombre d’observations TTF : {int(bundle.ttf.shape[0])}", styles["Normal"]))
+    story.append(Spacer(1, 8))
+
+    # ---- Ajout : Bloc optimisation (hypothèses & paramètres)
+    story.append(Paragraph("Optimisation — Hypothèses & paramètres", styles["Heading2"]))
+
+    # On lit des attributs possibles (si tu les ajoutes dans UnifyOptions plus tard, ils s’afficheront automatiquement)
+    R_target = getattr(opt, "R_target", None)
+    C_prev = getattr(opt, "C_prev", None) or getattr(opt, "Cp", None) or getattr(opt, "cost_prev", None)
+    C_corr = getattr(opt, "C_corr", None) or getattr(opt, "Cf", None) or getattr(opt, "cost_corr", None)
+    R_min_cost = getattr(opt, "R_min_cost", None) or getattr(opt, "Rmin", None)
+
+    opt_rows = [
+        ["Paramètre", "Valeur"],
+        ["Fiabilité cible R*", _fmt(R_target, 2)],
+        ["Coût préventif Cp", _fmt(C_prev, 2)],
+        ["Coût correctif Cf", _fmt(C_corr, 2)],
+        ["Seuil R_min (optionnel)", _fmt(R_min_cost, 2)],
+        ["Modèle économique", "C(T) = (Cp·R(T) + Cf·(1−R(T))) / ∫0..T R(t) dt"],
+    ]
+    story.append(_mk_table(opt_rows, [8.5 * cm, 8.5 * cm], font_size=8))
     story.append(Spacer(1, 10))
 
-    # --------------------------------------------------------
-    # Synthèse globale
-    # --------------------------------------------------------
-    story.append(Paragraph("Synthèse fiabiliste", styles["Heading2"]))
-    story.append(_mk_table(_get_summary_rows(analysis_results), total_width=usable_width, font_size=7))
-    story.append(Spacer(1, 8))
+    # ---- Table synthèse globale (protégée A4 grâce à _mk_table)
+    head = ["Équipement", "n TTF", "β", "η(h)", "γ(h)", "MTBF(h)", "Intervalle opt(h)", "Type maintenance", "Modèle", "Loi"]
+    rows = [head]
+    for eq in eqs:
+        r = mdf.loc[mdf["equipment_code"] == eq].iloc[0].to_dict()
+        try:
+            n_ttf = int(bundle.ttf.loc[bundle.ttf["equipment_code"] == eq, "ttf_h"].size)
+        except Exception:
+            n_ttf = 0
+        pipe = (bundle.pipeline_by_eq or {}).get(eq, {}) or {}
+        rows.append([
+            eq,
+            _fmt(n_ttf, 0),
+            _fmt(r.get("beta"), 3),
+            _fmt(r.get("eta"), 1),
+            _fmt(r.get("gamma"), 1),
+            _fmt(r.get("MTBF"), 1),
+            _fmt(r.get("interval_opt_h"), 1),
+            _maintenance_type(float(r.get("beta")) if r.get("beta") is not None else float("nan")),
+            str(pipe.get("model", "RP")),
+            str(pipe.get("distribution", "weibull_2p")),
+        ])
 
-    story.append(Paragraph("Synthèse thermique", styles["Heading2"]))
-    story.append(_mk_table(_get_thermal_rows(analysis_results), total_width=usable_width, font_size=7))
-    story.append(Spacer(1, 8))
-
+    story.append(
+        _mk_table(
+            rows,
+            # large table → _mk_table va auto-scale si besoin
+            [2.7 * cm, 1.4 * cm, 1.3 * cm, 1.5 * cm, 1.5 * cm, 1.8 * cm, 2.2 * cm, 3.0 * cm, 1.6 * cm, 2.0 * cm],
+            font_size=7,  # un peu plus petit pour une synthèse large
+        )
+    )
     story.append(PageBreak())
 
-    # --------------------------------------------------------
-    # Détail par équipement
-    # --------------------------------------------------------
-    for idx, (eq, result) in enumerate(sorted(analysis_results.items())):
-        story.append(Paragraph(_san(f"Équipement {eq}"), styles["Heading2"]))
-
-        rel = _get_rel(result)
-        decision = rel.get("decision", {}) or {}
-        if decision.get("reason"):
-            story.append(Paragraph(_compact(decision.get("reason"), 200), styles["BodyText"]))
-            story.append(Spacer(1, 5))
-
-        story.append(Paragraph("Tests de tendance", styles["Heading3"]))
-        story.append(_mk_table(_build_trend_table(result), total_width=usable_width, font_size=7))
-        story.append(Spacer(1, 5))
-
-        story.append(Paragraph("Tests de dépendance", styles["Heading3"]))
-        story.append(_mk_table(_build_dependence_table(result), total_width=usable_width, font_size=7))
-        story.append(Spacer(1, 5))
-
-        story.append(Paragraph("Choix du processus", styles["Heading3"]))
-        story.append(_mk_table(_build_model_table(result), total_width=usable_width, font_size=7))
-        story.append(Spacer(1, 5))
-
-        story.append(Paragraph("Qualité d’ajustement", styles["Heading3"]))
-        story.append(_mk_table(_build_fit_table(result), total_width=usable_width, font_size=7))
-        story.append(Spacer(1, 5))
-
-        story.append(Paragraph("Paramètres fiabilistes", styles["Heading3"]))
-        story.append(_mk_table(_build_parameter_table(result), total_width=usable_width, font_size=7))
-        story.append(Spacer(1, 5))
-
-        story.append(Paragraph("Paramètres thermiques", styles["Heading3"]))
-        story.append(_mk_table(_build_thermal_table(result), total_width=usable_width, font_size=7))
-        story.append(Spacer(1, 8))
-
-        if idx < len(analysis_results) - 1:
+    # ---- Pages par équipement
+    for i, eq in enumerate(eqs):
+        story.extend(_per_eq_section(eq, mdf, bundle))
+        if i < len(eqs) - 1:
             story.append(PageBreak())
 
     doc.build(story)
-    return str(out_path)
+    return str(fpath)
