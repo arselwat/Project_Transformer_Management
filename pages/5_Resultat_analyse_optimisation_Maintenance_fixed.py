@@ -20,15 +20,11 @@ from core.ui import render_shell, render_page_header
 try:
     from core.datahub import (
         get_current_failures_df,
-        get_failures_meta,
         get_current_project_data,
-        get_project_meta,
     )
 except Exception:
     get_current_failures_df = None
-    get_failures_meta = None
     get_current_project_data = None
-    get_project_meta = None
 
 try:
     from core.reliability.reporting_global import export_global_analysis_report_pdf
@@ -423,55 +419,205 @@ def process_score(process_name: str) -> int:
     return 1
 
 
-def compute_final_decision_row(row: pd.Series):
-    score = 0
+def build_priority_contributors(row: pd.Series | Dict[str, Any]) -> List[Dict[str, Any]]:
+    if isinstance(row, pd.Series):
+        row = row.to_dict()
+
+    contributors: List[Dict[str, Any]] = []
+
     process_name = str(row.get("model", "RP"))
-    thermal_status = str(row.get("thermal_status", "Non disponible"))
+    process_points = process_score(process_name)
+    contributors.append(
+        {
+            "Paramètre pris en compte": "Processus retenu",
+            "Valeur observée": process_name,
+            "Intervention dans la décision": (
+                "NHPP augmente davantage la priorité, BPP augmente modérément, RP reste la situation la plus stable."
+            ),
+            "Points": process_points,
+        }
+    )
+
     beta_value = safe_float(row.get("beta"), None)
-    days_left = safe_float(row.get("days_left"), None)
+    if beta_value is None:
+        beta_points = 0
+        beta_comment = "Le paramètre bêta n'était pas disponible, donc il n'a pas été utilisé directement pour le score."
+    elif beta_value > 1.2:
+        beta_points = 3
+        beta_comment = "Le paramètre bêta traduit une phase d'usure marquée, ce qui augmente fortement la priorité."
+    elif beta_value >= 1.0:
+        beta_points = 2
+        beta_comment = "Le paramètre bêta traduit un comportement déjà orienté vers l'usure ou le régime aléatoire avancé."
+    elif beta_value < 0.8:
+        beta_points = 1
+        beta_comment = "Le paramètre bêta suggère surtout des défauts précoces, ce qui pèse faiblement sur la priorité."
+    else:
+        beta_points = 0
+        beta_comment = "Le paramètre bêta n'a pas ajouté de point spécifique dans cette zone intermédiaire."
+    contributors.append(
+        {
+            "Paramètre pris en compte": "Paramètre bêta",
+            "Valeur observée": format_number(beta_value, 3),
+            "Intervention dans la décision": beta_comment,
+            "Points": beta_points,
+        }
+    )
 
-    score += process_score(process_name)
-
-    if beta_value is not None:
-        if beta_value > 1.2:
-            score += 3
-        elif beta_value >= 1.0:
-            score += 2
-        elif beta_value < 0.8:
-            score += 1
-
+    thermal_status = str(row.get("thermal_status", "Non disponible"))
     if thermal_status == "Critique":
-        score += 4
+        thermal_points = 4
+        thermal_comment = "Le statut thermique critique accélère fortement la maintenance."
     elif thermal_status == "Alerte":
-        score += 2
+        thermal_points = 2
+        thermal_comment = "Le statut thermique en alerte renforce la prudence et rapproche l'intervention."
+    else:
+        thermal_points = 0
+        thermal_comment = "Le statut thermique n'a pas majoré le score."
+    contributors.append(
+        {
+            "Paramètre pris en compte": "Statut thermique",
+            "Valeur observée": thermal_status,
+            "Intervention dans la décision": thermal_comment,
+            "Points": thermal_points,
+        }
+    )
 
-    if days_left is not None:
-        if days_left <= 7:
-            score += 3
-        elif days_left <= 30:
-            score += 2
-        elif days_left <= 90:
-            score += 1
+    days_left = safe_float(row.get("days_left"), None)
+    if days_left is None:
+        due_points = 0
+        due_comment = "Aucune échéance exploitable n'était disponible."
+    elif days_left <= 7:
+        due_points = 3
+        due_comment = "L'échéance est très proche, ce qui augmente fortement la priorité."
+    elif days_left <= 30:
+        due_points = 2
+        due_comment = "L'échéance est proche, ce qui augmente modérément la priorité."
+    elif days_left <= 90:
+        due_points = 1
+        due_comment = "L'échéance reste à surveiller, avec un impact faible sur le score."
+    else:
+        due_points = 0
+        due_comment = "L'échéance n'est pas suffisamment proche pour majorer le score."
+    contributors.append(
+        {
+            "Paramètre pris en compte": "Nombre de jours restants",
+            "Valeur observée": "Non disponible" if days_left is None else f"{int(days_left)} jours",
+            "Intervention dans la décision": due_comment,
+            "Points": due_points,
+        }
+    )
 
-    maintenance_type = str(row.get("maintenance_type", ""))
+    contributors.append(
+        {
+            "Paramètre pris en compte": "Température maximale du point chaud",
+            "Valeur observée": format_number(row.get("theta_hs_max"), 2),
+            "Intervention dans la décision": "Cet indicateur thermique aide à qualifier le statut thermique global.",
+            "Points": 0,
+        }
+    )
+    contributors.append(
+        {
+            "Paramètre pris en compte": "Facteur maximal d'accélération du vieillissement",
+            "Valeur observée": format_number(row.get("faa_max"), 3),
+            "Intervention dans la décision": "Il augmente la sévérité thermique lorsque la chaleur accélère le vieillissement.",
+            "Points": 0,
+        }
+    )
+    contributors.append(
+        {
+            "Paramètre pris en compte": "Perte de vie estimée",
+            "Valeur observée": format_number(row.get("loss_of_life_pct"), 3) + " %",
+            "Intervention dans la décision": "Elle participe à la qualification thermique globale et à la prudence de maintenance.",
+            "Points": 0,
+        }
+    )
+    contributors.append(
+        {
+            "Paramètre pris en compte": "Temps moyen entre défaillances",
+            "Valeur observée": format_number(row.get("mtbf_h"), 1) + " h",
+            "Intervention dans la décision": "Il renseigne sur l'espacement moyen des pannes et aide à interpréter le niveau de risque.",
+            "Points": 0,
+        }
+    )
+    contributors.append(
+        {
+            "Paramètre pris en compte": "Temps moyen de réparation",
+            "Valeur observée": format_number(row.get("mttr_h"), 1) + " h",
+            "Intervention dans la décision": "Il renseigne sur la rapidité de remise en service et éclaire la disponibilité.",
+            "Points": 0,
+        }
+    )
+    contributors.append(
+        {
+            "Paramètre pris en compte": "Intervalle recommandé",
+            "Valeur observée": format_number(row.get("T_recommended_h"), 1) + " h",
+            "Intervention dans la décision": "Il n'ajoute pas de point directement, mais structure la date d'intervention proposée.",
+            "Points": 0,
+        }
+    )
+    contributors.append(
+        {
+            "Paramètre pris en compte": "Type de maintenance recommandé",
+            "Valeur observée": str(row.get("maintenance_type", "—")),
+            "Intervention dans la décision": "C'est la traduction opérationnelle finale des résultats de fiabilité, de thermique et d'optimisation.",
+            "Points": 0,
+        }
+    )
+
+    return contributors
+
+
+def compute_final_decision_row(row: pd.Series):
+    contributors = build_priority_contributors(row)
+    score = int(sum(int(item.get("Points", 0) or 0) for item in contributors))
+
+    process_name = str(row.get("model", "RP"))
+    maintenance_type = str(row.get("maintenance_type", "maintenance ciblée"))
+    thermal_status = str(row.get("thermal_status", "Non disponible"))
 
     if score >= 10:
         decision = "Intervention prioritaire"
-        reason = (
-            f"Le processus {process_name}, l’état thermique ou l’échéance imposent une action rapide. "
-            f"Type d’action retenu : {maintenance_type or 'maintenance ciblée'}."
+        base_reason = (
+            f"Le niveau de risque global est élevé. Le processus {process_name}, le niveau thermique "
+            f"et l'échéance imposent une action rapide. Type d'action retenu : {maintenance_type}."
         )
     elif score >= 7:
         decision = "Préventif renforcé"
-        reason = "Le risque reste important. Une surveillance renforcée et une intervention planifiée rapide sont recommandées."
+        base_reason = (
+            f"Le risque reste important. Une surveillance renforcée et une planification rapide d'une maintenance "
+            f"de type {maintenance_type} sont recommandées."
+        )
     elif score >= 4:
         decision = "Surveillance active"
-        reason = "La situation reste intermédiaire. Il faut suivre le plan calculé et surveiller les dérives."
+        base_reason = (
+            f"La situation est intermédiaire. Il faut suivre de près l'équipement, conserver le plan calculé "
+            f"et appliquer le type {maintenance_type} au bon moment."
+        )
     else:
         decision = "Suivi nominal"
-        reason = "Aucun signal critique immédiat n’est dominant. Le plan standard peut être appliqué."
+        base_reason = (
+            f"Aucun signal critique immédiat ne domine. Le plan standard peut être appliqué avec le type "
+            f"de maintenance {maintenance_type}."
+        )
 
-    return decision, reason, int(score)
+    strong_drivers = [
+        item["Paramètre pris en compte"]
+        for item in contributors
+        if int(item.get("Points", 0) or 0) >= 2
+    ]
+    if strong_drivers:
+        reason = base_reason + " Paramètres les plus influents : " + ", ".join(strong_drivers) + "."
+    else:
+        reason = base_reason
+
+    if thermal_status == "Critique":
+        reason += " La thermique a clairement aggravé la décision finale."
+    elif thermal_status == "Alerte":
+        reason += " La thermique a contribué à renforcer la prudence."
+    elif thermal_status == "Normal":
+        reason += " La thermique n'a pas majoré le score."
+
+    return decision, reason, score
 
 
 DISPLAY_COLUMN_NAMES = {
@@ -483,6 +629,11 @@ DISPLAY_COLUMN_NAMES = {
     "model": "Processus retenu",
     "process_variant": "Variant du processus",
     "distribution": "Loi de probabilité retenue",
+    "aic": "Critère d'information d'Akaike",
+    "ks_p": "Valeur p du test de Kolmogorov-Smirnov",
+    "chi2_p": "Valeur p du test du chi carré",
+    "cvm_p": "Valeur p du test de Cramér-von Mises",
+    "goodness_accepted": "Ajustement accepté",
     "beta": "Paramètre bêta",
     "eta_h": "Paramètre êta (heures)",
     "gamma_h": "Paramètre gamma (heures)",
@@ -505,6 +656,10 @@ DISPLAY_COLUMN_NAMES = {
     "motif_decision": "Motif de la décision",
     "priority_score": "Score de priorité",
     "priorite": "Niveau de priorité",
+    "Paramètre pris en compte": "Paramètre pris en compte",
+    "Valeur observée": "Valeur observée",
+    "Intervention dans la décision": "Intervention dans la décision",
+    "Points": "Points",
 }
 
 
@@ -530,13 +685,13 @@ def build_trend_trace_table(result: Dict[str, Any], alpha_value: float) -> pd.Da
         {
             "Élément observé": "Test de Mann-Kendall",
             "Valeur": f"statistique = {format_number(mann_kendall_result.get('z'), 3)}, p-valeur = {format_number(mann_kendall_result.get('p'), 4)}",
-            "Comment lire cette valeur": f"Si la p-valeur est inférieure à {alpha_value:.3f}, on considère qu’une tendance est significative.",
+            "Comment lire cette valeur": f"Si la p-valeur est inférieure à {alpha_value:.3f}, la tendance est considérée significative.",
             "Conclusion": "Tendance détectée" if mann_kendall_result.get("has_trend") else "Pas de tendance significative",
         },
         {
             "Élément observé": "Test de Laplace",
             "Valeur": f"statistique = {format_number(laplace_result.get('u'), 3)}, p-valeur = {format_number(laplace_result.get('p'), 4)}",
-            "Comment lire cette valeur": f"Si la p-valeur est inférieure à {alpha_value:.3f}, on considère qu’une tendance est significative.",
+            "Comment lire cette valeur": f"Si la p-valeur est inférieure à {alpha_value:.3f}, la tendance est considérée significative.",
             "Conclusion": "Tendance détectée" if laplace_result.get("has_trend") else "Pas de tendance significative",
         },
         {
@@ -574,7 +729,7 @@ def build_dependence_trace_table(result: Dict[str, Any], alpha_value: float) -> 
         {
             "Élément observé": "Décision finale sur la dépendance",
             "Valeur": f"force estimée = {dependence_result.get('strength', 'non précisée')}",
-            "Comment lire cette valeur": "Cette information sert à savoir si les défaillances successives se ressemblent ou s’influencent.",
+            "Comment lire cette valeur": "Cette information aide à savoir si les défaillances successives s’influencent.",
             "Conclusion": "Dépendance retenue" if dependence_result.get("has_dep") else "Indépendance privilégiée",
         },
     ]
@@ -584,7 +739,6 @@ def build_dependence_trace_table(result: Dict[str, Any], alpha_value: float) -> 
 def build_model_trace_table(result: Dict[str, Any]) -> pd.DataFrame:
     reliability_result = result.get("reliability", {}) or {}
     decision = reliability_result.get("decision", {}) or {}
-    goodness = reliability_result.get("goodness", {}) or {}
 
     rows = [
         {
@@ -605,11 +759,45 @@ def build_model_trace_table(result: Dict[str, Any]) -> pd.DataFrame:
             "Comment lire cette valeur": "La loi retenue décrit mathématiquement la durée entre deux défaillances.",
             "Conclusion": "Loi acceptée" if decision.get("law_accepted") is True else "Loi non validée strictement" if decision.get("law_accepted") is False else "Validation non disponible",
         },
+    ]
+    return pd.DataFrame(rows)
+
+
+def build_goodness_of_fit_trace_table(result: Dict[str, Any]) -> pd.DataFrame:
+    reliability_result = result.get("reliability", {}) or {}
+    goodness = reliability_result.get("goodness", {}) or {}
+    decision = reliability_result.get("decision", {}) or {}
+
+    rows = [
         {
-            "Élément observé": "Critère d’ajustement",
-            "Valeur": f"AIC = {format_number(goodness.get('aic'), 3)}, KS = {format_number(goodness.get('ks_p'), 4)}, Chi carré = {format_number(goodness.get('chi2_p'), 4)}, Cramér-von Mises = {format_number(goodness.get('cvm_p'), 4)}",
-            "Comment lire cette valeur": "Un AIC plus faible est meilleur. Les p-valeurs élevées traduisent un ajustement plus acceptable.",
-            "Conclusion": "Synthèse de qualité du modèle",
+            "Élément observé": "Critère d'information d'Akaike",
+            "Valeur": format_number(goodness.get("aic"), 3),
+            "Comment lire cette valeur": "Plus cette valeur est faible, meilleur est le compromis entre qualité d'ajustement et complexité.",
+            "Conclusion": "Utilisé dans le choix de la loi retenue",
+        },
+        {
+            "Élément observé": "Test de Kolmogorov-Smirnov",
+            "Valeur": format_number(goodness.get("ks_p"), 4),
+            "Comment lire cette valeur": "Une valeur p élevée traduit un ajustement plus acceptable.",
+            "Conclusion": "Compatible avec l'ajustement" if safe_float(goodness.get("ks_p"), 0.0) >= 0.05 else "Ajustement à surveiller",
+        },
+        {
+            "Élément observé": "Test du chi carré",
+            "Valeur": format_number(goodness.get("chi2_p"), 4),
+            "Comment lire cette valeur": "Une valeur p élevée traduit un ajustement plus acceptable.",
+            "Conclusion": "Compatible avec l'ajustement" if safe_float(goodness.get("chi2_p"), 0.0) >= 0.05 else "Ajustement à surveiller",
+        },
+        {
+            "Élément observé": "Test de Cramér-von Mises",
+            "Valeur": format_number(goodness.get("cvm_p"), 4),
+            "Comment lire cette valeur": "Une valeur p élevée traduit un ajustement plus acceptable.",
+            "Conclusion": "Compatible avec l'ajustement" if safe_float(goodness.get("cvm_p"), 0.0) >= 0.05 else "Ajustement à surveiller",
+        },
+        {
+            "Élément observé": "Décision globale sur l'ajustement",
+            "Valeur": str(goodness.get("accepted", "Non disponible")),
+            "Comment lire cette valeur": "Cette décision résume si l'ajustement retenu est jugé acceptable par le pipeline.",
+            "Conclusion": decision.get("law_selected", "—"),
         },
     ]
     return pd.DataFrame(rows)
@@ -729,44 +917,21 @@ def build_optimization_trace_table(row: Dict[str, Any]) -> pd.DataFrame:
 
 
 def build_decision_trace_table(row: Dict[str, Any]) -> pd.DataFrame:
-    rows = [
-        {
-            "Critère": "Tendance détectée",
-            "Valeur": row.get("trend_detected", "—"),
-            "Impact sur la décision": "Une tendance pousse vers une vigilance accrue.",
-        },
-        {
-            "Critère": "Dépendance détectée",
-            "Valeur": row.get("dependence_detected", "—"),
-            "Impact sur la décision": "Une dépendance peut justifier un modèle plus complexe et une surveillance renforcée.",
-        },
-        {
-            "Critère": "Processus retenu",
-            "Valeur": row.get("model", "—"),
-            "Impact sur la décision": "Le processus retenu influence le niveau de priorité.",
-        },
-        {
-            "Critère": "Statut thermique",
-            "Valeur": row.get("thermal_status", "—"),
-            "Impact sur la décision": "Une alerte thermique accélère l’action à mener.",
-        },
-        {
-            "Critère": "Nombre de jours restants",
-            "Valeur": f"{row.get('days_left', '—')} jours",
-            "Impact sur la décision": "Plus l’échéance est proche, plus la priorité augmente.",
-        },
-        {
-            "Critère": "Score de priorité",
-            "Valeur": row.get("priority_score", "—"),
-            "Impact sur la décision": row.get("priorite", "—"),
-        },
-        {
-            "Critère": "Décision finale",
-            "Valeur": row.get("decision_finale", "—"),
-            "Impact sur la décision": row.get("motif_decision", "—"),
-        },
-    ]
-    return pd.DataFrame(rows)
+    contributors = build_priority_contributors(row)
+    decision_rows = pd.DataFrame(contributors)
+
+    score_row = pd.DataFrame(
+        [
+            {
+                "Paramètre pris en compte": "Score final de priorité",
+                "Valeur observée": row.get("priority_score", "—"),
+                "Intervention dans la décision": f"Niveau de priorité final : {row.get('priorite', '—')}. Décision retenue : {row.get('decision_finale', '—')}. Motif : {row.get('motif_decision', '—')}",
+                "Points": row.get("priority_score", "—"),
+            }
+        ]
+    )
+
+    return pd.concat([decision_rows, score_row], ignore_index=True)
 
 
 def build_excel_bytes(
@@ -800,9 +965,17 @@ def build_excel_bytes(
 # =========================================================
 control_col_1, control_col_2, control_col_3, control_col_4 = st.columns([1, 1, 1, 1])
 with control_col_1:
-    uploaded_failures_csv = st.file_uploader("Fichier CSV des temps entre défaillances (optionnel)", type=["csv"], key="global_uploaded_failures")
+    uploaded_failures_csv = st.file_uploader(
+        "Fichier CSV des temps entre défaillances (optionnel)",
+        type=["csv"],
+        key="global_uploaded_failures",
+    )
 with control_col_2:
-    uploaded_project_xlsx = st.file_uploader("Fichier Excel du projet thermique (optionnel)", type=["xlsx"], key="global_uploaded_project")
+    uploaded_project_xlsx = st.file_uploader(
+        "Fichier Excel du projet thermique (optionnel)",
+        type=["xlsx"],
+        key="global_uploaded_project",
+    )
 with control_col_3:
     alpha_value = st.slider("Seuil alpha", 0.01, 0.10, 0.05, 0.01)
 with control_col_4:
@@ -820,6 +993,8 @@ with st.expander("Comprendre clairement les variables affichées sur cette page"
 **Processus retenu** : décrit le comportement global du système de défaillance.
 
 **Loi de probabilité retenue** : loi mathématique choisie pour représenter les temps entre défaillances.
+
+**Critères d’ajustement** : ils servent à vérifier si la loi retenue représente correctement les données.
 
 **Paramètre bêta** : forme du vieillissement.  
 - inférieur à 1 : défauts précoces  
@@ -929,6 +1104,7 @@ with st.spinner("Analyse globale en cours..."):
         indicators = reliability_result.get("indicators", {}) or {}
         parameters = reliability_result.get("params", {}) or {}
         decision = reliability_result.get("decision", {}) or {}
+        goodness = reliability_result.get("goodness", {}) or {}
         thermal_result = result.get("thermal") or {}
         thermal_summary = (thermal_result.get("summary") or {}) if isinstance(thermal_result, dict) else {}
 
@@ -954,6 +1130,11 @@ with st.spinner("Analyse globale en cours..."):
                 "model": reliability_result.get("model"),
                 "process_variant": reliability_result.get("process_variant"),
                 "distribution": reliability_result.get("distribution"),
+                "aic": goodness.get("aic"),
+                "ks_p": goodness.get("ks_p"),
+                "chi2_p": goodness.get("chi2_p"),
+                "cvm_p": goodness.get("cvm_p"),
+                "goodness_accepted": goodness.get("accepted"),
                 "beta": parameters.get("beta", optimization_row.get("beta")),
                 "eta_h": parameters.get("eta", optimization_row.get("eta_h")),
                 "gamma_h": parameters.get("gamma", optimization_row.get("gamma_h")),
@@ -1000,6 +1181,21 @@ summary_dataframe = summary_dataframe.sort_values(
     ascending=[False, True],
 ).reset_index(drop=True)
 
+for equipment_code in results_by_equipment.keys():
+    row_df = summary_dataframe[summary_dataframe["equipment_code"].astype(str) == str(equipment_code)]
+    if row_df.empty:
+        continue
+    selected_row = row_df.iloc[0].to_dict()
+    selected_result = results_by_equipment[equipment_code]
+
+    detail_tables_by_equipment[equipment_code]["trace_trend"] = build_trend_trace_table(selected_result, alpha_value)
+    detail_tables_by_equipment[equipment_code]["trace_dependence"] = build_dependence_trace_table(selected_result, alpha_value)
+    detail_tables_by_equipment[equipment_code]["trace_model_choice"] = build_model_trace_table(selected_result)
+    detail_tables_by_equipment[equipment_code]["trace_goodness_of_fit"] = build_goodness_of_fit_trace_table(selected_result)
+    detail_tables_by_equipment[equipment_code]["trace_parameters"] = build_parameter_trace_table(selected_row)
+    detail_tables_by_equipment[equipment_code]["trace_optimization"] = build_optimization_trace_table(selected_row)
+    detail_tables_by_equipment[equipment_code]["trace_final_decision"] = build_decision_trace_table(selected_row)
+
 trend_overview_dataframe = summary_dataframe[
     [
         "equipment_code",
@@ -1010,6 +1206,18 @@ trend_overview_dataframe = summary_dataframe[
         "model",
         "process_variant",
         "distribution",
+    ]
+].copy()
+
+goodness_overview_dataframe = summary_dataframe[
+    [
+        "equipment_code",
+        "distribution",
+        "aic",
+        "ks_p",
+        "chi2_p",
+        "cvm_p",
+        "goodness_accepted",
     ]
 ].copy()
 
@@ -1063,6 +1271,7 @@ due_tasks_dataframe = maintenance_due_dataframe.copy() if not maintenance_due_da
 global_tables = {
     "Synthese_globale": summary_dataframe,
     "Vue_tendance": trend_overview_dataframe,
+    "Vue_ajustement": goodness_overview_dataframe,
     "Vue_risque": risk_overview_dataframe,
     "Vue_optimisation": optimization_overview_dataframe,
     "Taches_dues": due_tasks_dataframe,
@@ -1095,6 +1304,9 @@ with page_tab_1:
     st.subheader("Synthèse globale")
     st.dataframe(rename_columns_for_display(summary_dataframe), use_container_width=True, hide_index=True)
 
+    st.markdown("### Tableau séparé — Tests d’ajustement")
+    st.dataframe(rename_columns_for_display(goodness_overview_dataframe), use_container_width=True, hide_index=True)
+
     chart_col_1, chart_col_2 = st.columns(2)
     with chart_col_1:
         figure_process, axis_process = plt.subplots(figsize=(8, 4))
@@ -1126,22 +1338,53 @@ with page_tab_2:
     selected_row = summary_dataframe[summary_dataframe["equipment_code"] == selected_equipment_code].iloc[0].to_dict()
 
     st.markdown("### Tableau 1 — Validation des tests de tendance")
-    st.dataframe(build_trend_trace_table(selected_result, alpha_value), use_container_width=True, hide_index=True)
+    st.dataframe(
+        rename_columns_for_display(build_trend_trace_table(selected_result, alpha_value)),
+        use_container_width=True,
+        hide_index=True,
+    )
 
     st.markdown("### Tableau 2 — Validation des tests de dépendance")
-    st.dataframe(build_dependence_trace_table(selected_result, alpha_value), use_container_width=True, hide_index=True)
+    st.dataframe(
+        rename_columns_for_display(build_dependence_trace_table(selected_result, alpha_value)),
+        use_container_width=True,
+        hide_index=True,
+    )
 
     st.markdown("### Tableau 3 — Choix du processus et du modèle")
-    st.dataframe(build_model_trace_table(selected_result), use_container_width=True, hide_index=True)
+    st.dataframe(
+        rename_columns_for_display(build_model_trace_table(selected_result)),
+        use_container_width=True,
+        hide_index=True,
+    )
 
-    st.markdown("### Tableau 4 — Paramètres fiabilistes et thermiques")
-    st.dataframe(build_parameter_trace_table(selected_row), use_container_width=True, hide_index=True)
+    st.markdown("### Tableau 4 — Tests d’ajustement")
+    st.dataframe(
+        rename_columns_for_display(build_goodness_of_fit_trace_table(selected_result)),
+        use_container_width=True,
+        hide_index=True,
+    )
 
-    st.markdown("### Tableau 5 — Optimisation et maintenance retenue")
-    st.dataframe(build_optimization_trace_table(selected_row), use_container_width=True, hide_index=True)
+    st.markdown("### Tableau 5 — Paramètres fiabilistes et thermiques")
+    st.dataframe(
+        rename_columns_for_display(build_parameter_trace_table(selected_row)),
+        use_container_width=True,
+        hide_index=True,
+    )
 
-    st.markdown("### Tableau 6 — Traçabilité de la décision finale")
-    st.dataframe(build_decision_trace_table(selected_row), use_container_width=True, hide_index=True)
+    st.markdown("### Tableau 6 — Optimisation et maintenance retenue")
+    st.dataframe(
+        rename_columns_for_display(build_optimization_trace_table(selected_row)),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.markdown("### Tableau 7 — Traçabilité détaillée de la décision finale")
+    st.dataframe(
+        rename_columns_for_display(build_decision_trace_table(selected_row)),
+        use_container_width=True,
+        hide_index=True,
+    )
 
     st.success(f"Décision finale — {selected_row.get('decision_finale', '—')}")
     st.info(selected_row.get("motif_decision", "Aucun motif disponible."))

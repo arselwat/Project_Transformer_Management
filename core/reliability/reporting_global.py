@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from datetime import datetime
-from typing import Any, Dict, Optional, Iterable
+from typing import Any, Dict, Optional
 
 import pandas as pd
 
@@ -108,7 +108,36 @@ def _df_to_table_data(df: pd.DataFrame, max_rows: Optional[int] = None) -> list[
     return data
 
 
-def _mk_table(data: list[list[str]], col_widths=None, font_size: int = 7) -> Table:
+def _auto_col_widths(data: list[list[str]], total_width: float = 180 * mm) -> list[float]:
+    if not data:
+        return []
+
+    ncols = max(len(row) for row in data)
+    lengths = [8] * ncols
+
+    for row in data[:40]:
+        for idx in range(ncols):
+            cell = row[idx] if idx < len(row) else ""
+            lengths[idx] = max(lengths[idx], min(len(str(cell)), 80))
+
+    weights = [max(length, 8) for length in lengths]
+    weight_sum = sum(weights) if sum(weights) > 0 else ncols
+
+    widths = [(weight / weight_sum) * total_width for weight in weights]
+
+    min_width = 18 * mm
+    max_width = 58 * mm
+    widths = [min(max(width, min_width), max_width) for width in widths]
+
+    current_sum = sum(widths)
+    if current_sum > total_width:
+        ratio = total_width / current_sum
+        widths = [width * ratio for width in widths]
+
+    return widths
+
+
+def _mk_table(data: list[list[str]], font_size: int = 7) -> Table:
     styles = getSampleStyleSheet()
 
     body_style = ParagraphStyle(
@@ -135,11 +164,13 @@ def _mk_table(data: list[list[str]], col_widths=None, font_size: int = 7) -> Tab
             [Paragraph(_san(cell).replace("\n", "<br/>"), style) for cell in row]
         )
 
+    col_widths = _auto_col_widths(data)
+
     table = Table(wrapped_rows, repeatRows=1, colWidths=col_widths)
     table.setStyle(
         TableStyle(
             [
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4F6DB8")),
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#355CBB")),
                 ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
                 ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#D1D5DB")),
                 ("VALIGN", (0, 0), (-1, -1), "TOP"),
@@ -154,49 +185,34 @@ def _mk_table(data: list[list[str]], col_widths=None, font_size: int = 7) -> Tab
     return table
 
 
-def _bool_label(value: Any) -> str:
-    if value is True:
-        return "Oui"
-    if value is False:
-        return "Non"
-    return _san(value) if value not in (None, "") else "Non disponible"
-
-
-def _first_row(df: pd.DataFrame) -> Dict[str, Any]:
-    if isinstance(df, pd.DataFrame) and not df.empty:
-        return df.iloc[0].to_dict()
-    return {}
-
-
 def _build_executive_summary(summary_df: pd.DataFrame) -> list[str]:
     lines: list[str] = []
     if summary_df is None or summary_df.empty:
         return ["Aucune donnée globale n'est disponible pour le rapport."]
 
-    equipment_count = len(summary_df)
-    critical_count = 0
+    lines.append(f"- Équipements analysés : {len(summary_df)}")
+
     if "priorite" in summary_df.columns:
-        critical_count = int((summary_df["priorite"].astype(str) == "Critique").sum())
+        lines.append(
+            f"- Équipements en priorité critique : {int((summary_df['priorite'].astype(str) == 'Critique').sum())}"
+        )
 
-    nhpp_count = 0
     if "model" in summary_df.columns:
-        nhpp_count = int((summary_df["model"].astype(str).str.upper() == "NHPP").sum())
+        lines.append(
+            f"- Équipements classés NHPP : {int((summary_df['model'].astype(str).str.upper() == 'NHPP').sum())}"
+        )
 
-    thermal_critical = 0
-    thermal_alert = 0
     if "thermal_status" in summary_df.columns:
-        thermal_critical = int((summary_df["thermal_status"].astype(str) == "Critique").sum())
-        thermal_alert = int((summary_df["thermal_status"].astype(str) == "Alerte").sum())
-
-    lines.append(f"- Équipements analysés : {equipment_count}")
-    lines.append(f"- Équipements en priorité critique : {critical_count}")
-    lines.append(f"- Équipements classés NHPP : {nhpp_count}")
-    lines.append(f"- Cas thermiques critiques : {thermal_critical}")
-    lines.append(f"- Cas thermiques en alerte : {thermal_alert}")
+        lines.append(
+            f"- Cas thermiques critiques : {int((summary_df['thermal_status'].astype(str) == 'Critique').sum())}"
+        )
+        lines.append(
+            f"- Cas thermiques en alerte : {int((summary_df['thermal_status'].astype(str) == 'Alerte').sum())}"
+        )
 
     if "decision_finale" in summary_df.columns:
-        top_decisions = summary_df["decision_finale"].astype(str).value_counts().head(3)
-        for label, count in top_decisions.items():
+        decisions = summary_df["decision_finale"].astype(str).value_counts().head(3)
+        for label, count in decisions.items():
             lines.append(f"- Décision fréquente : {label} ({int(count)})")
 
     return lines
@@ -205,12 +221,12 @@ def _build_executive_summary(summary_df: pd.DataFrame) -> list[str]:
 def _thermal_influence_rules() -> list[str]:
     return [
         "- Statut thermique Critique : la maintenance doit être accélérée, même si la partie fiabiliste seule semblait acceptable.",
-        "- Statut thermique Alerte : la maintenance recommandée reste souvent préventive renforcée ou avec surveillance active.",
-        "- Statut thermique Normal : la décision repose surtout sur la fiabilité, le coût et l'échéance.",
-        "- Température du point chaud élevée : elle traduit un échauffement sévère pouvant justifier un contrôle prioritaire.",
-        "- Facteur d'accélération du vieillissement élevé : il montre que l'isolation vieillit plus vite et pousse vers une intervention plus précoce.",
-        "- Perte de vie élevée : elle signale qu'une part significative de la durée de vie a déjà été consommée.",
-        "- En pratique, la thermique ne remplace pas la fiabilité : elle agit comme facteur aggravant ou modérateur sur le choix du type de maintenance.",
+        "- Statut thermique Alerte : la maintenance recommandée devient plus prudente et peut être avancée.",
+        "- Statut thermique Normal : la décision dépend surtout de la fiabilité, du coût et de l'échéance.",
+        "- Température du point chaud élevée : elle signale un échauffement sévère pouvant justifier un contrôle prioritaire.",
+        "- Facteur d'accélération du vieillissement élevé : il montre que l'isolation se dégrade plus vite.",
+        "- Perte de vie élevée : elle signale qu'une part importante de la durée de vie est déjà consommée.",
+        "- En pratique, la thermique ne remplace pas la fiabilité : elle agit comme facteur aggravant ou modérateur.",
     ]
 
 
@@ -223,90 +239,30 @@ def _thermal_influence_for_row(row: Dict[str, Any]) -> str:
 
     if thermal_status == "Critique":
         return _san(
-            f"Le statut thermique est Critique. La température de point chaud, le facteur d'accélération du vieillissement "
-            f"ou la perte de vie sont jugés sévères (thetaHS max={hotspot}, FAA max={faa}, perte de vie={lol} %). "
-            f"Cela pousse la décision vers une action plus rapide et renforce le besoin d'une maintenance de type {maintenance_type}."
+            f"Le statut thermique est Critique. La température du point chaud, le facteur d'accélération du vieillissement "
+            f"ou la perte de vie sont sévères (thetaHS max={hotspot}, FAA max={faa}, perte de vie={lol} %). "
+            f"Cela accélère la décision et renforce le besoin d'une maintenance de type {maintenance_type}."
         )
 
     if thermal_status == "Alerte":
         return _san(
             f"Le statut thermique est Alerte (thetaHS max={hotspot}, FAA max={faa}, perte de vie={lol} %). "
-            f"La thermique ne rend pas toujours l'intervention immédiate, mais elle renforce la prudence et justifie souvent "
-            f"une maintenance plus précoce ou un renforcement de la surveillance autour du type {maintenance_type}."
+            f"La thermique renforce la prudence et rapproche souvent l'intervention ou la surveillance autour du type {maintenance_type}."
         )
 
     if thermal_status == "Normal":
         return _san(
-            f"Le statut thermique est Normal. Les indicateurs thermiques restent compatibles avec le fonctionnement courant "
-            f"(thetaHS max={hotspot}, FAA max={faa}, perte de vie={lol} %). Dans ce cas, le choix de maintenance dépend surtout "
-            f"de la fiabilité, de l'optimisation économique et de l'échéance calculée. Le type retenu reste {maintenance_type}."
+            f"Le statut thermique est Normal (thetaHS max={hotspot}, FAA max={faa}, perte de vie={lol} %). "
+            f"Le choix de maintenance dépend alors surtout de la fiabilité, de l'optimisation économique et de l'échéance. "
+            f"Le type retenu reste {maintenance_type}."
         )
 
     return _san(
-        f"La thermique n'est pas disponible ou n'est pas exploitable pour cet équipement. Le type de maintenance retenu "
-        f"({maintenance_type}) provient alors principalement de la fiabilité, du coût et de l'échéance."
+        f"La thermique n'est pas disponible ou exploitable. Le type de maintenance retenu ({maintenance_type}) provient alors "
+        f"principalement de la fiabilité, du coût et de l'échéance."
     )
 
 
-def _build_equipment_story_blocks(
-    eq: str,
-    summary_row: Dict[str, Any],
-    tables: Dict[str, pd.DataFrame],
-    styles,
-) -> list:
-    story = []
-
-    story.append(Paragraph(_san(f"Équipement {eq}"), styles["Heading2"]))
-
-    story.append(
-        Paragraph(
-            _san(
-                f"Décision finale : {summary_row.get('decision_finale', '—')} | "
-                f"Priorité : {summary_row.get('priorite', '—')} | "
-                f"Type de maintenance : {summary_row.get('maintenance_type', '—')}"
-            ),
-            styles["BodyText"],
-        )
-    )
-    story.append(
-        Paragraph(
-            _san(f"Motif : {summary_row.get('motif_decision', 'Aucun motif disponible.')}"),
-            styles["BodyText"],
-        )
-    )
-    story.append(
-        Paragraph(
-            _san(_thermal_influence_for_row(summary_row)),
-            styles["BodyText"],
-        )
-    )
-    story.append(Spacer(1, 6))
-
-    ordered_tables = [
-        ("trend_results", "Tests de tendance"),
-        ("dependence_results", "Tests de dépendance"),
-        ("process_choice", "Choix du processus"),
-        ("fit_candidates", "Modèles candidats"),
-        ("reliability_summary", "Synthèse fiabiliste"),
-        ("thermal_summary", "Synthèse thermique"),
-        ("thermal_table_indicators", "Indicateurs thermiques"),
-        ("thermal_top5_days", "Jours thermiquement critiques"),
-    ]
-
-    for key, label in ordered_tables:
-        df = tables.get(key)
-        if isinstance(df, pd.DataFrame) and not df.empty:
-            story.append(Paragraph(_san(label), styles["Heading3"]))
-            max_rows = 20 if key not in ("fit_candidates", "thermal_top5_days") else 10
-            story.append(_mk_table(_df_to_table_data(df, max_rows=max_rows), font_size=7))
-            story.append(Spacer(1, 6))
-
-    return story
-
-
-# ---------------------------------------------------------------------
-# Fallback FPDF
-# ---------------------------------------------------------------------
 def _fallback_fpdf(
     summary_df: pd.DataFrame,
     global_tables: Dict[str, pd.DataFrame],
@@ -386,57 +342,41 @@ def _fallback_fpdf(
         )
     pdf.ln(2)
 
-    if detail_tables_by_eq:
+    for eq, tables in detail_tables_by_eq.items():
+        matching = summary_df[summary_df["equipment_code"].astype(str) == str(eq)]
+        row = matching.iloc[0].to_dict() if not matching.empty else {}
+
         pdf.add_page()
         pdf.set_font("Arial", "B", 11)
-        pdf.cell(0, 6, "Détail par équipement", ln=1)
+        pdf.multi_cell(0, 6, _san(f"Équipement {eq}"))
         pdf.set_font("Arial", "", 9)
+        pdf.multi_cell(
+            0,
+            5,
+            _san(
+                f"Décision={row.get('decision_finale', '—')} | Priorité={row.get('priorite', '—')} | "
+                f"Maintenance={row.get('maintenance_type', '—')}"
+            ),
+        )
+        pdf.multi_cell(0, 5, _san(_thermal_influence_for_row(row)))
 
-        for eq, tables in detail_tables_by_eq.items():
-            matching = summary_df[summary_df["equipment_code"].astype(str) == str(eq)]
-            row = matching.iloc[0].to_dict() if not matching.empty else {}
-
-            pdf.set_font("Arial", "B", 10)
-            pdf.multi_cell(0, 6, _san(f"[{eq}]"))
-            pdf.set_font("Arial", "", 9)
-            pdf.multi_cell(
-                0,
-                5,
-                _san(
-                    f"Décision={row.get('decision_finale', '—')} | "
-                    f"Priorité={row.get('priorite', '—')} | "
-                    f"Maintenance={row.get('maintenance_type', '—')}"
-                ),
-            )
-            pdf.multi_cell(0, 5, _san(_thermal_influence_for_row(row)))
-
-            reliability_summary = tables.get("reliability_summary")
-            if isinstance(reliability_summary, pd.DataFrame) and not reliability_summary.empty:
-                info = reliability_summary.iloc[0].to_dict()
-                pdf.multi_cell(
-                    0,
-                    5,
-                    _san(
-                        f"Fiabilité: processus={info.get('Processus', '')} | distribution={info.get('Distribution', '')} | "
-                        f"MTBF={_fmt(info.get('MTBF (h)'), 1)} h | MTTR={_fmt(info.get('MTTR (h)'), 1)} h | "
-                        f"disponibilité={_fmt(info.get('Disponibilité'), 3)}"
-                    ),
-                )
-
-            thermal_summary = tables.get("thermal_summary")
-            if isinstance(thermal_summary, pd.DataFrame) and not thermal_summary.empty:
-                info = thermal_summary.iloc[0].to_dict()
-                pdf.multi_cell(
-                    0,
-                    5,
-                    _san(
-                        f"Thermique: thetaHS max={_fmt(info.get('θHS max') or info.get('theta_hs_max'), 1)} | "
-                        f"FAA max={_fmt(info.get('FAA max') or info.get('faa_max'), 3)} | "
-                        f"perte de vie={_fmt(info.get('Loss of life (%)') or info.get('loss_of_life_pct'), 3)} %"
-                    ),
-                )
-
-            pdf.ln(1)
+        for key in [
+            "trace_trend",
+            "trace_dependence",
+            "trace_model_choice",
+            "trace_goodness_of_fit",
+            "trace_parameters",
+            "trace_optimization",
+            "trace_final_decision",
+        ]:
+            df = tables.get(key)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                pdf.ln(1)
+                pdf.set_font("Arial", "B", 10)
+                pdf.multi_cell(0, 5, _san(key))
+                pdf.set_font("Arial", "", 9)
+                for _, r in df.head(25).iterrows():
+                    pdf.multi_cell(0, 5, _san(" | ".join([f"{c}={r[c]}" for c in df.columns])))
 
     pdf.output(str(out_path))
     return str(out_path)
@@ -487,7 +427,7 @@ def export_global_analysis_report_pdf(
     )
 
     # -----------------------------------------------------------------
-    # Cover / title
+    # Titre
     # -----------------------------------------------------------------
     story.append(Paragraph(_san(title), styles["Title"]))
     story.append(Paragraph(_san(datetime.now().strftime("%d/%m/%Y %H:%M")), styles["Normal"]))
@@ -500,7 +440,7 @@ def export_global_analysis_report_pdf(
         story.append(Spacer(1, 8))
 
     # -----------------------------------------------------------------
-    # Executive summary
+    # Résumé exécutif
     # -----------------------------------------------------------------
     story.append(Paragraph("Résumé exécutif", styles["Heading2"]))
     for line in _build_executive_summary(summary_df):
@@ -508,15 +448,15 @@ def export_global_analysis_report_pdf(
     story.append(Spacer(1, 8))
 
     # -----------------------------------------------------------------
-    # Explain thermal influence
+    # Influence thermique
     # -----------------------------------------------------------------
     story.append(Paragraph("Influence de la partie thermique sur le choix du type de maintenance", styles["Heading2"]))
     story.append(
         Paragraph(
             _san(
-                "La partie thermique n'agit pas seule, mais elle modifie la priorité et peut faire évoluer "
-                "le type de maintenance recommandé. Lorsqu'un équipement présente un stress thermique marqué, "
-                "la décision finale devient plus prudente même si les indicateurs fiabilistes restent acceptables."
+                "La partie thermique n'agit pas seule, mais elle modifie la priorité et peut faire évoluer le type de maintenance recommandé. "
+                "Lorsqu'un équipement présente un stress thermique marqué, la décision finale devient plus prudente même si les indicateurs fiabilistes "
+                "restent acceptables."
             ),
             styles["SmallBody"],
         )
@@ -526,12 +466,13 @@ def export_global_analysis_report_pdf(
     story.append(Spacer(1, 8))
 
     # -----------------------------------------------------------------
-    # Global tables
+    # Tableaux globaux
     # -----------------------------------------------------------------
     ordered_global = [
         (("Decision_finale", "final_decision"), "Décision finale hiérarchisée"),
         (("Synthese_globale", "global_summary"), "Synthèse globale"),
         (("Vue_tendance", "trend_overview"), "Vue d'ensemble des tendances et dépendances"),
+        (("Vue_ajustement", "goodness_overview"), "Vue d'ensemble des tests d'ajustement"),
         (("Vue_risque", "risk_overview"), "Vue d'ensemble fiabilité et thermique"),
         (("Vue_optimisation", "optimization_overview"), "Vue d'ensemble optimisation et maintenance"),
         (("Taches_dues", "due_tasks"), "Tâches dues"),
@@ -541,22 +482,74 @@ def export_global_analysis_report_pdf(
         df = _get_table(global_tables, *candidate_names)
         if not df.empty:
             story.append(Paragraph(_san(label), styles["Heading2"]))
-            story.append(_mk_table(_df_to_table_data(df, max_rows=40), font_size=7))
+            font_size = 6 if len(df.columns) >= 10 else 7
+            max_rows = 40 if label != "Tâches dues" else 25
+            story.append(_mk_table(_df_to_table_data(df, max_rows=max_rows), font_size=font_size))
             story.append(Spacer(1, 8))
 
     story.append(PageBreak())
 
     # -----------------------------------------------------------------
-    # Detailed equipment sections
+    # Détail par équipement
     # -----------------------------------------------------------------
     story.append(Paragraph("Détail par équipement", styles["Heading1"]))
     story.append(Spacer(1, 6))
 
-    for eq, tables in detail_tables_by_eq.items():
+    ordered_trace_tables = [
+        ("trace_trend", "Validation des tests de tendance"),
+        ("trace_dependence", "Validation des tests de dépendance"),
+        ("trace_model_choice", "Choix du processus et du modèle"),
+        ("trace_goodness_of_fit", "Tests d'ajustement"),
+        ("trace_parameters", "Paramètres fiabilistes et thermiques"),
+        ("trace_optimization", "Optimisation et maintenance retenue"),
+        ("trace_final_decision", "Traçabilité détaillée de la décision finale"),
+        ("trend_results", "Tableau technique des tests de tendance"),
+        ("dependence_results", "Tableau technique des tests de dépendance"),
+        ("process_choice", "Tableau technique du choix du processus"),
+        ("fit_candidates", "Tableau technique des lois candidates"),
+        ("reliability_summary", "Synthèse fiabiliste"),
+        ("thermal_summary", "Synthèse thermique"),
+        ("thermal_table_indicators", "Indicateurs thermiques"),
+        ("thermal_top5_days", "Jours thermiquement critiques"),
+    ]
+
+    equipment_codes = list(detail_tables_by_eq.keys())
+    for index, eq in enumerate(equipment_codes):
+        tables = detail_tables_by_eq[eq]
         matching = summary_df[summary_df["equipment_code"].astype(str) == str(eq)]
         summary_row = matching.iloc[0].to_dict() if not matching.empty else {}
-        story.extend(_build_equipment_story_blocks(eq, summary_row, tables, styles))
-        story.append(PageBreak())
+
+        story.append(Paragraph(_san(f"Équipement {eq}"), styles["Heading2"]))
+        story.append(
+            Paragraph(
+                _san(
+                    f"Décision finale : {summary_row.get('decision_finale', '—')} | "
+                    f"Priorité : {summary_row.get('priorite', '—')} | "
+                    f"Type de maintenance : {summary_row.get('maintenance_type', '—')}"
+                ),
+                styles["SmallBody"],
+            )
+        )
+        story.append(
+            Paragraph(
+                _san(f"Motif : {summary_row.get('motif_decision', 'Aucun motif disponible.')}"),
+                styles["SmallBody"],
+            )
+        )
+        story.append(Paragraph(_san(_thermal_influence_for_row(summary_row)), styles["SmallBody"]))
+        story.append(Spacer(1, 6))
+
+        for key, label in ordered_trace_tables:
+            df = tables.get(key)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                story.append(Paragraph(_san(label), styles["Heading3"]))
+                font_size = 6 if len(df.columns) >= 4 else 7
+                max_rows = 25 if key != "fit_candidates" else 12
+                story.append(_mk_table(_df_to_table_data(df, max_rows=max_rows), font_size=font_size))
+                story.append(Spacer(1, 6))
+
+        if index < len(equipment_codes) - 1:
+            story.append(PageBreak())
 
     doc.build(story)
     return str(out_path)
