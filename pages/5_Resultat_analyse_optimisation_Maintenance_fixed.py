@@ -41,6 +41,7 @@ st.set_page_config(
     page_icon="📋",
     layout="wide",
 )
+
 require_login()
 
 render_shell("pages/5_Resultat_analyse_optimisation_Maintenance.py")
