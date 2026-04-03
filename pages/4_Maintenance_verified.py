@@ -1,412 +1,295 @@
 from __future__ import annotations
 
-from pathlib import Path
+import hashlib
+import math
 from datetime import date, timedelta
-from io import BytesIO
-import io
-from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-import numpy as np
 import pandas as pd
 import streamlit as st
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 
 from core.security.auth import require_login
-from core.reliability.organigram import analyze_ttf_pipeline
-from core.ui import render_shell, render_page_header, render_paper_table
+from core.ui import render_shell, render_page_header
 
 try:
-    from core.datahub import (
-        get_current_failures_df,
-        get_failures_meta,
-        get_current_project_data,
-        get_project_meta,
-    )
-except Exception:
-    get_current_failures_df = None
-    get_failures_meta = None
-    get_current_project_data = None
-    get_project_meta = None
-
-try:
-    from core.reliability.reporting_global import export_global_analysis_report_pdf
-except Exception:
-    export_global_analysis_report_pdf = None
+    from core.maintenance.reporting_plus import export_pm_plan_with_kits_pdf
+except Exception as error:
+    export_pm_plan_with_kits_pdf = None
+    maintenance_report_error_message = str(error)
+else:
+    maintenance_report_error_message = None
 
 
-st.set_page_config(
-    page_title="Résultat global",
-    page_icon="📋",
-    layout="wide",
-)
+st.set_page_config(page_title="Maintenance", page_icon="🛠️", layout="wide")
 require_login()
 
-render_shell("pages/5_Resultat_analyse_optimisation_Maintenance.py")
+render_shell("pages/4_Maintenance_verified.py")
 render_page_header(
-    "Résultat global",
-    "Traçabilité complète : tests, modèle, thermique, optimisation, maintenance et décision.",
-    "📋",
+    "Maintenance",
+    "Planning issu de l’optimisation, échéances, commentaires détaillés et recommandation finale.",
+    "🛠️",
 )
 
-BASE_DIR = Path(__file__).resolve().parents[1]
-DATA_DIR = BASE_DIR / "data"
-FAILURES_CSV = DATA_DIR / "failures_saved.csv"
-OPTIM_CSV = DATA_DIR / "last_optimization.csv"
 
-
-# =========================================================
+# -------------------------------------------------------------------
 # Helpers
-# =========================================================
-def _read_csv_flex(src) -> pd.DataFrame:
-    def _try_read(s, **kw):
-        try:
-            return pd.read_csv(s, **kw)
-        except Exception:
-            return None
-
-    df = _try_read(src)
-    if df is None:
-        if hasattr(src, "seek"):
-            try:
-                src.seek(0)
-            except Exception:
-                pass
-        df = _try_read(src, engine="python", on_bad_lines="skip", sep=None)
-    if df is None:
-        if hasattr(src, "seek"):
-            try:
-                src.seek(0)
-            except Exception:
-                pass
-        df = _try_read(src, sep=";", engine="python", on_bad_lines="skip")
-    if df is None:
-        return pd.DataFrame()
-
-    df.columns = [str(c).strip() for c in df.columns]
-    return df
+# -------------------------------------------------------------------
+def hash_dataframe(dataframe: pd.DataFrame) -> str:
+    if dataframe is None or dataframe.empty:
+        return "empty"
+    return hashlib.md5(dataframe.to_csv(index=False).encode("utf-8")).hexdigest()
 
 
-def _safe_float(x: Any, default: Optional[float] = None) -> Optional[float]:
+def safe_float(value: Any, default: Optional[float] = None) -> Optional[float]:
     try:
-        if x is None:
+        if value is None:
             return default
-        v = float(x)
-        if np.isnan(v) or np.isinf(v):
+        numeric_value = float(value)
+        if pd.isna(numeric_value) or math.isnan(numeric_value) or math.isinf(numeric_value):
             return default
-        return v
+        return numeric_value
     except Exception:
         return default
 
 
-def _fmt(x: Any, nd: int = 2, default: str = "—") -> str:
-    v = _safe_float(x, None)
-    return default if v is None else f"{v:.{nd}f}"
+def format_number(value: Any, decimals: int = 2, default: str = "—") -> str:
+    numeric_value = safe_float(value)
+    if numeric_value is None:
+        return default
+    return f"{numeric_value:.{decimals}f}"
 
 
-def _load_failures_df(uploaded_csv=None) -> pd.DataFrame:
-    if uploaded_csv is not None:
-        df = _read_csv_flex(uploaded_csv)
-    elif callable(get_current_failures_df):
-        try:
-            df = get_current_failures_df()
-        except Exception:
-            df = pd.DataFrame()
-    elif FAILURES_CSV.exists():
-        df = _read_csv_flex(FAILURES_CSV)
-    else:
-        df = pd.DataFrame()
-
-    if df.empty:
-        return df
-
-    df.columns = [str(c).strip() for c in df.columns]
-    if "equipment_code" not in df.columns or "ttf_h" not in df.columns:
-        return pd.DataFrame()
-
-    df["equipment_code"] = df["equipment_code"].astype(str)
-    df["ttf_h"] = pd.to_numeric(df["ttf_h"], errors="coerce")
-    if "duree_rep_h" in df.columns:
-        df["duree_rep_h"] = pd.to_numeric(df["duree_rep_h"], errors="coerce")
-    else:
-        df["duree_rep_h"] = np.nan
-
-    df = df.dropna(subset=["ttf_h"])
-    df = df[df["ttf_h"] > 0].reset_index(drop=True)
-    return df
+def maintenance_label(maintenance_type: str) -> str:
+    normalized = (maintenance_type or "").strip().lower()
+    if not normalized:
+        return "Type non défini"
+    if "correct" in normalized:
+        return "Maintenance corrective"
+    if "condition" in normalized or "inspection" in normalized:
+        return "Maintenance conditionnelle ou inspection"
+    if "predict" in normalized or "prédict" in normalized:
+        return "Maintenance prédictive"
+    if "prévent" in normalized or "prevent" in normalized:
+        return "Maintenance préventive planifiée"
+    return maintenance_type
 
 
-def _normalize_thermal_timeseries(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame()
-
-    out = df.copy()
-    out.columns = [str(c).strip() for c in out.columns]
-
-    aliases = {
-        "ambient_temp_c": "temp_amb_C",
-        "temp_ambiante_c": "temp_amb_C",
-        "temperature_ambiante": "temp_amb_C",
-        "fan_status": "etat_ventilateurs",
-        "fans_status": "etat_ventilateurs",
-        "ventilateurs": "etat_ventilateurs",
-        "load_pct": "charge_pct",
+def readable_interval_source(source_name: Optional[str]) -> str:
+    mapping = {
+        "T_recommended_h": "intervalle recommandé",
+        "T_R_h": "intervalle issu du critère de fiabilité",
+        "T_cost_h": "intervalle issu du critère économique",
+        "interval_opt_h": "intervalle optimisé",
+        "interval_h": "intervalle générique",
     }
-    lower = {c.lower().strip(): c for c in out.columns}
-    ren = {}
-    for k, v in aliases.items():
-        if k in lower and v not in out.columns:
-            ren[lower[k]] = v
-    out = out.rename(columns=ren)
-
-    if "timestamp" in out.columns:
-        out["timestamp"] = pd.to_datetime(out["timestamp"], errors="coerce")
-        out = out.dropna(subset=["timestamp"])
-
-    if "K" not in out.columns:
-        if "load_factor" in out.columns:
-            out["K"] = pd.to_numeric(out["load_factor"], errors="coerce")
-        elif "charge_pct" in out.columns:
-            out["K"] = pd.to_numeric(out["charge_pct"], errors="coerce") / 100.0
-        elif "load_mva" in out.columns:
-            out["K"] = pd.to_numeric(out["load_mva"], errors="coerce") / 100.0
-
-    if "etat_ventilateurs" not in out.columns:
-        out["etat_ventilateurs"] = 0
-
-    for c in ["temp_amb_C", "K", "etat_ventilateurs", "top_oil_temp_c", "hotspot_temp_c"]:
-        if c in out.columns:
-            out[c] = pd.to_numeric(out[c], errors="coerce")
-
-    return out.reset_index(drop=True)
+    return mapping.get(str(source_name or ""), "source non précisée")
 
 
-def _normalize_thermal_params(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame()
-
-    out = df.copy()
-    out.columns = [str(c).strip() for c in out.columns]
-
-    aliases = {
-        "delta_theta_to_r": "delta_to_r",
-        "delta_theta_h_r": "delta_h_r",
-        "tau_to_hours": "tau_to_hours",
-        "tau_h_hours": "tau_h_hours",
-        "normal_life_hours": "normal_insulation_life_h",
-        "rated_power_mva": "sn_mva",
-    }
-    lower = {c.lower().strip(): c for c in out.columns}
-    ren = {}
-    for k, v in aliases.items():
-        if k in lower and v not in out.columns:
-            ren[lower[k]] = v
-    out = out.rename(columns=ren)
-
-    for c in out.columns:
-        if c != "asset_id":
-            out[c] = pd.to_numeric(out[c], errors="ignore")
-
-    if "tau_to_hours" in out.columns and "tau_to_min" not in out.columns:
-        out["tau_to_min"] = pd.to_numeric(out["tau_to_hours"], errors="coerce") * 60.0
-    if "tau_h_hours" in out.columns and "tau_w_min" not in out.columns:
-        out["tau_w_min"] = pd.to_numeric(out["tau_h_hours"], errors="coerce") * 60.0
-
-    return out
+def pick_interval_hours(row: dict) -> tuple[Optional[float], Optional[str]]:
+    for column_name in ["T_recommended_h", "T_R_h", "T_cost_h", "interval_opt_h", "interval_h"]:
+        if column_name in row and row[column_name] is not None:
+            interval_value = safe_float(row[column_name], None)
+            if interval_value is not None and interval_value > 0:
+                return interval_value, column_name
+    return None, None
 
 
-def _load_project_context(uploaded_xlsx=None) -> Dict[str, pd.DataFrame]:
-    if uploaded_xlsx is not None:
-        try:
-            raw = uploaded_xlsx.read()
-            xls = pd.ExcelFile(io.BytesIO(raw))
-            sheets = {sheet: pd.read_excel(io.BytesIO(raw), sheet_name=sheet) for sheet in xls.sheet_names}
-        except Exception:
-            sheets = {}
-    elif callable(get_current_project_data):
-        try:
-            sheets = get_current_project_data() or {}
-        except Exception:
-            sheets = {}
+def beta_zone(beta_value: Optional[float]) -> str:
+    if beta_value is None:
+        return "unknown"
+    if beta_value < 0.8:
+        return "early"
+    if beta_value <= 1.2:
+        return "random"
+    return "wear"
+
+
+def beta_explanation(beta_value: Optional[float]) -> str:
+    zone = beta_zone(beta_value)
+    if zone == "early":
+        return "Le paramètre bêta est inférieur à 1 : cela évoque surtout des défauts précoces ou des problèmes initiaux."
+    if zone == "random":
+        return "Le paramètre bêta est proche de 1 : les défaillances sont plutôt aléatoires."
+    if zone == "wear":
+        return "Le paramètre bêta est supérieur à 1 : cela évoque une phase d’usure ou de vieillissement."
+    return "Le paramètre bêta n’est pas disponible."
+
+
+def interval_intensity(interval_hours: Optional[float]) -> str:
+    if interval_hours is None:
+        return "unknown"
+    if interval_hours <= 168:
+        return "high"
+    if interval_hours <= 720:
+        return "medium"
+    return "low"
+
+
+def interval_intensity_explanation(interval_hours: Optional[float]) -> str:
+    intensity = interval_intensity(interval_hours)
+    if intensity == "high":
+        return "L’intervalle est court : l’équipement demande des actions rapprochées."
+    if intensity == "medium":
+        return "L’intervalle est intermédiaire : il s’agit d’un compromis entre risque et coût."
+    if intensity == "low":
+        return "L’intervalle est long : la surveillance peut être plus espacée."
+    return "L’intensité de planification n’a pas pu être déterminée."
+
+
+def process_explanation(process_name: Optional[str], process_variant: Optional[str]) -> str:
+    process_upper = str(process_name or "").upper()
+    variant_upper = str(process_variant or "").upper()
+
+    if process_upper == "NHPP":
+        return "Le processus retenu est un processus de Poisson non homogène : le comportement évolue dans le temps."
+    if process_upper == "BPP":
+        return "Le processus retenu signale une dépendance entre événements : une panne peut influencer les suivantes."
+    if variant_upper == "HPP":
+        return "Le variant homogène du processus de Poisson est retenu : le taux de défaillance reste approximativement constant."
+    return "Le processus retenu correspond à un renouvellement avec défaillances considérées comme indépendantes."
+
+
+def thermal_status_explanation(thermal_status: Optional[str]) -> str:
+    normalized = str(thermal_status or "").lower()
+    if "alerte" in normalized or "critique" in normalized:
+        return "Les indicateurs thermiques montrent une situation défavorable qui peut accélérer le vieillissement."
+    if "conforme" in normalized or "normal" in normalized:
+        return "Les indicateurs thermiques restent dans une zone acceptable."
+    if "analyse thermique calculée" in normalized:
+        return "Une analyse thermique est disponible, mais aucun seuil de conformité strict n’a été imposé ici."
+    return "Aucune information thermique claire n’est disponible."
+
+
+def build_maintenance_comment(
+    *,
+    beta: Optional[float],
+    eta_h: Optional[float],
+    interval_h: Optional[float],
+    interval_source: Optional[str],
+    maintenance_type_label: str,
+    process_model: Optional[str] = None,
+    process_variant: Optional[str] = None,
+    thermal_status: Optional[str] = None,
+    thermal_ageing_acceleration_factor_max: Optional[float] = None,
+    thermal_loss_of_life_percent: Optional[float] = None,
+) -> str:
+    beta_value = safe_float(beta, None)
+    eta_value = safe_float(eta_h, None)
+    interval_value = safe_float(interval_h, None)
+    ageing_acceleration_factor_value = safe_float(thermal_ageing_acceleration_factor_max, None)
+    loss_of_life_value = safe_float(thermal_loss_of_life_percent, None)
+
+    source_text = readable_interval_source(interval_source)
+    parts: list[str] = []
+
+    parts.append(f"Type recommandé : {maintenance_type_label}.")
+    parts.append(process_explanation(process_model, process_variant))
+    parts.append(beta_explanation(beta_value))
+    parts.append(thermal_status_explanation(thermal_status))
+
+    if interval_value is not None:
+        parts.append(f"L’intervalle retenu est de {interval_value:.1f} heures et provient de la source suivante : {source_text}.")
+        parts.append(interval_intensity_explanation(interval_value))
     else:
-        sheets = {}
+        parts.append("Aucun intervalle exploitable n’a été retenu automatiquement.")
 
-    out: Dict[str, pd.DataFrame] = {}
-    for k, v in sheets.items():
-        if isinstance(v, pd.DataFrame):
-            out[str(k).strip()] = v.copy()
+    if eta_value is not None and interval_value is not None:
+        ratio = interval_value / max(eta_value, 1e-9)
+        parts.append(f"Le paramètre êta, qui représente une durée de vie caractéristique, vaut environ {eta_value:.1f} heures.")
+        if ratio > 1.0:
+            parts.append("L’intervalle choisi dépasse la durée de vie caractéristique estimée : une surveillance renforcée est recommandée.")
+        elif ratio > 0.5:
+            parts.append("L’intervalle choisi reste proche de la durée de vie caractéristique : il faut rester vigilant.")
+        else:
+            parts.append("L’intervalle choisi reste nettement inférieur à la durée de vie caractéristique : l’approche est prudente.")
+    elif eta_value is not None:
+        parts.append(f"Le paramètre êta, qui représente une durée de vie caractéristique, vaut environ {eta_value:.1f} heures.")
 
-    if "thermal_timeseries" in out:
-        out["thermal_timeseries"] = _normalize_thermal_timeseries(out["thermal_timeseries"])
-    if "thermal_params" in out:
-        out["thermal_params"] = _normalize_thermal_params(out["thermal_params"])
-
-    return out
-
-
-def _extract_thermal_for_eq(
-    sheets: Dict[str, pd.DataFrame],
-    eq: str,
-) -> Tuple[Optional[pd.DataFrame], Optional[Dict[str, Any]]]:
-    if not sheets:
-        return None, None
-
-    thermal_df = None
-    thermal_cfg = None
-
-    ts = sheets.get("thermal_timeseries")
-    if isinstance(ts, pd.DataFrame) and not ts.empty:
-        tmp = ts.copy()
-        asset_col = "asset_id" if "asset_id" in tmp.columns else None
-        if asset_col:
-            tmp = tmp[tmp[asset_col].astype(str) == str(eq)]
-        if not tmp.empty:
-            thermal_df = tmp.reset_index(drop=True)
-
-    params = sheets.get("thermal_params")
-    if isinstance(params, pd.DataFrame) and not params.empty:
-        tmp = params.copy()
-        asset_col = "asset_id" if "asset_id" in tmp.columns else None
-        if asset_col:
-            tmp = tmp[tmp[asset_col].astype(str) == str(eq)]
-        if not tmp.empty:
-            r = tmp.iloc[0].to_dict()
-            thermal_cfg = {
-                "sn_mva": _safe_float(r.get("sn_mva"), 100.0) or 100.0,
-                "R": _safe_float(r.get("R"), 5.0) or 5.0,
-                "delta_to_r": _safe_float(r.get("delta_to_r"), 55.0) or 55.0,
-                "delta_h_r": _safe_float(r.get("delta_h_r"), 30.0) or 30.0,
-                "tau_to_min": _safe_float(r.get("tau_to_min"), 180.0) or 180.0,
-                "tau_w_min": _safe_float(r.get("tau_w_min"), 10.0) or 10.0,
-                "n_exp": _safe_float(r.get("n_exp"), 0.8) or 0.8,
-                "m_exp": _safe_float(r.get("m_exp"), 0.8) or 0.8,
-                "forced_tau_to_factor": _safe_float(r.get("forced_tau_to_factor"), 0.75) or 0.75,
-                "forced_delta_to_factor": _safe_float(r.get("forced_delta_to_factor"), 0.92) or 0.92,
-                "forced_delta_h_factor": _safe_float(r.get("forced_delta_h_factor"), 0.92) or 0.92,
-                "normal_insulation_life_h": _safe_float(r.get("normal_insulation_life_h"), 180000.0) or 180000.0,
-            }
-
-    return thermal_df, thermal_cfg
-
-
-def _load_optimization_df() -> pd.DataFrame:
-    df = st.session_state.get("optimization_df")
-    if isinstance(df, pd.DataFrame) and not df.empty:
-        out = df.copy()
-    elif OPTIM_CSV.exists():
-        out = _read_csv_flex(OPTIM_CSV)
-    else:
-        out = pd.DataFrame()
-
-    if out.empty:
-        return out
-
-    out.columns = [str(c).strip() for c in out.columns]
-    if "process_model" in out.columns and "model" not in out.columns:
-        out["model"] = out["process_model"]
-    if "beta_pipe" in out.columns and "beta" not in out.columns:
-        out["beta"] = out["beta_pipe"]
-    if "eta_pipe_h" in out.columns and "eta_h" not in out.columns:
-        out["eta_h"] = out["eta_pipe_h"]
-    if "gamma_pipe_h" in out.columns and "gamma_h" not in out.columns:
-        out["gamma_h"] = out["gamma_pipe_h"]
-    return out
-
-
-def _build_virtual_pm_plan_from_optimization(
-    opt_df: pd.DataFrame,
-    start_date: date,
-    within_days: int,
-):
-    if opt_df is None or opt_df.empty:
-        return pd.DataFrame(), pd.DataFrame()
-
-    rows: List[Dict[str, Any]] = []
-    for _, r in opt_df.iterrows():
-        eq = str(r.get("equipment_code", "")).strip()
-        if not eq:
-            continue
-
-        interval_h = None
-        src = None
-        for c in ["T_recommended_h", "T_R_h", "T_cost_h", "interval_opt_h", "interval_h"]:
-            v = _safe_float(r.get(c), None)
-            if v is not None and v > 0:
-                interval_h = v
-                src = c
-                break
-
-        if interval_h is None:
-            continue
-
-        periodicity_days = max(1, int(round(interval_h / 24.0)))
-        next_due = start_date + timedelta(days=periodicity_days)
-        days_left = int((next_due - start_date).days)
-
-        rows.append(
-            {
-                "equipment_code": eq,
-                "maintenance_type": r.get("maintenance_type"),
-                "interval_source": src,
-                "interval_h": interval_h,
-                "next_due_date": next_due.isoformat(),
-                "days_left": days_left,
-            }
+    if ageing_acceleration_factor_value is not None:
+        parts.append(
+            f"Le facteur maximal d’accélération du vieillissement est d’environ {ageing_acceleration_factor_value:.3f}."
         )
 
-    all_df = pd.DataFrame(rows)
-    if all_df.empty:
-        return all_df, all_df
+    if loss_of_life_value is not None:
+        parts.append(
+            f"La perte de vie estimée est d’environ {loss_of_life_value:.3f} %."
+        )
 
-    due_df = all_df[all_df["days_left"] <= int(within_days)].copy()
-    return all_df.reset_index(drop=True), due_df.reset_index(drop=True)
+    actions: list[str] = []
+    zone = beta_zone(beta_value)
+    if zone == "early":
+        actions.extend([
+            "vérifier la mise en service et la qualité des montages",
+            "rechercher les causes racines des incidents répétés",
+            "maintenir une surveillance rapprochée",
+        ])
+    elif zone == "random":
+        actions.extend([
+            "garder une surveillance régulière",
+            "préparer les consommables pour réduire le temps de réparation",
+            "contrôler les signes faibles avant toute dérive",
+        ])
+    elif zone == "wear":
+        actions.extend([
+            "planifier l’intervention avant la zone critique",
+            "renforcer les contrôles ciblés",
+            "préparer le remplacement des éléments vieillissants",
+        ])
+
+    if thermal_status and "alerte" in str(thermal_status).lower():
+        actions.insert(0, "contrôler immédiatement l’échauffement et le système de refroidissement")
+    elif thermal_status and ("conforme" in str(thermal_status).lower() or "normal" in str(thermal_status).lower()):
+        actions.insert(0, "conserver la surveillance thermique actuelle")
+
+    if actions:
+        parts.append("Actions conseillées : " + "; ".join(actions) + ".")
+
+    return " ".join(parts)
 
 
-def _thermal_status(theta_hs_max: Any, faa_max: Any, lol_pct: Any) -> str:
-    th = _safe_float(theta_hs_max, None)
-    faa = _safe_float(faa_max, None)
-    lol = _safe_float(lol_pct, None)
-
-    if (th is not None and th >= 130) or (faa is not None and faa >= 2.0) or (lol is not None and lol >= 1.0):
-        return "Critique"
-    if (th is not None and th >= 110) or (faa is not None and faa >= 1.5) or (lol is not None and lol >= 0.3):
-        return "Alerte"
-    if th is None and faa is None and lol is None:
-        return "Non disponible"
-    return "Normal"
-
-
-def _process_score(model: str) -> int:
-    m = (model or "").upper()
-    if "NHPP" in m:
-        return 3
-    if "BPP" in m or "HAWKES" in m:
-        return 2
-    return 1
+def load_optimization_fallback() -> pd.DataFrame:
+    base_dir = Path(__file__).resolve().parents[1]
+    fallback_file = base_dir / "data" / "last_optimization.csv"
+    if fallback_file.exists():
+        try:
+            dataframe = pd.read_csv(fallback_file)
+            dataframe.columns = [str(column).strip() for column in dataframe.columns]
+            return dataframe
+        except Exception:
+            return pd.DataFrame()
+    return pd.DataFrame()
 
 
-def _final_decision_row(row: pd.Series):
+def compute_priority_decision(row: Dict[str, Any]) -> tuple[int, str, str, str]:
     score = 0
-    model = str(row.get("model", "RP"))
-    thermal_status = str(row.get("thermal_status", "Non disponible"))
-    beta = _safe_float(row.get("beta"), None)
-    days_left = _safe_float(row.get("days_left"), None)
 
-    score += _process_score(model)
+    process_name = str(row.get("model", "RP")).upper()
+    thermal_status = str(row.get("thermal_status", "Aucune donnée thermique disponible"))
+    beta_value = safe_float(row.get("beta"), None)
+    days_left = safe_float(row.get("days_left"), None)
+    global_conformity = row.get("admissible_global")
 
-    if beta is not None:
-        if beta > 1.2:
+    if process_name == "NHPP":
+        score += 3
+    elif process_name == "BPP":
+        score += 2
+    else:
+        score += 1
+
+    if beta_value is not None:
+        if beta_value > 1.2:
             score += 3
-        elif beta >= 1.0:
+        elif beta_value >= 1.0:
             score += 2
-        elif beta < 0.8:
+        elif beta_value < 0.8:
             score += 1
 
-    if thermal_status == "Critique":
+    normalized_thermal_status = thermal_status.lower()
+    if "alerte" in normalized_thermal_status or "critique" in normalized_thermal_status:
         score += 4
-    elif thermal_status == "Alerte":
-        score += 2
+    elif "conforme" in normalized_thermal_status or "normal" in normalized_thermal_status:
+        score += 1
 
     if days_left is not None:
         if days_left <= 7:
@@ -416,459 +299,505 @@ def _final_decision_row(row: pd.Series):
         elif days_left <= 90:
             score += 1
 
-    maint_type = str(row.get("maintenance_type", ""))
+    if global_conformity is False:
+        score += 2
 
     if score >= 10:
-        decision = "Intervention prioritaire"
-        reason = f"Processus {model}, état global défavorable et échéance proche. Action : {maint_type or 'maintenance ciblée'}."
+        priority_level = "Critique"
+        final_decision = "Intervention prioritaire"
+        reason = "Les signaux fiabilistes, thermiques et calendaires imposent une action rapide."
     elif score >= 7:
-        decision = "Préventif renforcé"
-        reason = "Risque significatif détecté. Renforcer la surveillance et planifier l’intervention."
+        priority_level = "Élevée"
+        final_decision = "Préventif renforcé"
+        reason = "Le niveau de risque reste significatif : il faut maintenir une action planifiée rapide."
     elif score >= 4:
-        decision = "Surveillance active"
-        reason = "Situation intermédiaire. Conserver le plan optimisé et suivre les dérives."
+        priority_level = "Modérée"
+        final_decision = "Surveillance active"
+        reason = "La situation demande une surveillance structurée et le respect du plan calculé."
     else:
-        decision = "Suivi nominal"
-        reason = "Pas de signal critique immédiat. Application du plan standard."
+        priority_level = "Faible"
+        final_decision = "Suivi nominal"
+        reason = "Aucun signal critique immédiat n’est dominant : le plan standard peut être suivi."
 
-    return decision, reason, int(score)
-
-
-def _trace_trend_table(result: Dict[str, Any], alpha: float) -> pd.DataFrame:
-    tests = (result.get("reliability", {}) or {}).get("tests", {}) or {}
-    mk = tests.get("trend_mk", {}) or {}
-    lap = tests.get("trend_laplace", {}) or {}
-
-    rows = [
-        {
-            "Test": "Mann-Kendall",
-            "Statistique": _fmt(mk.get("z"), 3),
-            "p-valeur": _fmt(mk.get("p"), 4),
-            "Règle": f"p < {alpha:.3f}",
-            "Décision": "Tendance détectée" if mk.get("has_trend") else "Pas de tendance",
-            "Interprétation": (
-                f"Tendance {mk.get('direction', 'non précisée')}"
-                if mk.get("has_trend") else "Le test ne met pas en évidence de tendance significative."
-            ),
-        },
-        {
-            "Test": "Laplace",
-            "Statistique": _fmt(lap.get("z"), 3),
-            "p-valeur": _fmt(lap.get("p"), 4),
-            "Règle": f"p < {alpha:.3f}",
-            "Décision": "Tendance détectée" if lap.get("has_trend") else "Pas de tendance",
-            "Interprétation": (
-                f"Tendance {lap.get('direction', 'non précisée')}"
-                if lap.get("has_trend") else "Le test confirme une évolution non significative."
-            ),
-        },
-    ]
-    return pd.DataFrame(rows)
+    return score, priority_level, final_decision, reason
 
 
-def _trace_dependence_table(result: Dict[str, Any], alpha: float) -> pd.DataFrame:
-    dep = ((result.get("reliability", {}) or {}).get("tests", {}) or {}).get("dependence", {}) or {}
-
-    rho = dep.get("spearman_r")
-    rho_txt = _fmt(rho, 3)
-    rho_int = "Corrélation positive" if _safe_float(rho, 0) > 0 else "Corrélation négative ou nulle"
-
-    tau = dep.get("kendall_tau")
-    tau_txt = _fmt(tau, 3)
-    tau_int = "Concordance positive" if _safe_float(tau, 0) > 0 else "Concordance négative ou nulle"
-
-    rows = [
-        {
-            "Test": "Spearman",
-            "Coefficient": rho_txt,
-            "p-valeur": _fmt(dep.get("spearman_p"), 4),
-            "Règle": f"p < {alpha:.3f}",
-            "Décision": "Dépendance détectée" if dep.get("has_dep") else "Pas de dépendance significative",
-            "Interprétation": rho_int,
-        },
-        {
-            "Test": "Kendall",
-            "Coefficient": tau_txt,
-            "p-valeur": _fmt(dep.get("kendall_p"), 4),
-            "Règle": f"p < {alpha:.3f}",
-            "Décision": "Appui sur la dépendance" if dep.get("has_dep") else "Appui sur l’indépendance",
-            "Interprétation": tau_int,
-        },
-    ]
-    return pd.DataFrame(rows)
-
-
-def _trace_model_table(result: Dict[str, Any]) -> pd.DataFrame:
-    rel = result.get("reliability", {}) or {}
-    good = rel.get("goodness", {}) or {}
-    dec = rel.get("decision", {}) or {}
-
-    rows = [
-        {"Élément": "Processus retenu", "Valeur": rel.get("model", "—"), "Lecture": "Sortie finale du pipeline."},
-        {"Élément": "Loi retenue", "Valeur": rel.get("distribution", "—"), "Lecture": "Loi choisie après ajustement."},
-        {"Élément": "AIC", "Valeur": _fmt(good.get("aic"), 3), "Lecture": "Plus faible = meilleur compromis ajustement / complexité."},
-        {"Élément": "KS p-valeur", "Valeur": _fmt(good.get("ks_p"), 4), "Lecture": "Plus la p-valeur est élevée, plus l’ajustement est acceptable."},
-        {"Élément": "Chi² p-valeur", "Valeur": _fmt(good.get("chi2_p"), 4), "Lecture": "Validation complémentaire de l’ajustement."},
-        {"Élément": "Motif de décision", "Valeur": dec.get("reason", "—"), "Lecture": "Justification textuelle du pipeline."},
-    ]
-    return pd.DataFrame(rows)
-
-
-def _trace_parameter_table(row: Dict[str, Any]) -> pd.DataFrame:
-    beta = _safe_float(row.get("beta"), None)
-    beta_lecture = "Usure" if beta is not None and beta > 1 else "Aléatoire" if beta is not None and beta >= 0.9 else "Défauts précoces"
-
-    rows = [
-        {"Paramètre": "β", "Valeur": _fmt(row.get("beta"), 3), "Interprétation": beta_lecture},
-        {"Paramètre": "η (h)", "Valeur": _fmt(row.get("eta_h"), 1), "Interprétation": "Échelle de durée de vie."},
-        {"Paramètre": "γ (h)", "Valeur": _fmt(row.get("gamma_h"), 1), "Interprétation": "Décalage éventuel du modèle."},
-        {"Paramètre": "MTBF (h)", "Valeur": _fmt(row.get("mtbf_h"), 1), "Interprétation": "Temps moyen entre défaillances."},
-        {"Paramètre": "MTTR (h)", "Valeur": _fmt(row.get("mttr_h"), 1), "Interprétation": "Temps moyen de réparation."},
-        {"Paramètre": "Disponibilité (%)", "Valeur": _fmt(row.get("availability_pct"), 2), "Interprétation": "Part du temps où l’équipement est disponible."},
-        {"Paramètre": "θHS max (°C)", "Valeur": _fmt(row.get("theta_hs_max"), 2), "Interprétation": "Température maximale du point chaud."},
-        {"Paramètre": "FAA max", "Valeur": _fmt(row.get("faa_max"), 3), "Interprétation": "Accélération maximale du vieillissement."},
-        {"Paramètre": "Perte de vie (%)", "Valeur": _fmt(row.get("loss_of_life_pct"), 3), "Interprétation": "Consommation estimée de la vie d’isolation."},
-    ]
-    return pd.DataFrame(rows)
-
-
-def _trace_optimization_table(row: Dict[str, Any]) -> pd.DataFrame:
-    t_rec = _safe_float(row.get("T_recommended_h"), None)
-    t_r = _safe_float(row.get("T_R_h"), None)
-    t_cost = _safe_float(row.get("T_cost_h"), None)
-
-    if t_rec is not None and t_r is not None and abs(t_rec - t_r) < 1e-6:
-        lecture = "Le temps recommandé suit le critère fiabilité."
-    elif t_rec is not None and t_cost is not None and abs(t_rec - t_cost) < 1e-6:
-        lecture = "Le temps recommandé suit le critère économique."
-    else:
-        lecture = "Le temps recommandé est un compromis entre coût et fiabilité."
-
-    rows = [
-        {"Indicateur": "T_R (h)", "Valeur": _fmt(row.get("T_R_h"), 1), "Lecture": "Intervalle issu du critère de fiabilité cible."},
-        {"Indicateur": "T_cost (h)", "Valeur": _fmt(row.get("T_cost_h"), 1), "Lecture": "Intervalle minimisant le coût moyen."},
-        {"Indicateur": "T_recommended (h)", "Valeur": _fmt(row.get("T_recommended_h"), 1), "Lecture": lecture},
-        {"Indicateur": "R(T_cost)", "Valeur": _fmt(row.get("R(T_cost)"), 3), "Lecture": "Fiabilité au temps économique."},
-        {"Indicateur": "C_min / h", "Valeur": _fmt(row.get("C_min_per_h"), 4), "Lecture": "Coût minimal moyen par heure."},
-        {"Indicateur": "Maintenance retenue", "Valeur": row.get("maintenance_type", "—"), "Lecture": "Type d’action recommandé."},
-        {"Indicateur": "Échéance", "Valeur": row.get("next_due_date", "—"), "Lecture": f"J-{row.get('days_left', '—')}"},
-    ]
-    return pd.DataFrame(rows)
-
-
-def _trace_decision_table(row: Dict[str, Any]) -> pd.DataFrame:
-    rows = [
-        {"Critère": "Tendance", "Valeur": row.get("trend_detected", "—"), "Impact": "Augmente la vigilance si Oui."},
-        {"Critère": "Dépendance", "Valeur": row.get("dependence_detected", "—"), "Impact": "Oriente vers processus plus complexe."},
-        {"Critère": "Processus", "Valeur": row.get("model", "—"), "Impact": "Modifie le niveau de priorité."},
-        {"Critère": "Statut thermique", "Valeur": row.get("thermal_status", "—"), "Impact": "Peut imposer une action plus rapide."},
-        {"Critère": "Échéance", "Valeur": f"J-{row.get('days_left', '—')}", "Impact": "Plus l’échéance est proche, plus le score augmente."},
-        {"Critère": "Score final", "Valeur": row.get("priority_score", "—"), "Impact": row.get("priorite", "—")},
-        {"Critère": "Décision finale", "Valeur": row.get("decision_finale", "—"), "Impact": row.get("motif_decision", "—")},
-    ]
-    return pd.DataFrame(rows)
-
-
-def _xlsx_bytes(global_tables: Dict[str, pd.DataFrame], detail_tables: Dict[str, Dict[str, pd.DataFrame]]) -> bytes:
-    buff = BytesIO()
-    with pd.ExcelWriter(buff, engine="openpyxl") as writer:
-        for name, df in global_tables.items():
-            if isinstance(df, pd.DataFrame) and not df.empty:
-                df.to_excel(writer, sheet_name=name[:31], index=False)
-        for eq, tables in detail_tables.items():
-            for tname, df in tables.items():
-                if isinstance(df, pd.DataFrame) and not df.empty:
-                    try:
-                        df.to_excel(writer, sheet_name=f"{eq}_{tname}"[:31], index=False)
-                    except Exception:
-                        pass
-    buff.seek(0)
-    return buff.getvalue()
-
-
-# =========================================================
-# Contrôles page
-# =========================================================
-ctrl1, ctrl2, ctrl3, ctrl4 = st.columns([1, 1, 1, 1])
-with ctrl1:
-    up_fail = st.file_uploader("TTF CSV optionnel", type=["csv"], key="global_up_fail")
-with ctrl2:
-    up_project = st.file_uploader("Projet Excel optionnel", type=["xlsx"], key="global_up_project")
-with ctrl3:
-    alpha = st.slider("Seuil alpha", 0.01, 0.10, 0.05, 0.01)
-with ctrl4:
-    within_days = st.slider("Fenêtre maintenance (jours)", 7, 365, 30, 1)
-
-start_dt = st.date_input("Date de référence", value=date.today())
-
-
-# =========================================================
-# Chargement données
-# =========================================================
-df_fail = _load_failures_df(up_fail)
-if df_fail.empty:
-    st.error("Aucun dataset TTF disponible.")
-    st.stop()
-
-project_sheets = _load_project_context(up_project)
-opt_df = _load_optimization_df()
-
-pm_all = st.session_state.get("pm_virtual_all")
-pm_due = st.session_state.get("pm_virtual_due")
-if isinstance(pm_all, list) and isinstance(pm_due, list):
-    pm_all_df = pd.DataFrame(pm_all)
-    pm_due_df = pd.DataFrame(pm_due)
-else:
-    pm_all_df, pm_due_df = _build_virtual_pm_plan_from_optimization(opt_df, start_dt, within_days)
-
-c1, c2, c3 = st.columns(3)
-with c1:
-    st.info(f"TTF actifs : {len(df_fail)} lignes")
-with c2:
-    st.info(f"Projet thermique : {'Oui' if bool(project_sheets) else 'Non'}")
-with c3:
-    st.info(f"Optimisation : {'Oui' if not opt_df.empty else 'Non'}")
-
-
-# =========================================================
-# Analyse globale
-# =========================================================
-with st.spinner("Analyse globale..."):
-    results_by_eq: Dict[str, Dict[str, Any]] = {}
-    detail_tables_by_eq: Dict[str, Dict[str, pd.DataFrame]] = {}
-    global_rows: List[Dict[str, Any]] = []
-
-    eqs = sorted(df_fail["equipment_code"].astype(str).unique().tolist())
-
-    for eq in eqs:
-        g = df_fail[df_fail["equipment_code"].astype(str) == str(eq)].copy()
-        ttf_series = g["ttf_h"].dropna().astype(float).tolist()
-        if len(ttf_series) < 3:
-            continue
-
-        repair_series = None
-        if "duree_rep_h" in g.columns:
-            rr = pd.to_numeric(g["duree_rep_h"], errors="coerce").dropna().tolist()
-            repair_series = rr if rr else None
-
-        thermal_df_eq, thermal_cfg_eq = _extract_thermal_for_eq(project_sheets, eq)
-
-        try:
-            res = analyze_ttf_pipeline(
-                ttf_series=ttf_series,
-                alpha=float(alpha),
-                repair_series=repair_series,
-                thermal_df=thermal_df_eq,
-                thermal_config=thermal_cfg_eq,
-            )
-        except Exception as e:
-            st.warning(f"{eq} : analyse impossible ({e})")
-            continue
-
-        results_by_eq[eq] = res
-        detail_tables_by_eq[eq] = res.get("tables", {}) or {}
-
-        reliability = res.get("reliability", {}) or {}
-        indicators = reliability.get("indicators", {}) or {}
-        params = reliability.get("params", {}) or {}
-        tests = reliability.get("tests", {}) or {}
-        thermal = res.get("thermal") or {}
-        thermal_summary = (thermal.get("summary") or {}) if isinstance(thermal, dict) else {}
-
-        opt_row = {}
-        if isinstance(opt_df, pd.DataFrame) and not opt_df.empty and "equipment_code" in opt_df.columns:
-            m = opt_df[opt_df["equipment_code"].astype(str) == str(eq)]
-            if not m.empty:
-                opt_row = m.iloc[0].to_dict()
-
-        pm_row = {}
-        if isinstance(pm_all_df, pd.DataFrame) and not pm_all_df.empty and "equipment_code" in pm_all_df.columns:
-            m = pm_all_df[pm_all_df["equipment_code"].astype(str) == str(eq)]
-            if not m.empty:
-                pm_row = m.iloc[0].to_dict()
-
-        trend_mk = tests.get("trend_mk", {}) or {}
-        trend_lap = tests.get("trend_laplace", {}) or {}
-
-        beta_pref = params.get("beta", opt_row.get("beta"))
-        eta_pref = params.get("eta", opt_row.get("eta_h"))
-        gamma_pref = params.get("gamma", opt_row.get("gamma_h"))
-
-        global_rows.append(
-            {
-                "equipment_code": eq,
-                "n_ttf": len(ttf_series),
-                "trend_detected": "Oui" if (trend_mk.get("has_trend") or trend_lap.get("has_trend")) else "Non",
-                "trend_direction": trend_mk.get("direction") or trend_lap.get("direction"),
-                "dependence_detected": "Oui" if ((tests.get("dependence", {}) or {}).get("has_dep")) else "Non",
-                "model": reliability.get("model"),
-                "distribution": reliability.get("distribution"),
-                "beta": beta_pref,
-                "eta_h": eta_pref,
-                "gamma_h": gamma_pref,
-                "mtbf_h": indicators.get("mtbf_h"),
-                "mttr_h": indicators.get("mttr_h"),
-                "availability_pct": None if indicators.get("availability_intrinsic") is None else 100.0 * float(indicators.get("availability_intrinsic")),
-                "theta_hs_max": thermal_summary.get("theta_hs_max"),
-                "faa_max": thermal_summary.get("faa_max"),
-                "loss_of_life_pct": thermal_summary.get("loss_of_life_pct"),
-                "thermal_status": _thermal_status(
-                    thermal_summary.get("theta_hs_max"),
-                    thermal_summary.get("faa_max"),
-                    thermal_summary.get("loss_of_life_pct"),
-                ),
-                "maintenance_type": opt_row.get("maintenance_type"),
-                "T_recommended_h": opt_row.get("T_recommended_h"),
-                "T_R_h": opt_row.get("T_R_h"),
-                "T_cost_h": opt_row.get("T_cost_h"),
-                "R(T_cost)": opt_row.get("R(T_cost)"),
-                "C_min_per_h": opt_row.get("C_min_per_h"),
-                "next_due_date": pm_row.get("next_due_date"),
-                "days_left": pm_row.get("days_left"),
-            }
-        )
-
-summary_df = pd.DataFrame(global_rows)
-if summary_df.empty:
-    st.error("Aucun équipement exploitable.")
-    st.stop()
-
-final_decisions = summary_df.apply(lambda r: _final_decision_row(r), axis=1)
-summary_df[["decision_finale", "motif_decision", "priority_score"]] = pd.DataFrame(final_decisions.tolist(), index=summary_df.index)
-summary_df["priorite"] = pd.cut(
-    summary_df["priority_score"],
-    bins=[-1, 3, 6, 9, 100],
-    labels=["Faible", "Modérée", "Élevée", "Critique"],
-)
-summary_df = summary_df.sort_values(["priority_score", "equipment_code"], ascending=[False, True]).reset_index(drop=True)
-
-trend_overview = summary_df[[
-    "equipment_code", "n_ttf", "trend_detected", "trend_direction", "dependence_detected", "model", "distribution"
-]].copy()
-
-risk_overview = summary_df[[
-    "equipment_code", "beta", "eta_h", "mtbf_h", "mttr_h", "availability_pct",
-    "theta_hs_max", "faa_max", "loss_of_life_pct", "thermal_status"
-]].copy()
-
-optimization_overview = summary_df[[
-    "equipment_code", "maintenance_type", "T_recommended_h", "T_R_h", "T_cost_h",
-    "R(T_cost)", "C_min_per_h", "next_due_date", "days_left"
-]].copy()
-
-final_decision_df = summary_df[[
-    "equipment_code", "model", "distribution", "thermal_status", "maintenance_type",
-    "days_left", "priority_score", "priorite", "decision_finale", "motif_decision"
-]].copy()
-
-due_tasks_df = pm_due_df.copy() if not pm_due_df.empty else pd.DataFrame()
-
-global_tables = {
-    "global_summary": summary_df,
-    "trend_overview": trend_overview,
-    "risk_overview": risk_overview,
-    "optimization_overview": optimization_overview,
-    "due_tasks": due_tasks_df,
-    "final_decision": final_decision_df,
+DISPLAY_COLUMN_NAMES = {
+    "equipment_code": "Code équipement",
+    "title": "Titre du plan",
+    "maintenance_type": "Type de maintenance recommandé",
+    "maintenance_comment": "Commentaire détaillé",
+    "interval_source": "Source brute de l’intervalle",
+    "interval_source_readable": "Source lisible de l’intervalle",
+    "interval_h": "Intervalle retenu (heures)",
+    "periodicity_days": "Périodicité (jours)",
+    "next_due_date": "Prochaine date d’échéance",
+    "days_left": "Nombre de jours restants",
+    "beta": "Paramètre bêta",
+    "eta_h": "Paramètre êta (heures)",
+    "gamma_h": "Paramètre gamma (heures)",
+    "model": "Processus retenu",
+    "process_variant": "Variant du processus",
+    "distribution": "Loi de probabilité retenue",
+    "T_recommended_h": "Intervalle recommandé (heures)",
+    "T_R_h": "Intervalle issu du critère de fiabilité (heures)",
+    "T_cost_h": "Intervalle issu du critère économique (heures)",
+    "R_at_T": "Fiabilité au niveau de l’intervalle économique",
+    "C_min_per_h": "Coût minimal par heure",
+    "FAA_max": "Facteur maximal d’accélération du vieillissement",
+    "loss_of_life_pct": "Perte de vie (%)",
+    "thermal_status": "Statut thermique",
+    "thermal_ok": "Conformité thermique",
+    "reliability_ok": "Conformité fiabiliste",
+    "admissible_global": "Conformité globale",
+    "status": "Statut du plan",
+    "priority_score": "Score de priorité",
+    "priority_level": "Niveau de priorité",
+    "final_decision": "Décision finale",
+    "final_reason": "Motif de la décision",
 }
 
 
-# =========================================================
-# KPIs
-# =========================================================
-k1, k2, k3, k4, k5 = st.columns(5)
-with k1:
-    st.metric("Équipements analysés", len(summary_df))
-with k2:
-    st.metric("Priorité critique", int((summary_df["priorite"].astype(str) == "Critique").sum()))
-with k3:
-    st.metric("Tâches dues", len(due_tasks_df))
-with k4:
-    st.metric("Thermique critique", int((summary_df["thermal_status"] == "Critique").sum()))
-with k5:
-    st.metric("NHPP détectés", int((summary_df["model"].astype(str).str.upper() == "NHPP").sum()))
+def rename_columns_for_display(dataframe: pd.DataFrame) -> pd.DataFrame:
+    if dataframe is None or dataframe.empty:
+        return dataframe
+    renamed_dataframe = dataframe.copy()
+    renamed_dataframe = renamed_dataframe.rename(columns={
+        column: DISPLAY_COLUMN_NAMES.get(column, column)
+        for column in renamed_dataframe.columns
+    })
+    return renamed_dataframe
 
 
-# =========================================================
-# Onglets
-# =========================================================
-tab1, tab2, tab3 = st.tabs(["Vue synthèse", "Traçabilité par équipement", "Exports"])
+def build_virtual_maintenance_plan_from_optimization(
+    optimization_dataframe: pd.DataFrame,
+    start_date: date,
+    due_window_days: int,
+    show_all: bool = True,
+    only_preventive: bool = False,
+    only_globally_conformant: bool = False,
+    minimum_days: int = 1,
+) -> Dict[str, Any]:
+    if optimization_dataframe is None or optimization_dataframe.empty:
+        return {"ok": False, "msg": "Le tableau d’optimisation est vide.", "rows": [], "due": []}
 
-with tab1:
-    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+    dataframe = optimization_dataframe.copy()
+    dataframe.columns = [str(column).strip() for column in dataframe.columns]
 
-    a, b = st.columns(2)
-    with a:
-        fig, ax = plt.subplots(figsize=(8, 4))
-        vc = summary_df["model"].astype(str).value_counts()
-        ax.bar(vc.index.tolist(), vc.values.tolist())
-        ax.set_title("Répartition des processus")
-        ax.grid(True, alpha=0.25)
-        st.pyplot(fig, clear_figure=True)
+    if "equipment_code" not in dataframe.columns:
+        return {"ok": False, "msg": "La colonne equipment_code est absente.", "rows": [], "due": []}
 
-    with b:
-        fig, ax = plt.subplots(figsize=(8, 4))
-        tmp = summary_df[["equipment_code", "priority_score"]].sort_values("priority_score")
-        ax.barh(tmp["equipment_code"], tmp["priority_score"])
-        ax.set_title("Score de priorité")
-        ax.grid(True, alpha=0.25)
-        st.pyplot(fig, clear_figure=True)
+    rows: List[Dict[str, Any]] = []
+    used_interval_columns = {
+        "T_recommended_h": 0,
+        "T_R_h": 0,
+        "T_cost_h": 0,
+        "interval_opt_h": 0,
+        "interval_h": 0,
+        "none": 0,
+    }
 
-with tab2:
-    eq = st.selectbox("Choisir un équipement", options=summary_df["equipment_code"].tolist())
-    res = results_by_eq[eq]
-    row = summary_df[summary_df["equipment_code"] == eq].iloc[0].to_dict()
+    for _, record in dataframe.iterrows():
+        row = record.to_dict()
+        equipment_code = str(row.get("equipment_code") or "").strip()
+        if not equipment_code:
+            continue
 
-    render_paper_table("Tableau 1 : Validation des tests de tendance", _trace_trend_table(res, alpha))
-    render_paper_table("Tableau 2 : Validation des tests de dépendance", _trace_dependence_table(res, alpha))
-    render_paper_table("Tableau 3 : Choix du processus et du modèle", _trace_model_table(res))
-    render_paper_table("Tableau 4 : Paramètres fiabilistes et thermiques", _trace_parameter_table(row))
-    render_paper_table("Tableau 5 : Optimisation et maintenance retenue", _trace_optimization_table(row))
-    render_paper_table("Tableau 6 : Traçabilité de la décision finale", _trace_decision_table(row))
+        globally_conformant = row.get("admissible_global")
+        if only_globally_conformant and globally_conformant is not None and not bool(globally_conformant):
+            continue
 
-    st.success(f"Décision finale — {row.get('decision_finale', '—')}")
-    st.info(row.get("motif_decision", "Aucun motif disponible."))
+        maintenance_type_readable = maintenance_label(str(row.get("maintenance_type") or "").strip())
+        if only_preventive and "préventive" not in maintenance_type_readable.lower():
+            continue
 
-with tab3:
-    excel_bytes = _xlsx_bytes(global_tables, detail_tables_by_eq)
-    st.download_button(
-        "⬇️ Télécharger le pack Excel global",
-        data=excel_bytes,
-        file_name="resultat_analyse_optimisation_maintenance.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
+        interval_hours, interval_source = pick_interval_hours(row)
+        if not interval_hours:
+            used_interval_columns["none"] += 1
+            continue
+
+        if interval_source in used_interval_columns:
+            used_interval_columns[interval_source] += 1
+
+        periodicity_days = max(int(minimum_days), int(round(float(interval_hours) / 24.0)))
+        next_due_date = start_date + timedelta(days=periodicity_days)
+        days_left = (next_due_date - start_date).days
+
+        beta_value = safe_float(row.get("beta"), None)
+        eta_value = safe_float(row.get("eta_h"), None)
+
+        maintenance_comment = build_maintenance_comment(
+            beta=beta_value,
+            eta_h=eta_value,
+            interval_h=safe_float(interval_hours, None),
+            interval_source=interval_source,
+            maintenance_type_label=maintenance_type_readable,
+            process_model=str(row.get("model") or ""),
+            process_variant=str(row.get("process_variant") or ""),
+            thermal_status=str(row.get("thermal_status") or ""),
+            thermal_ageing_acceleration_factor_max=safe_float(row.get("FAA_max"), None),
+            thermal_loss_of_life_percent=safe_float(row.get("loss_of_life_pct"), None),
+        )
+
+        task = {
+            "equipment_code": equipment_code,
+            "title": "Plan issu de l’optimisation",
+            "maintenance_type": maintenance_type_readable,
+            "maintenance_comment": maintenance_comment,
+            "interval_source": interval_source,
+            "interval_source_readable": readable_interval_source(interval_source),
+            "interval_h": float(interval_hours),
+            "periodicity_days": periodicity_days,
+            "next_due_date": next_due_date.isoformat(),
+            "days_left": int(days_left),
+            "beta": beta_value,
+            "eta_h": eta_value,
+            "gamma_h": row.get("gamma_h"),
+            "model": row.get("model"),
+            "process_variant": row.get("process_variant"),
+            "distribution": row.get("distribution"),
+            "T_recommended_h": row.get("T_recommended_h"),
+            "T_R_h": row.get("T_R_h"),
+            "T_cost_h": row.get("T_cost_h"),
+            "R_at_T": row.get("R(T_cost)"),
+            "C_min_per_h": row.get("C_min_per_h"),
+            "FAA_max": row.get("FAA_max"),
+            "loss_of_life_pct": row.get("loss_of_life_pct"),
+            "thermal_status": row.get("thermal_status"),
+            "thermal_ok": row.get("thermal_ok"),
+            "reliability_ok": row.get("reliability_ok"),
+            "admissible_global": row.get("admissible_global"),
+            "status": "Plan virtuel",
+        }
+
+        priority_score, priority_level, final_decision, final_reason = compute_priority_decision(task)
+        task["priority_score"] = priority_score
+        task["priority_level"] = priority_level
+        task["final_decision"] = final_decision
+        task["final_reason"] = final_reason
+
+        if show_all or (days_left <= due_window_days):
+            rows.append(task)
+
+    rows = sorted(
+        rows,
+        key=lambda row: (
+            -int(row.get("priority_score", 0)),
+            int(row.get("days_left", 999999)),
+            str(row.get("equipment_code", "")),
+        ),
+    )
+    due_rows = [row for row in rows if int(row.get("days_left", 999999)) <= due_window_days]
+
+    return {
+        "ok": True,
+        "rows": rows,
+        "due": due_rows,
+        "used_cols_stats": used_interval_columns,
+        "interval_priority": ["T_recommended_h", "T_R_h", "T_cost_h", "interval_opt_h", "interval_h"],
+    }
+
+
+# -------------------------------------------------------------------
+# Chargement
+# -------------------------------------------------------------------
+optimization_dataframe = st.session_state.get("optimization_df")
+if not isinstance(optimization_dataframe, pd.DataFrame) or optimization_dataframe.empty:
+    optimization_dataframe = load_optimization_fallback()
+
+if not isinstance(optimization_dataframe, pd.DataFrame) or optimization_dataframe.empty:
+    st.info("Aucune optimisation disponible. Va d’abord dans la page Optimisation.")
+    st.stop()
+
+optimization_dataframe = optimization_dataframe.copy()
+optimization_dataframe.columns = [str(column).strip() for column in optimization_dataframe.columns]
+
+optimization_hash = hash_dataframe(optimization_dataframe)
+st.success(f"Optimisation synchronisée | lignes={len(optimization_dataframe)} | empreinte={optimization_hash}")
+
+
+# -------------------------------------------------------------------
+# Explications
+# -------------------------------------------------------------------
+with st.expander("Comprendre clairement les variables utilisées sur cette page", expanded=False):
+    st.markdown(
+        """
+**Paramètre bêta** : décrit la forme du vieillissement.  
+- inférieur à 1 : défauts précoces ou problèmes initiaux  
+- proche de 1 : comportement plutôt aléatoire  
+- supérieur à 1 : phase d’usure
+
+**Paramètre êta** : durée de vie caractéristique estimée. Plus il est grand, plus l’équipement peut tenir longtemps.
+
+**Paramètre gamma** : éventuel décalage du modèle dans le temps.
+
+**Intervalle recommandé** : temps retenu pour préparer l’action de maintenance.
+
+**Intervalle issu du critère de fiabilité** : temps qui respecte le niveau de fiabilité visé.
+
+**Intervalle issu du critère économique** : temps qui cherche à minimiser le coût moyen.
+
+**Facteur maximal d’accélération du vieillissement** : indicateur thermique montrant à quel point la chaleur accélère le vieillissement de l’isolation.
+
+**Perte de vie (%)** : part estimée de la durée de vie déjà consommée.
+
+**Statut thermique** : indique si la situation thermique est normale, conforme, en alerte ou non disponible.
+
+**Conformité fiabiliste** : indique si le modèle de fiabilité retenu est jugé acceptable.
+
+**Conformité globale** : synthèse de la cohérence fiabilité + thermique.
+
+**Score de priorité** : score interne utilisé pour classer les équipements à traiter en premier.
+
+**Décision finale** : conclusion pratique retenue pour orienter l’action.
+        """
     )
 
-    if export_global_analysis_report_pdf is None:
-        st.info("Module PDF global non détecté.")
-    else:
-        if st.button("📄 Générer le rapport PDF global", use_container_width=True):
-            try:
-                pdf_path = export_global_analysis_report_pdf(
-                    summary_df=summary_df,
-                    global_tables=global_tables,
-                    detail_tables_by_eq=detail_tables_by_eq,
-                    out_dir=str(BASE_DIR / "reports"),
-                    title="Résultat analyse / optimisation / maintenance",
-                    meta={
-                        "alpha": alpha,
-                        "window_days": within_days,
-                        "start_date": str(start_dt),
-                        "n_equipment": len(summary_df),
-                    },
-                )
-                st.session_state["global_pdf_path"] = pdf_path
-                st.success(f"PDF généré : {pdf_path}")
-            except Exception as e:
-                st.error(f"PDF : {e}")
 
-        pdf_path = st.session_state.get("global_pdf_path")
-        if pdf_path and Path(pdf_path).exists():
-            with open(pdf_path, "rb") as f:
-                st.download_button(
-                    "📥 Télécharger le PDF global",
-                    data=f,
-                    file_name=Path(pdf_path).name,
-                    mime="application/pdf",
-                    use_container_width=True,
+# -------------------------------------------------------------------
+# Contrôles
+# -------------------------------------------------------------------
+control_col_1, control_col_2, control_col_3, control_col_4, control_col_5 = st.columns(5)
+with control_col_1:
+    due_window_days = st.slider("Fenêtre des tâches dues (jours)", 7, 365, 14, 1)
+with control_col_2:
+    show_all_rows = st.toggle("Afficher toutes les lignes", value=True)
+with control_col_3:
+    only_preventive_rows = st.toggle("Montrer seulement la maintenance préventive", value=False)
+with control_col_4:
+    only_globally_conformant_rows = st.toggle("Montrer seulement les cas globalement conformes", value=False)
+with control_col_5:
+    start_reference_date = st.date_input("Date de départ du planning", value=date.today())
+
+maintenance_plan = build_virtual_maintenance_plan_from_optimization(
+    optimization_dataframe=optimization_dataframe,
+    start_date=start_reference_date,
+    due_window_days=int(due_window_days),
+    show_all=bool(show_all_rows),
+    only_preventive=bool(only_preventive_rows),
+    only_globally_conformant=bool(only_globally_conformant_rows),
+    minimum_days=1,
+)
+
+if not maintenance_plan.get("ok"):
+    st.error(maintenance_plan.get("msg", "Erreur lors de la construction du plan de maintenance."))
+    st.stop()
+
+all_planned_rows = maintenance_plan.get("rows", [])
+due_rows = maintenance_plan.get("due", [])
+
+st.caption(f"Ordre de priorité des colonnes d’intervalle : {', '.join(maintenance_plan.get('interval_priority', []))}")
+st.caption(f"Nombre d’utilisations de chaque colonne d’intervalle : {maintenance_plan.get('used_cols_stats')}")
+
+metric_col_1, metric_col_2, metric_col_3, metric_col_4 = st.columns(4)
+with metric_col_1:
+    st.metric("Équipements planifiés", len(all_planned_rows))
+with metric_col_2:
+    st.metric("Tâches dues dans la fenêtre", len(due_rows))
+with metric_col_3:
+    globally_conformant_count = int(
+        pd.Series([row.get("admissible_global") for row in all_planned_rows]).fillna(False).astype(bool).sum()
+    ) if all_planned_rows else 0
+    st.metric("Plans globalement conformes", globally_conformant_count)
+with metric_col_4:
+    preventive_count = int(sum(1 for row in all_planned_rows if "préventive" in str(row.get("maintenance_type", "")).lower()))
+    st.metric("Actions préventives", preventive_count)
+
+
+# -------------------------------------------------------------------
+# Tabs
+# -------------------------------------------------------------------
+page_tabs = st.tabs([
+    "Commentaires et explications",
+    "Planning complet",
+    "Tâches dues",
+    "Recommandation finale",
+    "Exports",
+])
+
+with page_tabs[0]:
+    st.subheader("Commentaires de maintenance")
+    if all_planned_rows:
+        all_rows_dataframe = pd.DataFrame(all_planned_rows)
+        comment_dataframe = all_rows_dataframe[
+            [
+                column for column in [
+                    "equipment_code",
+                    "maintenance_type",
+                    "interval_source_readable",
+                    "interval_h",
+                    "beta",
+                    "eta_h",
+                    "thermal_status",
+                    "priority_level",
+                    "maintenance_comment",
+                ] if column in all_rows_dataframe.columns
+            ]
+        ].copy()
+        comment_dataframe = comment_dataframe.drop_duplicates(subset=["equipment_code"]).sort_values("equipment_code")
+        st.dataframe(rename_columns_for_display(comment_dataframe), use_container_width=True, hide_index=True)
+    else:
+        st.info("Aucun commentaire disponible.")
+
+with page_tabs[1]:
+    st.subheader("Planning complet")
+    if not all_planned_rows:
+        st.warning("Aucune ligne exploitable.")
+    else:
+        full_planning_dataframe = pd.DataFrame(all_planned_rows)
+        selected_columns = [
+            "equipment_code",
+            "maintenance_type",
+            "interval_source_readable",
+            "interval_h",
+            "periodicity_days",
+            "next_due_date",
+            "days_left",
+            "beta",
+            "eta_h",
+            "gamma_h",
+            "model",
+            "process_variant",
+            "distribution",
+            "FAA_max",
+            "loss_of_life_pct",
+            "thermal_status",
+            "admissible_global",
+            "priority_score",
+            "priority_level",
+            "final_decision",
+            "maintenance_comment",
+        ]
+        selected_columns = [column for column in selected_columns if column in full_planning_dataframe.columns]
+        st.dataframe(
+            rename_columns_for_display(full_planning_dataframe[selected_columns]),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+with page_tabs[2]:
+    st.subheader("Tâches dues dans la fenêtre choisie")
+    if not due_rows:
+        st.info("Aucune tâche n’arrive à échéance dans la fenêtre choisie.")
+    else:
+        due_rows_dataframe = pd.DataFrame(due_rows)
+        selected_columns = [
+            "equipment_code",
+            "maintenance_type",
+            "interval_source_readable",
+            "interval_h",
+            "next_due_date",
+            "days_left",
+            "beta",
+            "eta_h",
+            "model",
+            "process_variant",
+            "distribution",
+            "FAA_max",
+            "loss_of_life_pct",
+            "thermal_status",
+            "admissible_global",
+            "priority_score",
+            "priority_level",
+            "final_decision",
+            "maintenance_comment",
+        ]
+        selected_columns = [column for column in selected_columns if column in due_rows_dataframe.columns]
+        st.dataframe(
+            rename_columns_for_display(due_rows_dataframe[selected_columns]),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+with page_tabs[3]:
+    st.subheader("Recommandation finale")
+    if all_planned_rows:
+        ranking_dataframe = pd.DataFrame(all_planned_rows).copy()
+        if "priority_score" in ranking_dataframe.columns:
+            ranking_dataframe["priority_score"] = pd.to_numeric(ranking_dataframe["priority_score"], errors="coerce").fillna(0)
+        if "days_left" in ranking_dataframe.columns:
+            ranking_dataframe["days_left"] = pd.to_numeric(ranking_dataframe["days_left"], errors="coerce").fillna(999999)
+
+        ranking_dataframe = ranking_dataframe.sort_values(
+            ["priority_score", "days_left"],
+            ascending=[False, True],
+        )
+
+        best_row = ranking_dataframe.iloc[0].to_dict()
+
+        st.success(
+            f"Équipement prioritaire : {best_row.get('equipment_code', '—')} | "
+            f"{best_row.get('maintenance_type', '—')} | "
+            f"échéance prévue : {best_row.get('next_due_date', '—')}"
+        )
+
+        summary_rows = pd.DataFrame([
+            {
+                "equipment_code": best_row.get("equipment_code"),
+                "maintenance_type": best_row.get("maintenance_type"),
+                "model": best_row.get("model"),
+                "process_variant": best_row.get("process_variant"),
+                "distribution": best_row.get("distribution"),
+                "interval_h": best_row.get("interval_h"),
+                "days_left": best_row.get("days_left"),
+                "thermal_status": best_row.get("thermal_status"),
+                "priority_score": best_row.get("priority_score"),
+                "priority_level": best_row.get("priority_level"),
+                "final_decision": best_row.get("final_decision"),
+                "final_reason": best_row.get("final_reason"),
+            }
+        ])
+        st.dataframe(rename_columns_for_display(summary_rows), use_container_width=True, hide_index=True)
+
+        st.write(best_row.get("maintenance_comment", "Aucun commentaire disponible."))
+    else:
+        st.info("Aucune recommandation disponible.")
+
+with page_tabs[4]:
+    st.subheader("Exports")
+
+    st.session_state["pm_virtual_all"] = all_planned_rows
+    st.session_state["pm_virtual_due"] = due_rows
+
+    if all_planned_rows:
+        all_rows_dataframe = pd.DataFrame(all_planned_rows)
+        csv_bytes = rename_columns_for_display(all_rows_dataframe).to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Télécharger le planning complet au format CSV",
+            data=csv_bytes,
+            file_name="maintenance_virtual_plan.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+    include_full_planning_in_pdf = st.toggle("Inclure tout le planning dans le PDF", value=False)
+
+    if export_pm_plan_with_kits_pdf is None:
+        st.info("Le module PDF de maintenance n’est pas disponible.")
+        if maintenance_report_error_message:
+            st.caption(maintenance_report_error_message)
+    else:
+        if st.button("Générer le PDF de maintenance", use_container_width=True):
+            tasks_for_pdf = all_planned_rows if include_full_planning_in_pdf else due_rows
+            metrics_table = optimization_dataframe.to_dict("records")
+            try:
+                output_path = export_pm_plan_with_kits_pdf(
+                    tasks_due=tasks_for_pdf,
+                    kits_by_eq={},
+                    metrics_table=metrics_table,
+                    out_dir="reports",
+                    title="Plan de maintenance issu de l’optimisation",
+                    include_kits=False,
+                    tools_checklist=None,
                 )
+                st.success("PDF généré.")
+                with open(output_path, "rb") as file:
+                    st.download_button(
+                        "Télécharger le PDF de maintenance",
+                        data=file,
+                        file_name=Path(output_path).name,
+                        mime="application/pdf",
+                        use_container_width=True,
+                    )
+            except Exception as error:
+                st.error(f"PDF : {error}")
