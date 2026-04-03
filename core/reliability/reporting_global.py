@@ -68,6 +68,13 @@ def _fmt(value: Any, decimals: int = 2, default: str = "—") -> str:
         return text if text else default
 
 
+def _compact_text(value: Any, max_len: int = 120) -> str:
+    text = _san(value).replace("\n", " ").strip()
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3] + "..."
+
+
 def _require_pdf():
     if not HAVE_REPORTLAB and not HAVE_FPDF:
         raise RuntimeError("Aucun moteur PDF disponible. Installe reportlab ou fpdf2.")
@@ -102,7 +109,7 @@ def _df_to_table_data(df: pd.DataFrame, max_rows: Optional[int] = None) -> list[
             if isinstance(value, (int, float)):
                 line.append(_fmt(value, 4))
             else:
-                line.append(_san(value))
+                line.append(_compact_text(value, 100))
         data.append(line)
 
     return data
@@ -118,14 +125,22 @@ def _auto_col_widths(data: list[list[str]], total_width: float) -> list[float]:
     for row in data[:50]:
         for idx in range(ncols):
             cell = row[idx] if idx < len(row) else ""
-            lengths[idx] = max(lengths[idx], min(len(str(cell)), 70))
+            lengths[idx] = max(lengths[idx], min(len(str(cell)), 50))
 
     weights = [max(length, 8) for length in lengths]
     weight_sum = sum(weights) if sum(weights) > 0 else ncols
     widths = [(weight / weight_sum) * total_width for weight in weights]
 
-    min_width = 16 * mm
-    max_width = 65 * mm
+    if ncols <= 2:
+        min_width = 35 * mm
+        max_width = 120 * mm
+    elif ncols <= 4:
+        min_width = 28 * mm
+        max_width = 90 * mm
+    else:
+        min_width = 18 * mm
+        max_width = 65 * mm
+
     widths = [min(max(width, min_width), max_width) for width in widths]
 
     current_sum = sum(widths)
@@ -140,7 +155,7 @@ def _mk_table(data: list[list[str]], total_width: float, font_size: int = 7) -> 
     styles = getSampleStyleSheet()
 
     body_style = ParagraphStyle(
-        name=f"body_table_{font_size}",
+        name=f"body_table_{font_size}_{len(data)}",
         fontName="Helvetica",
         fontSize=font_size,
         leading=max(8, int(font_size * 1.35)),
@@ -148,7 +163,7 @@ def _mk_table(data: list[list[str]], total_width: float, font_size: int = 7) -> 
         wordWrap="CJK",
     )
     head_style = ParagraphStyle(
-        name=f"head_table_{font_size}",
+        name=f"head_table_{font_size}_{len(data)}",
         fontName="Helvetica-Bold",
         fontSize=max(font_size, 8),
         leading=max(9, int(font_size * 1.35)),
@@ -165,7 +180,12 @@ def _mk_table(data: list[list[str]], total_width: float, font_size: int = 7) -> 
 
     col_widths = _auto_col_widths(data, total_width=total_width)
 
-    table = Table(wrapped_rows, repeatRows=1, colWidths=col_widths)
+    table = Table(
+        wrapped_rows,
+        repeatRows=1,
+        colWidths=col_widths,
+        splitByRow=1,
+    )
     table.setStyle(
         TableStyle(
             [
@@ -277,7 +297,7 @@ def _table_explanation(label: str) -> str:
         "Tests d'ajustement": "Ce tableau indique comment la qualité de l'ajustement a été jugée à l'aide des tests statistiques.",
         "Paramètres fiabilistes et thermiques": "Ce tableau donne les paramètres principaux utilisés pour interpréter le comportement de l'équipement.",
         "Optimisation et maintenance retenue": "Ce tableau explique l'intervalle choisi et le type de maintenance recommandé.",
-        "Traçabilité détaillée de la décision finale": "Ce tableau montre quels paramètres ont réellement pesé dans la décision finale et comment chacun est intervenu.",
+        "Traçabilité détaillée de la décision finale": "Ce tableau montre quels paramètres ont pesé dans la décision finale et comment chacun est intervenu.",
         "Tableau technique des tests de tendance": "Ce tableau technique affiche les résultats bruts des tests de tendance.",
         "Tableau technique des tests de dépendance": "Ce tableau technique affiche les résultats bruts des tests de dépendance.",
         "Tableau technique du choix du processus": "Ce tableau technique récapitule la logique métier utilisée pour choisir le processus.",
@@ -296,12 +316,12 @@ def _to_vertical_table(df: pd.DataFrame) -> pd.DataFrame:
 
     rows: List[Dict[str, Any]] = []
     for row_index, (_, row) in enumerate(df.iterrows(), start=1):
-        row_prefix = f"Ligne {row_index} - " if len(df) > 1 else ""
+        prefix = f"Ligne {row_index} - " if len(df) > 1 else ""
         for column_name, value in row.items():
             rows.append(
                 {
-                    "Champ": f"{row_prefix}{column_name}",
-                    "Valeur": value,
+                    "Champ": f"{prefix}{column_name}",
+                    "Valeur": _compact_text(value, 140),
                 }
             )
     return pd.DataFrame(rows)
@@ -310,7 +330,7 @@ def _to_vertical_table(df: pd.DataFrame) -> pd.DataFrame:
 def _split_dataframe_columns(
     df: pd.DataFrame,
     fixed_columns: Optional[List[str]] = None,
-    max_columns_per_part: int = 6,
+    max_columns_per_part: int = 5,
 ) -> List[Tuple[str, pd.DataFrame]]:
     if df is None or df.empty:
         return [("Tableau", pd.DataFrame())]
@@ -325,13 +345,13 @@ def _split_dataframe_columns(
     chunks: List[Tuple[str, pd.DataFrame]] = []
 
     start = 0
-    part_index = 1
+    index = 1
     while start < len(other_columns):
         end = start + available_for_other
-        part_columns = fixed_columns + other_columns[start:end]
-        chunks.append((f"Partie {part_index}", df[part_columns].copy()))
+        current_columns = fixed_columns + other_columns[start:end]
+        chunks.append((f"Partie {index}", df[current_columns].copy()))
         start = end
-        part_index += 1
+        index += 1
 
     return chunks
 
@@ -354,15 +374,17 @@ def _render_table_block(
     if max_rows is not None:
         work = work.head(max_rows)
 
-    if len(work.columns) > 8 and len(work) <= 3:
+    # Cas très large -> vertical si peu de lignes
+    if len(work.columns) > 8 and len(work) <= 5:
         work = _to_vertical_table(work)
-
-    if len(work.columns) > 8:
-        parts = _split_dataframe_columns(work, fixed_columns=fixed_columns, max_columns_per_part=6)
+        story.append(_mk_table(_df_to_table_data(work), total_width=total_width, font_size=7))
+        story.append(Spacer(1, 4))
+    # Cas large -> découpage
+    elif len(work.columns) > 8:
+        parts = _split_dataframe_columns(work, fixed_columns=fixed_columns, max_columns_per_part=5)
         for part_label, part_df in parts:
             story.append(Paragraph(_san(part_label), styles["Heading3"]))
-            font_size = 7 if len(part_df.columns) <= 5 else 6
-            story.append(_mk_table(_df_to_table_data(part_df), total_width=total_width, font_size=font_size))
+            story.append(_mk_table(_df_to_table_data(part_df), total_width=total_width, font_size=6))
             story.append(Spacer(1, 4))
     else:
         font_size = 7 if len(work.columns) <= 5 else 6
@@ -519,16 +541,6 @@ def export_global_analysis_report_pdf(
         )
     )
 
-    styles.add(
-        ParagraphStyle(
-            name="TinyBody",
-            fontName="Helvetica",
-            fontSize=8,
-            leading=10,
-            alignment=TA_LEFT,
-        )
-    )
-
     doc = SimpleDocTemplate(
         str(out_path),
         pagesize=landscape(A4),
@@ -626,7 +638,7 @@ def export_global_analysis_report_pdf(
         ("trend_results", "Tableau technique des tests de tendance", None),
         ("dependence_results", "Tableau technique des tests de dépendance", None),
         ("process_choice", "Tableau technique du choix du processus", None),
-        ("fit_candidates", "Tableau technique des lois candidates", ["Modèle"] if "Modèle" else None),
+        ("fit_candidates", "Tableau technique des lois candidates", ["Modèle"]),
         ("reliability_summary", "Synthèse fiabiliste", None),
         ("thermal_summary", "Synthèse thermique", None),
         ("thermal_table_indicators", "Indicateurs thermiques", None),
