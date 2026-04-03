@@ -1409,7 +1409,7 @@ with page_tab_3:
                     global_tables=global_tables,
                     detail_tables_by_eq=detail_tables_by_equipment,
                     out_dir=str(BASE_DIR / "reports"),
-                    title="Résultat analyse optimisation maintenance",
+                    title="Résultat global de l'analyse  et de l'optimisation de maintenance",
                     meta={
                         "alpha": alpha_value,
                         "window_days": due_window_days,

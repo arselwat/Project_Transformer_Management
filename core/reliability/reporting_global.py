@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List, Tuple
 
 import pandas as pd
 
 try:
-    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.pagesizes import A4, landscape
     from reportlab.lib import colors
     from reportlab.lib.units import mm
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -108,25 +108,24 @@ def _df_to_table_data(df: pd.DataFrame, max_rows: Optional[int] = None) -> list[
     return data
 
 
-def _auto_col_widths(data: list[list[str]], total_width: float = 180 * mm) -> list[float]:
+def _auto_col_widths(data: list[list[str]], total_width: float) -> list[float]:
     if not data:
         return []
 
     ncols = max(len(row) for row in data)
     lengths = [8] * ncols
 
-    for row in data[:40]:
+    for row in data[:50]:
         for idx in range(ncols):
             cell = row[idx] if idx < len(row) else ""
-            lengths[idx] = max(lengths[idx], min(len(str(cell)), 80))
+            lengths[idx] = max(lengths[idx], min(len(str(cell)), 70))
 
     weights = [max(length, 8) for length in lengths]
     weight_sum = sum(weights) if sum(weights) > 0 else ncols
-
     widths = [(weight / weight_sum) * total_width for weight in weights]
 
-    min_width = 18 * mm
-    max_width = 58 * mm
+    min_width = 16 * mm
+    max_width = 65 * mm
     widths = [min(max(width, min_width), max_width) for width in widths]
 
     current_sum = sum(widths)
@@ -137,22 +136,22 @@ def _auto_col_widths(data: list[list[str]], total_width: float = 180 * mm) -> li
     return widths
 
 
-def _mk_table(data: list[list[str]], font_size: int = 7) -> Table:
+def _mk_table(data: list[list[str]], total_width: float, font_size: int = 7) -> Table:
     styles = getSampleStyleSheet()
 
     body_style = ParagraphStyle(
-        name="body_table",
+        name=f"body_table_{font_size}",
         fontName="Helvetica",
         fontSize=font_size,
-        leading=max(9, int(font_size * 1.35)),
+        leading=max(8, int(font_size * 1.35)),
         alignment=TA_LEFT,
         wordWrap="CJK",
     )
     head_style = ParagraphStyle(
-        name="head_table",
+        name=f"head_table_{font_size}",
         fontName="Helvetica-Bold",
         fontSize=max(font_size, 8),
-        leading=max(10, int(font_size * 1.4)),
+        leading=max(9, int(font_size * 1.35)),
         alignment=TA_CENTER,
         wordWrap="CJK",
     )
@@ -164,7 +163,7 @@ def _mk_table(data: list[list[str]], font_size: int = 7) -> Table:
             [Paragraph(_san(cell).replace("\n", "<br/>"), style) for cell in row]
         )
 
-    col_widths = _auto_col_widths(data)
+    col_widths = _auto_col_widths(data, total_width=total_width)
 
     table = Table(wrapped_rows, repeatRows=1, colWidths=col_widths)
     table.setStyle(
@@ -174,8 +173,8 @@ def _mk_table(data: list[list[str]], font_size: int = 7) -> Table:
                 ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
                 ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#D1D5DB")),
                 ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("LEFTPADDING", (0, 0), (-1, -1), 4),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                ("LEFTPADDING", (0, 0), (-1, -1), 3),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 3),
                 ("TOPPADDING", (0, 0), (-1, -1), 3),
                 ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
                 ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F8FAFC")]),
@@ -263,6 +262,125 @@ def _thermal_influence_for_row(row: Dict[str, Any]) -> str:
     )
 
 
+def _table_explanation(label: str) -> str:
+    explanations = {
+        "Décision finale hiérarchisée": "Ce tableau classe les équipements selon la priorité finale de traitement et résume la décision retenue.",
+        "Synthèse globale": "Ce tableau regroupe l'ensemble des résultats utiles à la lecture générale : fiabilité, thermique, optimisation et décision finale.",
+        "Vue d'ensemble des tendances et dépendances": "Ce tableau montre si les données présentent une tendance et si les défaillances successives se comportent comme des événements dépendants.",
+        "Vue d'ensemble des tests d'ajustement": "Ce tableau résume la qualité d'ajustement du modèle retenu à partir des critères statistiques.",
+        "Vue d'ensemble fiabilité et thermique": "Ce tableau relie les paramètres fiabilistes aux indicateurs thermiques pour chaque équipement.",
+        "Vue d'ensemble optimisation et maintenance": "Ce tableau présente les intervalles calculés et la recommandation de maintenance retenue.",
+        "Tâches dues": "Ce tableau liste les interventions dont l'échéance est proche dans la fenêtre choisie.",
+        "Validation des tests de tendance": "Ce tableau explique comment la présence ou non d'une tendance a été déterminée.",
+        "Validation des tests de dépendance": "Ce tableau explique comment la dépendance entre défaillances successives a été évaluée.",
+        "Choix du processus et du modèle": "Ce tableau justifie le processus fiabiliste retenu et la loi utilisée.",
+        "Tests d'ajustement": "Ce tableau indique comment la qualité de l'ajustement a été jugée à l'aide des tests statistiques.",
+        "Paramètres fiabilistes et thermiques": "Ce tableau donne les paramètres principaux utilisés pour interpréter le comportement de l'équipement.",
+        "Optimisation et maintenance retenue": "Ce tableau explique l'intervalle choisi et le type de maintenance recommandé.",
+        "Traçabilité détaillée de la décision finale": "Ce tableau montre quels paramètres ont réellement pesé dans la décision finale et comment chacun est intervenu.",
+        "Tableau technique des tests de tendance": "Ce tableau technique affiche les résultats bruts des tests de tendance.",
+        "Tableau technique des tests de dépendance": "Ce tableau technique affiche les résultats bruts des tests de dépendance.",
+        "Tableau technique du choix du processus": "Ce tableau technique récapitule la logique métier utilisée pour choisir le processus.",
+        "Tableau technique des lois candidates": "Ce tableau compare les différentes lois candidates avant de retenir le meilleur ajustement.",
+        "Synthèse fiabiliste": "Ce tableau résume les sorties principales du modèle de fiabilité retenu.",
+        "Synthèse thermique": "Ce tableau résume les principaux indicateurs thermiques calculés.",
+        "Indicateurs thermiques": "Ce tableau détaille les indicateurs thermiques les plus importants pour la décision.",
+        "Jours thermiquement critiques": "Ce tableau met en évidence les jours où la contrainte thermique a été la plus élevée.",
+    }
+    return explanations.get(label, "Ce tableau présente les résultats associés à cette partie du rapport.")
+
+
+def _to_vertical_table(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    rows: List[Dict[str, Any]] = []
+    for row_index, (_, row) in enumerate(df.iterrows(), start=1):
+        row_prefix = f"Ligne {row_index} - " if len(df) > 1 else ""
+        for column_name, value in row.items():
+            rows.append(
+                {
+                    "Champ": f"{row_prefix}{column_name}",
+                    "Valeur": value,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def _split_dataframe_columns(
+    df: pd.DataFrame,
+    fixed_columns: Optional[List[str]] = None,
+    max_columns_per_part: int = 6,
+) -> List[Tuple[str, pd.DataFrame]]:
+    if df is None or df.empty:
+        return [("Tableau", pd.DataFrame())]
+
+    fixed_columns = [col for col in (fixed_columns or []) if col in df.columns]
+    other_columns = [col for col in df.columns if col not in fixed_columns]
+
+    if len(df.columns) <= max_columns_per_part:
+        return [("Tableau complet", df)]
+
+    available_for_other = max(1, max_columns_per_part - len(fixed_columns))
+    chunks: List[Tuple[str, pd.DataFrame]] = []
+
+    start = 0
+    part_index = 1
+    while start < len(other_columns):
+        end = start + available_for_other
+        part_columns = fixed_columns + other_columns[start:end]
+        chunks.append((f"Partie {part_index}", df[part_columns].copy()))
+        start = end
+        part_index += 1
+
+    return chunks
+
+
+def _render_table_block(
+    story: list,
+    label: str,
+    df: pd.DataFrame,
+    styles,
+    total_width: float,
+    max_rows: int = 25,
+    fixed_columns: Optional[List[str]] = None,
+):
+    if df is None or df.empty:
+        return
+
+    story.append(Paragraph(_san(label), styles["Heading2"]))
+
+    work = df.copy()
+    if max_rows is not None:
+        work = work.head(max_rows)
+
+    if len(work.columns) > 8 and len(work) <= 3:
+        work = _to_vertical_table(work)
+
+    if len(work.columns) > 8:
+        parts = _split_dataframe_columns(work, fixed_columns=fixed_columns, max_columns_per_part=6)
+        for part_label, part_df in parts:
+            story.append(Paragraph(_san(part_label), styles["Heading3"]))
+            font_size = 7 if len(part_df.columns) <= 5 else 6
+            story.append(_mk_table(_df_to_table_data(part_df), total_width=total_width, font_size=font_size))
+            story.append(Spacer(1, 4))
+    else:
+        font_size = 7 if len(work.columns) <= 5 else 6
+        story.append(_mk_table(_df_to_table_data(work), total_width=total_width, font_size=font_size))
+        story.append(Spacer(1, 4))
+
+    story.append(
+        Paragraph(
+            _san("Explication : " + _table_explanation(label)),
+            styles["SmallBody"],
+        )
+    )
+    story.append(Spacer(1, 8))
+
+
+# ---------------------------------------------------------------------
+# Fallback FPDF
+# ---------------------------------------------------------------------
 def _fallback_fpdf(
     summary_df: pd.DataFrame,
     global_tables: Dict[str, pd.DataFrame],
@@ -278,7 +396,7 @@ def _fallback_fpdf(
     out_dir.mkdir(exist_ok=True, parents=True)
     out_path = out_dir / f"global_analysis_{datetime.now().strftime('%Y%m%d-%H%M')}.pdf"
 
-    pdf = FPDF()
+    pdf = FPDF(orientation="L", unit="mm", format="A4")
     pdf.set_auto_page_break(auto=True, margin=12)
     pdf.add_page()
 
@@ -324,23 +442,8 @@ def _fallback_fpdf(
                     f"décision={row.get('decision_finale', '')} | motif={row.get('motif_decision', '')}"
                 ),
             )
+        pdf.multi_cell(0, 5, _san("Explication : " + _table_explanation("Décision finale hiérarchisée")))
         pdf.ln(2)
-
-    pdf.set_font("Arial", "B", 11)
-    pdf.cell(0, 6, "Synthèse par équipement", ln=1)
-    pdf.set_font("Arial", "", 9)
-    for _, row in summary_df.head(30).iterrows():
-        pdf.multi_cell(
-            0,
-            5,
-            _san(
-                f"- {row.get('equipment_code', '')} | processus={row.get('model', '')} | "
-                f"loi={row.get('distribution', '')} | bêta={_fmt(row.get('beta'), 2)} | "
-                f"thermique={row.get('thermal_status', '')} | maintenance={row.get('maintenance_type', '')} | "
-                f"score={row.get('priority_score', '')}"
-            ),
-        )
-    pdf.ln(2)
 
     for eq, tables in detail_tables_by_eq.items():
         matching = summary_df[summary_df["equipment_code"].astype(str) == str(eq)]
@@ -360,23 +463,24 @@ def _fallback_fpdf(
         )
         pdf.multi_cell(0, 5, _san(_thermal_influence_for_row(row)))
 
-        for key in [
-            "trace_trend",
-            "trace_dependence",
-            "trace_model_choice",
-            "trace_goodness_of_fit",
-            "trace_parameters",
-            "trace_optimization",
-            "trace_final_decision",
+        for key, label in [
+            ("trace_trend", "Validation des tests de tendance"),
+            ("trace_dependence", "Validation des tests de dépendance"),
+            ("trace_model_choice", "Choix du processus et du modèle"),
+            ("trace_goodness_of_fit", "Tests d'ajustement"),
+            ("trace_parameters", "Paramètres fiabilistes et thermiques"),
+            ("trace_optimization", "Optimisation et maintenance retenue"),
+            ("trace_final_decision", "Traçabilité détaillée de la décision finale"),
         ]:
             df = tables.get(key)
             if isinstance(df, pd.DataFrame) and not df.empty:
                 pdf.ln(1)
                 pdf.set_font("Arial", "B", 10)
-                pdf.multi_cell(0, 5, _san(key))
+                pdf.multi_cell(0, 5, _san(label))
                 pdf.set_font("Arial", "", 9)
                 for _, r in df.head(25).iterrows():
                     pdf.multi_cell(0, 5, _san(" | ".join([f"{c}={r[c]}" for c in df.columns])))
+                pdf.multi_cell(0, 5, _san("Explication : " + _table_explanation(label)))
 
     pdf.output(str(out_path))
     return str(out_path)
@@ -390,7 +494,7 @@ def export_global_analysis_report_pdf(
     global_tables: Dict[str, pd.DataFrame],
     detail_tables_by_eq: Dict[str, Dict[str, pd.DataFrame]],
     out_dir: str | Path = "reports",
-    title: str = "Résultat analyse / optimisation / maintenance",
+    title: str = "Résultat global de l'analyse et optimisation",
     meta: Optional[Dict[str, Any]] = None,
 ) -> str:
     _require_pdf()
@@ -415,16 +519,28 @@ def export_global_analysis_report_pdf(
         )
     )
 
-    story = []
+    styles.add(
+        ParagraphStyle(
+            name="TinyBody",
+            fontName="Helvetica",
+            fontSize=8,
+            leading=10,
+            alignment=TA_LEFT,
+        )
+    )
 
     doc = SimpleDocTemplate(
         str(out_path),
-        pagesize=A4,
-        topMargin=18 * mm,
-        bottomMargin=15 * mm,
-        leftMargin=14 * mm,
-        rightMargin=14 * mm,
+        pagesize=landscape(A4),
+        topMargin=14 * mm,
+        bottomMargin=12 * mm,
+        leftMargin=10 * mm,
+        rightMargin=10 * mm,
     )
+
+    usable_width = landscape(A4)[0] - (doc.leftMargin + doc.rightMargin)
+
+    story = []
 
     # -----------------------------------------------------------------
     # Titre
@@ -469,23 +585,27 @@ def export_global_analysis_report_pdf(
     # Tableaux globaux
     # -----------------------------------------------------------------
     ordered_global = [
-        (("Decision_finale", "final_decision"), "Décision finale hiérarchisée"),
-        (("Synthese_globale", "global_summary"), "Synthèse globale"),
-        (("Vue_tendance", "trend_overview"), "Vue d'ensemble des tendances et dépendances"),
-        (("Vue_ajustement", "goodness_overview"), "Vue d'ensemble des tests d'ajustement"),
-        (("Vue_risque", "risk_overview"), "Vue d'ensemble fiabilité et thermique"),
-        (("Vue_optimisation", "optimization_overview"), "Vue d'ensemble optimisation et maintenance"),
-        (("Taches_dues", "due_tasks"), "Tâches dues"),
+        (("Decision_finale", "final_decision"), "Décision finale hiérarchisée", ["equipment_code"]),
+        (("Synthese_globale", "global_summary"), "Synthèse globale", ["equipment_code"]),
+        (("Vue_tendance", "trend_overview"), "Vue d'ensemble des tendances et dépendances", ["equipment_code"]),
+        (("Vue_ajustement", "goodness_overview"), "Vue d'ensemble des tests d'ajustement", ["equipment_code"]),
+        (("Vue_risque", "risk_overview"), "Vue d'ensemble fiabilité et thermique", ["equipment_code"]),
+        (("Vue_optimisation", "optimization_overview"), "Vue d'ensemble optimisation et maintenance", ["equipment_code"]),
+        (("Taches_dues", "due_tasks"), "Tâches dues", ["equipment_code"]),
     ]
 
-    for candidate_names, label in ordered_global:
+    for candidate_names, label, fixed_columns in ordered_global:
         df = _get_table(global_tables, *candidate_names)
         if not df.empty:
-            story.append(Paragraph(_san(label), styles["Heading2"]))
-            font_size = 6 if len(df.columns) >= 10 else 7
-            max_rows = 40 if label != "Tâches dues" else 25
-            story.append(_mk_table(_df_to_table_data(df, max_rows=max_rows), font_size=font_size))
-            story.append(Spacer(1, 8))
+            _render_table_block(
+                story=story,
+                label=label,
+                df=df,
+                styles=styles,
+                total_width=usable_width,
+                max_rows=40 if label != "Tâches dues" else 25,
+                fixed_columns=fixed_columns,
+            )
 
     story.append(PageBreak())
 
@@ -496,21 +616,21 @@ def export_global_analysis_report_pdf(
     story.append(Spacer(1, 6))
 
     ordered_trace_tables = [
-        ("trace_trend", "Validation des tests de tendance"),
-        ("trace_dependence", "Validation des tests de dépendance"),
-        ("trace_model_choice", "Choix du processus et du modèle"),
-        ("trace_goodness_of_fit", "Tests d'ajustement"),
-        ("trace_parameters", "Paramètres fiabilistes et thermiques"),
-        ("trace_optimization", "Optimisation et maintenance retenue"),
-        ("trace_final_decision", "Traçabilité détaillée de la décision finale"),
-        ("trend_results", "Tableau technique des tests de tendance"),
-        ("dependence_results", "Tableau technique des tests de dépendance"),
-        ("process_choice", "Tableau technique du choix du processus"),
-        ("fit_candidates", "Tableau technique des lois candidates"),
-        ("reliability_summary", "Synthèse fiabiliste"),
-        ("thermal_summary", "Synthèse thermique"),
-        ("thermal_table_indicators", "Indicateurs thermiques"),
-        ("thermal_top5_days", "Jours thermiquement critiques"),
+        ("trace_trend", "Validation des tests de tendance", None),
+        ("trace_dependence", "Validation des tests de dépendance", None),
+        ("trace_model_choice", "Choix du processus et du modèle", None),
+        ("trace_goodness_of_fit", "Tests d'ajustement", None),
+        ("trace_parameters", "Paramètres fiabilistes et thermiques", None),
+        ("trace_optimization", "Optimisation et maintenance retenue", None),
+        ("trace_final_decision", "Traçabilité détaillée de la décision finale", None),
+        ("trend_results", "Tableau technique des tests de tendance", None),
+        ("dependence_results", "Tableau technique des tests de dépendance", None),
+        ("process_choice", "Tableau technique du choix du processus", None),
+        ("fit_candidates", "Tableau technique des lois candidates", ["Modèle"] if "Modèle" else None),
+        ("reliability_summary", "Synthèse fiabiliste", None),
+        ("thermal_summary", "Synthèse thermique", None),
+        ("thermal_table_indicators", "Indicateurs thermiques", None),
+        ("thermal_top5_days", "Jours thermiquement critiques", ["date"]),
     ]
 
     equipment_codes = list(detail_tables_by_eq.keys())
@@ -539,14 +659,18 @@ def export_global_analysis_report_pdf(
         story.append(Paragraph(_san(_thermal_influence_for_row(summary_row)), styles["SmallBody"]))
         story.append(Spacer(1, 6))
 
-        for key, label in ordered_trace_tables:
+        for key, label, fixed_columns in ordered_trace_tables:
             df = tables.get(key)
             if isinstance(df, pd.DataFrame) and not df.empty:
-                story.append(Paragraph(_san(label), styles["Heading3"]))
-                font_size = 6 if len(df.columns) >= 4 else 7
-                max_rows = 25 if key != "fit_candidates" else 12
-                story.append(_mk_table(_df_to_table_data(df, max_rows=max_rows), font_size=font_size))
-                story.append(Spacer(1, 6))
+                _render_table_block(
+                    story=story,
+                    label=label,
+                    df=df,
+                    styles=styles,
+                    total_width=usable_width,
+                    max_rows=25 if key != "fit_candidates" else 12,
+                    fixed_columns=fixed_columns,
+                )
 
         if index < len(equipment_codes) - 1:
             story.append(PageBreak())
