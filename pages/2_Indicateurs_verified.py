@@ -310,13 +310,13 @@ def compute_rp_curve(
         return None
 
     try:
-        if curve_name == "non_event_probability":
+        if curve_name == "survival":
             values = distribution_object.sf(time_axis, *distribution_parameters)
-        elif curve_name == "cumulative_probability":
+        elif curve_name == "cdf":
             values = distribution_object.cdf(time_axis, *distribution_parameters)
-        elif curve_name == "density":
+        elif curve_name == "pdf":
             values = distribution_object.pdf(time_axis, *distribution_parameters)
-        elif curve_name == "intensity":
+        elif curve_name == "hazard":
             survival_values = distribution_object.sf(time_axis, *distribution_parameters)
             density_values = distribution_object.pdf(time_axis, *distribution_parameters)
             values = np.divide(
@@ -325,7 +325,7 @@ def compute_rp_curve(
                 out=np.full_like(density_values, np.nan, dtype=float),
                 where=survival_values > 1e-12,
             )
-        elif curve_name == "cumulative_events":
+        elif curve_name == "cum_mean_events":
             indicators = reliability_result.get("indicators", {}) or {}
             mean_time_between_failures = safe_float(
                 indicators.get("theoretical_mttf_h") or indicators.get("empirical_mttf_h"),
@@ -350,26 +350,28 @@ def compute_nhpp_curve(
     parameters = reliability_result.get("params", {}) or {}
     beta_value = safe_float(parameters.get("beta"), None)
     eta_value = safe_float(parameters.get("eta"), None)
+
     if beta_value is None or eta_value is None or beta_value <= 0 or eta_value <= 0:
         return None
 
     safe_time_axis = np.maximum(time_axis, 1e-6)
-    cumulative_mean = (safe_time_axis / eta_value) ** beta_value
-    intensity = (beta_value / eta_value) * ((safe_time_axis / eta_value) ** (beta_value - 1.0))
-    non_event_probability = np.exp(-cumulative_mean)
-    cumulative_probability = 1.0 - non_event_probability
-    density = intensity * non_event_probability
 
-    if curve_name == "non_event_probability":
-        return non_event_probability
-    if curve_name == "cumulative_probability":
+    mean_cumulative_events = (safe_time_axis / eta_value) ** beta_value
+    intensity = (beta_value / eta_value) * ((safe_time_axis / eta_value) ** (beta_value - 1.0))
+    survival_like = np.exp(-mean_cumulative_events)
+    cumulative_probability = 1.0 - survival_like
+    density_like = intensity * survival_like
+
+    if curve_name == "survival":
+        return survival_like
+    if curve_name == "cdf":
         return cumulative_probability
-    if curve_name == "density":
-        return density
-    if curve_name == "intensity":
+    if curve_name == "pdf":
+        return density_like
+    if curve_name == "hazard":
         return intensity
-    if curve_name == "cumulative_events":
-        return cumulative_mean
+    if curve_name == "cum_mean_events":
+        return mean_cumulative_events
 
     return None
 
@@ -408,19 +410,19 @@ def compute_bpp_curve(
         trapezoids = 0.5 * (intensity[1:] + intensity[:-1]) * delta
         cumulative_intensity[1:] = np.cumsum(trapezoids)
 
-    non_event_probability = np.exp(-cumulative_intensity)
-    cumulative_probability = 1.0 - non_event_probability
-    density = intensity * non_event_probability
+    survival_like = np.exp(-cumulative_intensity)
+    cumulative_probability = 1.0 - survival_like
+    density_like = intensity * survival_like
 
-    if curve_name == "non_event_probability":
-        return non_event_probability
-    if curve_name == "cumulative_probability":
+    if curve_name == "survival":
+        return survival_like
+    if curve_name == "cdf":
         return cumulative_probability
-    if curve_name == "density":
-        return density
-    if curve_name == "intensity":
+    if curve_name == "pdf":
+        return density_like
+    if curve_name == "hazard":
         return intensity
-    if curve_name == "cumulative_events":
+    if curve_name == "cum_mean_events":
         return cumulative_intensity
 
     return None
@@ -450,83 +452,107 @@ def build_curve_explanation(
 ) -> str:
     model_name = str(reliability_result.get("model") or "").upper()
 
-    if curve_name == "non_event_probability":
+    if curve_name == "survival":
         if model_name == "RP":
-            return (
-                "Cette courbe représente la probabilité qu’aucune défaillance ne survienne avant un temps donné. "
-                "Dans un processus de renouvellement, elle correspond à la fonction classique de fiabilité."
-            )
+            return "R(t) représente la probabilité qu’aucune défaillance ne survienne avant le temps t."
         if model_name == "NHPP":
-            return (
-                "Cette courbe représente ici la probabilité qu’aucun événement ne soit observé jusqu’au temps considéré "
-                "dans un processus de Poisson non homogène. Ce n’est pas une fiabilité au sens strict d’un système non réparable, "
-                "mais une probabilité de non-apparition d’événement."
-            )
-        return (
-            "Cette courbe représente une probabilité conditionnelle de non-apparition d’un nouvel événement, "
-            "calculée à partir de l’intensité estimée du processus avec dépendance."
-        )
+            return "Ici, la courbe joue le rôle d’une probabilité de non-événement jusqu’au temps t dans un processus non homogène."
+        return "Ici, la courbe représente une probabilité conditionnelle de non-événement compte tenu de la dépendance entre événements."
 
-    if curve_name == "cumulative_probability":
+    if curve_name == "cdf":
         if model_name == "RP":
-            return (
-                "Cette courbe représente la probabilité cumulée qu’une défaillance soit déjà survenue avant le temps considéré."
-            )
+            return "F(t) représente la probabilité cumulée qu’une défaillance soit déjà survenue avant le temps t."
         if model_name == "NHPP":
-            return (
-                "Cette courbe représente la probabilité cumulée d’avoir observé au moins un événement jusqu’au temps considéré "
-                "dans le processus non homogène."
-            )
-        return (
-            "Cette courbe représente une probabilité cumulée conditionnelle d’apparition d’au moins un événement "
-            "dans le processus avec dépendance."
-        )
+            return "Ici, F(t) représente la probabilité cumulée d’avoir observé au moins un événement avant le temps t."
+        return "Ici, F(t) représente une probabilité cumulée conditionnelle d’apparition d’au moins un événement."
 
-    if curve_name == "density":
+    if curve_name == "pdf":
         if model_name == "RP":
-            return (
-                "Cette courbe montre où se concentrent les durées les plus probables entre deux défaillances."
-            )
+            return "f(t) montre dans quelles zones de temps les défaillances sont les plus probables."
         if model_name == "NHPP":
-            return (
-                "Cette courbe représente la densité du premier événement dans un processus non homogène. "
-                "Elle combine l’intensité instantanée et la probabilité de n’avoir encore rien observé avant cet instant."
-            )
-        return (
-            "Cette courbe représente une densité conditionnelle du premier nouvel événement selon l’intensité estimée du processus avec dépendance."
-        )
+            return "Ici, f(t) représente une densité du premier événement dans le processus non homogène."
+        return "Ici, f(t) représente une densité conditionnelle d’apparition d’un événement."
 
-    if curve_name == "intensity":
+    if curve_name == "hazard":
         if model_name == "RP":
-            return (
-                "Cette courbe représente le taux instantané de défaillance : plus il est élevé, plus le risque immédiat de défaillance est fort."
-            )
+            return "h(t) est le taux instantané de défaillance : plus il est élevé, plus le risque immédiat de défaillance est fort."
         if model_name == "NHPP":
-            return (
-                "Cette courbe représente l’intensité instantanée d’apparition des événements dans le temps. "
-                "Elle montre si le processus s’accélère ou ralentit."
-            )
-        return (
-            "Cette courbe représente l’intensité conditionnelle du processus avec dépendance : "
-            "elle dépend du fond de processus et de l’effet des événements passés."
-        )
+            return "λ(t) est l’intensité instantanée du processus : elle montre si l’arrivée des événements s’accélère ou ralentit."
+        return "λ(t) est l’intensité conditionnelle du processus avec dépendance : elle dépend aussi des événements passés."
 
-    if curve_name == "cumulative_events":
+    if curve_name == "cum_mean_events":
         if model_name == "RP":
-            return (
-                "Cette courbe donne une approximation du nombre cumulé moyen d’événements, "
-                "obtenue en divisant le temps par la durée moyenne entre défaillances."
-            )
+            return "Cette courbe donne une approximation du nombre cumulé moyen de défaillances."
         if model_name == "NHPP":
-            return (
-                "Cette courbe représente le nombre cumulé moyen d’événements attendu selon le modèle non homogène."
-            )
-        return (
-            "Cette courbe représente l’intensité cumulée du processus avec dépendance, "
-            "qui sert ici d’approximation du cumul attendu des événements."
-        )
+            return "m(t) représente le nombre cumulé moyen d’événements attendu dans le modèle non homogène."
+        return "Cette courbe représente l’intensité cumulée ou le cumul moyen conditionnel des événements."
 
     return "Courbe non documentée."
+
+
+def build_time_horizon_for_equipment(
+    reliability_result: Dict[str, Any],
+    ttf_series: list[float],
+) -> float:
+    model_name = str(reliability_result.get("model") or "").upper()
+    parameters = reliability_result.get("params", {}) or {}
+
+    values = np.asarray(ttf_series, dtype=float)
+    values = values[np.isfinite(values)]
+    values = values[values > 0]
+
+    if values.size == 0:
+        return 100.0
+
+    max_ttf = float(np.max(values))
+    mean_ttf = float(np.mean(values))
+    q90_ttf = float(np.quantile(values, 0.90))
+
+    eta_value = safe_float(parameters.get("eta"), None)
+
+    base_horizon = max(
+        50.0,
+        max_ttf * 2.0,
+        mean_ttf * 6.0,
+        q90_ttf * 4.0,
+    )
+
+    if model_name == "RP":
+        if eta_value is not None and eta_value > 0:
+            return max(base_horizon, eta_value * 1.5)
+        return base_horizon
+
+    if model_name == "NHPP":
+        nhpp_horizon = base_horizon
+        if eta_value is not None and eta_value > 0:
+            nhpp_horizon = min(base_horizon, eta_value * 1.25)
+        return max(25.0, nhpp_horizon)
+
+    if model_name == "BPP":
+        return base_horizon
+
+    return base_horizon
+
+
+def build_group_time_horizon(
+    results_by_equipment: Dict[str, Dict[str, Any]],
+    ttf_series_by_equipment: Dict[str, list[float]],
+    equipment_codes: list[str],
+) -> float:
+    horizons = []
+    for equipment_code in equipment_codes:
+        result = results_by_equipment.get(equipment_code, {})
+        reliability_result = result.get("reliability", {}) or {}
+        ttf_series = ttf_series_by_equipment.get(equipment_code, [])
+        horizons.append(build_time_horizon_for_equipment(reliability_result, ttf_series))
+
+    if not horizons:
+        return 100.0
+
+    if len(horizons) == 1:
+        return float(horizons[0])
+
+    return float(np.quantile(np.asarray(horizons, dtype=float), 0.75))
 
 
 def export_tables_to_excel(results_by_equipment: Dict[str, Dict[str, Any]]) -> bytes:
@@ -920,55 +946,58 @@ with page_tabs[5]:
             + ", ".join(equipment_without_curves)
         )
 
-    maximum_time_candidates = []
-    for equipment_code, ttf_series in ttf_series_by_equipment.items():
-        if ttf_series:
-            maximum_time_candidates.append(float(np.max(np.asarray(ttf_series, dtype=float))))
-            maximum_time_candidates.append(float(np.sum(np.asarray(ttf_series, dtype=float))))
+    compare_all_equipment = st.toggle(
+        "Comparer tous les équipements sur les courbes",
+        value=False,
+        help="Décoche pour lire plus clairement les courbes de l’équipement sélectionné.",
+    )
 
-        reliability_result = (results_by_equipment.get(equipment_code, {}) or {}).get("reliability", {}) or {}
-        parameters = reliability_result.get("params", {}) or {}
-        eta_value = safe_float(parameters.get("eta"), None)
-        if eta_value is not None and eta_value > 0:
-            maximum_time_candidates.append(eta_value * 2.0)
+    if compare_all_equipment:
+        equipment_codes_for_plots = list(results_by_equipment.keys())
+    else:
+        equipment_codes_for_plots = [selected_equipment_for_detail]
 
-    maximum_time_value = max(maximum_time_candidates) if maximum_time_candidates else 1000.0
-    maximum_time_value = max(100.0, maximum_time_value)
-    time_axis = np.linspace(1e-6, maximum_time_value, 400)
+    time_horizon = build_group_time_horizon(
+        results_by_equipment=results_by_equipment,
+        ttf_series_by_equipment=ttf_series_by_equipment,
+        equipment_codes=equipment_codes_for_plots,
+    )
+    time_axis = np.linspace(1e-6, time_horizon, 400)
 
     selected_reliability_result = (results_by_equipment.get(selected_equipment_for_detail, {}) or {}).get("reliability", {}) or {}
 
     curve_definitions = [
         (
-            "non_event_probability",
-            "Probabilité de non-événement",
+            "survival",
+            "Fiabilité R(t) ou probabilité de non-événement",
             "Probabilité",
-            "Cette courbe remplace l’ancienne courbe R(t) lorsqu’on n’est pas dans un cas classique de renouvellement. "
-            "Elle reste donc utilisable pour RP, NHPP et BPP.",
+            "Pour un processus de renouvellement, cette courbe correspond à la fiabilité R(t). "
+            "Pour NHPP et BPP, elle est interprétée comme une probabilité de non-événement avant le temps t.",
         ),
         (
-            "cumulative_probability",
-            "Probabilité cumulée d’apparition d’au moins un événement",
+            "cdf",
+            "Fonction de répartition F(t)",
             "Probabilité cumulée",
-            "Cette courbe montre à quel rythme la probabilité d’observer au moins un événement augmente avec le temps.",
+            "Cette courbe montre la probabilité cumulée d’avoir déjà observé au moins un événement avant le temps t.",
         ),
         (
-            "density",
-            "Densité de probabilité ou densité du premier événement",
+            "pdf",
+            "Densité f(t)",
             "Densité",
-            "Cette courbe aide à voir dans quelles zones de temps les événements sont les plus concentrés.",
+            "Cette courbe montre dans quelles zones de temps les événements sont les plus concentrés.",
         ),
         (
-            "intensity",
-            "Taux ou intensité de défaillance",
+            "hazard",
+            "Intensité h(t) ou λ(t)",
             "Intensité",
-            "Cette courbe montre le niveau instantané de risque ou d’intensité du processus.",
+            "Pour RP, la courbe correspond au taux instantané de défaillance h(t). "
+            "Pour NHPP et BPP, elle correspond à l’intensité λ(t) du processus.",
         ),
         (
-            "cumulative_events",
-            "Nombre cumulé attendu d’événements",
-            "Cumul attendu",
-            "Cette courbe montre le volume attendu d’événements au fur et à mesure du temps.",
+            "cum_mean_events",
+            "Nombre cumulé moyen m(t)",
+            "Cumul moyen",
+            "Cette courbe montre le cumul moyen attendu des événements au cours du temps.",
         ),
     ]
 
@@ -979,9 +1008,12 @@ with page_tabs[5]:
         y_label: str,
     ):
         plotted_count = 0
-        for equipment_code, result in results_by_equipment.items():
+
+        for equipment_code in equipment_codes_for_plots:
+            result = results_by_equipment.get(equipment_code, {})
             reliability_result = result.get("reliability", {}) or {}
             equipment_ttf_series = ttf_series_by_equipment.get(equipment_code, [])
+
             curve_values = compute_model_based_curve(
                 reliability_result=reliability_result,
                 ttf_series=equipment_ttf_series,
@@ -1003,6 +1035,7 @@ with page_tabs[5]:
         axis.set_xlabel("Temps (heures)")
         axis.set_ylabel(y_label)
         axis.grid(True, alpha=0.3)
+
         if plotted_count:
             axis.legend(fontsize=8)
         else:
@@ -1016,11 +1049,11 @@ with page_tabs[5]:
             )
 
     reliability_curve_tabs = st.tabs([
-        "Probabilité de non-événement",
-        "Probabilité cumulée",
-        "Densité",
-        "Intensité",
-        "Nombre cumulé attendu",
+        "Fiabilité R(t)",
+        "Fonction de répartition F(t)",
+        "Densité f(t)",
+        "Intensité h(t) ou λ(t)",
+        "Nombre cumulé moyen m(t)",
     ])
 
     for curve_tab, curve_definition in zip(reliability_curve_tabs, curve_definitions):
@@ -1029,6 +1062,12 @@ with page_tabs[5]:
             figure, axis = plt.subplots(figsize=(10, 5))
             plot_multiple_model_curves(axis, curve_name, title, y_label)
             st.pyplot(figure, clear_figure=True)
+
+            if str(selected_reliability_result.get("model") or "").upper() == "NHPP":
+                st.caption(
+                    "L’échelle de l’axe du temps a été volontairement réduite pour le NHPP afin de rester dans une zone de lecture utile."
+                )
+
             st.caption(generic_explanation)
             st.caption(
                 f"Lecture pour l’équipement sélectionné ({selected_equipment_for_detail}) : "
