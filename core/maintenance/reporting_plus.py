@@ -1,6 +1,6 @@
 from __future__ import annotations
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import datetime
 import math
 import unicodedata
@@ -11,18 +11,21 @@ import unicodedata
 try:
     from reportlab.lib.styles import ParagraphStyle
     from reportlab.lib.enums import TA_LEFT, TA_CENTER
-
     from reportlab.lib.pagesizes import A4
     from reportlab.lib import colors
     from reportlab.lib.units import mm, cm
     from reportlab.lib.styles import getSampleStyleSheet
     from reportlab.platypus import (
-        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+        SimpleDocTemplate,
+        Paragraph,
+        Spacer,
+        Table,
+        TableStyle,
+        PageBreak,
     )
     HAVE_REPORTLAB = True
-except Exception:  # ModuleNotFoundError, etc. (ex: Streamlit Cloud)
+except Exception:
     HAVE_REPORTLAB = False
-    # Valeurs neutres pour éviter les NameError si fonctions non appelées
     A4 = (595.27, 841.89)
     colors = None
     mm = 1.0
@@ -52,6 +55,8 @@ def SAN(s: Any) -> str:
     s = (
         s.replace("≤", "<=").replace("≥", ">=").replace("±", "+/-")
          .replace("Ω", "Ohm").replace("δ", "delta")
+         .replace("β", "beta").replace("η", "eta").replace("γ", "gamma")
+         .replace("θ", "theta")
          .replace("°C", " degC")
     )
     s = unicodedata.normalize("NFKD", s)
@@ -70,38 +75,101 @@ def fnum(v: Any, nd: int = 1, default: str = "-") -> str:
         return default
 
 
+def safe_float(v: Any, default: Optional[float] = None) -> Optional[float]:
+    try:
+        if v is None:
+            return default
+        x = float(v)
+        if math.isnan(x) or math.isinf(x):
+            return default
+        return x
+    except Exception:
+        return default
+
+
+def _compact(text: Any, max_len: int = 140) -> str:
+    s = SAN(text).replace("\n", " ").strip()
+    if len(s) <= max_len:
+        return s
+    return s[: max_len - 3] + "..."
+
+
 def _title(story, styles, text: str, level: int = 3, space_after_pt: int = 6):
     h = {1: "Heading1", 2: "Heading2", 3: "Heading3"}.get(level, "Heading3")
     story.append(Paragraph(SAN(text), styles[h]))
     story.append(Spacer(1, space_after_pt))
 
 
+def _page_available_width(left_margin_mm: float = 16, right_margin_mm: float = 16) -> float:
+    return A4[0] - (left_margin_mm * mm + right_margin_mm * mm)
 
-def _mk_table(data, widths=None, font_size=8, header_font_size=None, header_center=True):
+
+def _scale_widths(widths, available_width):
+    if not widths:
+        return widths
+    total = sum(widths)
+    if total <= 0:
+        return widths
+    if total <= available_width:
+        return widths
+    factor = available_width / total
+    return [w * factor for w in widths]
+
+
+def _auto_widths_from_data(data, available_width, min_col_mm=16, max_col_mm=65):
+    if not data:
+        return None
+    ncols = max(len(r) for r in data)
+    lengths = [8] * ncols
+
+    for row in data[:40]:
+        for i in range(ncols):
+            cell = row[i] if i < len(row) else ""
+            lengths[i] = max(lengths[i], min(len(str(cell)), 60))
+
+    total_len = sum(lengths) if sum(lengths) > 0 else ncols
+    widths = [(length / total_len) * available_width for length in lengths]
+    min_w = min_col_mm * mm
+    max_w = max_col_mm * mm
+    widths = [min(max(w, min_w), max_w) for w in widths]
+    return _scale_widths(widths, available_width)
+
+
+def _mk_table(
+    data,
+    widths=None,
+    font_size=8,
+    header_font_size=None,
+    header_center=True,
+    available_width=None,
+):
     """
     Améliore la lisibilité des tableaux :
       - wrap automatique dans chaque cellule
       - padding + leading adaptés
       - header stylé
+      - réduction auto si la largeur dépasse la page
     IMPORTANT: ne change PAS le contenu, seulement le rendu.
     """
+    if available_width is None:
+        available_width = _page_available_width()
+
     header_font_size = header_font_size or max(font_size, 8)
 
-    # Styles Paragraph pour wrap automatique
     body_style = ParagraphStyle(
-        name="tbl_body",
+        name=f"tbl_body_{font_size}_{len(data)}",
         fontName="Helvetica",
         fontSize=font_size,
         leading=max(10, int(font_size * 1.35)),
         spaceBefore=0,
         spaceAfter=0,
         alignment=TA_LEFT,
-        wordWrap="CJK",        # robuste pour wrap
+        wordWrap="CJK",
         splitLongWords=True,
     )
 
     head_style = ParagraphStyle(
-        name="tbl_head",
+        name=f"tbl_head_{font_size}_{len(data)}",
         fontName="Helvetica-Bold",
         fontSize=header_font_size,
         leading=max(10, int(header_font_size * 1.2)),
@@ -112,45 +180,43 @@ def _mk_table(data, widths=None, font_size=8, header_font_size=None, header_cent
         splitLongWords=True,
     )
 
-    # Conversion en Paragraph (sauf None)
     def to_para(x, style):
-        s = SAN(x)
-        # petit hack : remplacer les sauts de ligne par <br/>
-        s = s.replace("\n", "<br/>")
+        s = SAN(x).replace("\n", "<br/>")
         return Paragraph(s, style)
 
-    # data[0] = header
     wrapped = []
     for i, row in enumerate(data):
         style = head_style if i == 0 else body_style
         wrapped.append([to_para(cell, style) for cell in row])
 
-    t = Table(wrapped, repeatRows=1, colWidths=widths)
+    if widths is not None:
+        widths = _scale_widths(widths, available_width)
+    else:
+        widths = _auto_widths_from_data(data, available_width)
+
+    t = Table(
+        wrapped,
+        repeatRows=1,
+        colWidths=widths,
+        splitByRow=1,
+    )
 
     t.setStyle(TableStyle([
-        # Header
         ("BACKGROUND", (0, 0), (-1, 0), colors.whitesmoke),
         ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
 
-        # Grid + align
         ("GRID", (0, 0), (-1, -1), 0.3, colors.grey),
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
 
-        # Padding (rend les cases “respirables”)
         ("LEFTPADDING", (0, 0), (-1, -1), 3),
         ("RIGHTPADDING", (0, 0), (-1, -1), 3),
         ("TOPPADDING", (0, 0), (-1, -1), 2),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
 
-        # Ligne séparatrice header + léger bold déjà via style
         ("LINEBELOW", (0, 0), (-1, 0), 0.8, colors.grey),
-
-        # Option : centrage de certaines colonnes si tu veux ensuite
-        # ("ALIGN", (0, 0), (-1, 0), "CENTER"),
     ]))
 
     return t
-
 
 
 # ============================================================
@@ -495,7 +561,6 @@ SPARE_PARTS: List[Dict[str, Any]] = [
 # ============================================================
 
 def _add_cahier_maintenance(story, styles):
-    # ---------------- En-tête ----------------
     _title(story, styles, "Cahier de Maintenance", level=1, space_after_pt=4)
     _title(story, styles, "Transformateur 220/20 kV – 100 MVA", level=2, space_after_pt=6)
 
@@ -509,7 +574,6 @@ def _add_cahier_maintenance(story, styles):
     story.append(Paragraph(SAN(intro), styles["BodyText"]))
     story.append(Spacer(1, 8))
 
-    # ---------------- 1. Maintenance préventive ----------------
     _title(story, styles, "1. Maintenance préventive", level=3, space_after_pt=3)
     txt = (
         "La maintenance préventive regroupe toutes les actions planifiées visant à éviter l’apparition de pannes. "
@@ -521,7 +585,6 @@ def _add_cahier_maintenance(story, styles):
     story.append(Paragraph(SAN(txt), styles["BodyText"]))
     story.append(Spacer(1, 6))
 
-    # ---------------- 2. Maintenance conditionnelle ----------------
     _title(story, styles, "2. Maintenance conditionnelle (CBM – Condition Based Maintenance)", level=3, space_after_pt=3)
     txt = (
         "La maintenance conditionnelle repose sur l’analyse continue de l’état réel du transformateur. "
@@ -533,7 +596,6 @@ def _add_cahier_maintenance(story, styles):
     story.append(Paragraph(SAN(txt), styles["BodyText"]))
     story.append(Spacer(1, 6))
 
-    # ---------------- 3. Maintenance corrective ----------------
     _title(story, styles, "3. Maintenance corrective", level=3, space_after_pt=3)
     txt = (
         "La maintenance corrective intervient après l’apparition d’un défaut ou lorsqu’une mesure dépasse les seuils "
@@ -545,7 +607,6 @@ def _add_cahier_maintenance(story, styles):
     story.append(Paragraph(SAN(txt), styles["BodyText"]))
     story.append(Spacer(1, 6))
 
-    # ---------------- 4. Maintenance prédictive ----------------
     _title(story, styles, "4. Maintenance prédictive", level=3, space_after_pt=3)
     txt = (
         "La maintenance prédictive utilise des méthodes avancées de diagnostic (analyse de tendances DGA, modélisation "
@@ -556,9 +617,6 @@ def _add_cahier_maintenance(story, styles):
     story.append(Paragraph(SAN(txt), styles["BodyText"]))
     story.append(Spacer(1, 10))
 
-    # -----------------------------------------------------------
-    # 1) Tableau – Huile isolante
-    # -----------------------------------------------------------
     _title(story, styles, "1. Tableau – Huile isolante (valeurs normalisées)", level=3, space_after_pt=4)
     tbl1 = [
         ["Paramètre", "Méthode", "Normale", "Alerte", "Critique", "Référence"],
@@ -595,9 +653,6 @@ def _add_cahier_maintenance(story, styles):
         story.append(Paragraph(SAN(line), styles["BodyText"]))
     story.append(Spacer(1, 8))
 
-    # -----------------------------------------------------------
-    # 2) Tableau – DGA
-    # -----------------------------------------------------------
     _title(story, styles, "2. Tableau – Analyse des gaz dissous (DGA – IEC 60599)", level=3, space_after_pt=4)
     tbl2 = [
         ["Gaz", "Normale", "Alerte", "Critique", "Signification"],
@@ -632,9 +687,6 @@ def _add_cahier_maintenance(story, styles):
         story.append(Paragraph(SAN(line), styles["BodyText"]))
     story.append(Spacer(1, 8))
 
-    # -----------------------------------------------------------
-    # 3) Tableau – Essais électriques
-    # -----------------------------------------------------------
     _title(story, styles, "3. Tableau – Essais électriques (IEC 60076)", level=3, space_after_pt=4)
     tbl3 = [
         ["Test", "Méthode / Appareil", "Valeur ref.", "Alerte", "Référence"],
@@ -670,9 +722,6 @@ def _add_cahier_maintenance(story, styles):
         story.append(Paragraph(SAN(line), styles["BodyText"]))
     story.append(Spacer(1, 8))
 
-    # -----------------------------------------------------------
-    # 4) Tableau – Paramètres thermiques
-    # -----------------------------------------------------------
     _title(story, styles, "4. Tableau – Paramètres thermiques et refroidissement", level=3, space_after_pt=4)
     tbl4 = [
         ["Paramètre", "Normale", "Alerte", "Critique"],
@@ -697,9 +746,6 @@ def _add_cahier_maintenance(story, styles):
     story.append(Paragraph(SAN("Abréviations : ONAF : Oil Natural Air Forced (huile naturelle, air forcé)."), styles["BodyText"]))
     story.append(Spacer(1, 8))
 
-    # -----------------------------------------------------------
-    # 5) Tableau – Inspection mécanique
-    # -----------------------------------------------------------
     _title(story, styles, "5. Tableau – Inspection mécanique & visuelle", level=3, space_after_pt=4)
     tbl5 = [
         ["Contrôle", "Critère normal", "Alerte", "Critique"],
@@ -732,9 +778,6 @@ def _add_cahier_maintenance(story, styles):
         story.append(Paragraph(SAN(line), styles["BodyText"]))
     story.append(Spacer(1, 8))
 
-    # -----------------------------------------------------------
-    # 6) Tableau – Fréquences recommandées
-    # -----------------------------------------------------------
     _title(story, styles, "6. Tableau – Fréquences recommandées des contrôles", level=3, space_after_pt=4)
     tbl6 = [
         ["Type de contrôle", "Fréquence recommandée"],
@@ -767,9 +810,6 @@ def _add_cahier_maintenance(story, styles):
     story.append(Paragraph(SAN(abbrev6), styles["BodyText"]))
     story.append(Spacer(1, 10))
 
-    # -----------------------------------------------------------
-    # 7) Tableau de suivi de maintenance
-    # -----------------------------------------------------------
     _title(story, styles, "7. Tableau de suivi de maintenance – Transformateur 220/20 kV – 100 MVA", level=3, space_after_pt=4)
 
     header = [
@@ -838,12 +878,7 @@ def _add_cahier_maintenance(story, styles):
         story.append(Paragraph(SAN(line), styles["BodyText"]))
     story.append(Spacer(1, 10))
 
-    # -----------------------------------------------------------
-    # 8) Matériel à prévoir (liste de pièces de rechange)
-    # -----------------------------------------------------------
     _title(story, styles, "8. Matériel à prévoir pour la maintenance du transfo 220/20 kV – 100 MVA", level=3, space_after_pt=4)
-
-    # On réutilise SPARE_PARTS : la liste détaillée des pièces
     header_sp = ["Catégorie", "Pièce de rechange", "Quantité recommandée", "Criticité", "Remarques"]
     data_sp = [header_sp]
     for sp in SPARE_PARTS:
@@ -858,362 +893,6 @@ def _add_cahier_maintenance(story, styles):
     story.append(_mk_table(data_sp, widths=widths_sp, font_size=7))
     story.append(Spacer(1, 10))
 
-# ============================================================
-# 1) Cahier de maintenance écrit à la main dans le code
-# ============================================================
-
-def _add_cahier_section(story, styles):
-    # Titre + intro
-    _title(story, styles, "Cahier de Maintenance", level=1, space_after_pt=4)
-    _title(story, styles, "Transformateur 220/20 kV – 100 MVA", level=2, space_after_pt=6)
-
-    intro = (
-        "Ce cahier regroupe les principaux tableaux de valeurs de référence et les consignes de suivi "
-        "pour la maintenance d’un transformateur de puissance 220/20 kV – 100 MVA, conformément aux "
-        "références IEC et CIGRE."
-    )
-    story.append(Paragraph(SAN(intro), styles["BodyText"]))
-    story.append(Spacer(1, 6))
-
-    para = (
-        "La maintenance appliquée à un transformateur de puissance se divise en plusieurs catégories "
-        "complémentaires, chacune ayant un rôle précis dans la fiabilité et la durée de vie de l’équipement."
-    )
-    story.append(Paragraph(SAN(para), styles["BodyText"]))
-    story.append(Spacer(1, 6))
-
-    # 1. Maintenance préventive
-    _title(story, styles, "1. Maintenance préventive", level=3, space_after_pt=2)
-    p = (
-        "La maintenance préventive regroupe toutes les actions planifiées visant à éviter l’apparition de pannes. "
-        "Elle est réalisée à des intervalles réguliers (mensuel, trimestriel, annuel) et comprend les inspections "
-        "visuelles, les mesures électriques, les analyses d’huile et le contrôle du système de refroidissement. "
-        "Son objectif principal est de maintenir le transformateur dans un état optimal en détectant les défauts "
-        "mineurs avant qu’ils ne deviennent critiques."
-    )
-    story.append(Paragraph(SAN(p), styles["BodyText"]))
-    story.append(Spacer(1, 6))
-
-    # 2. Maintenance conditionnelle
-    _title(story, styles, "2. Maintenance conditionnelle (CBM – Condition Based Maintenance)", level=3, space_after_pt=2)
-    p = (
-        "La maintenance conditionnelle repose sur l'analyse continue de l’état réel du transformateur. Elle utilise "
-        "des mesures et des capteurs (température, vibrations, humidité, DGA, thermographie) permettant de suivre "
-        "l’évolution des paramètres critiques. Cette méthode permet d'intervenir uniquement lorsque les indicateurs "
-        "montrent un début de dérive, ce qui optimise les coûts et augmente la disponibilité de l’équipement."
-    )
-    story.append(Paragraph(SAN(p), styles["BodyText"]))
-    story.append(Spacer(1, 6))
-
-    # 3. Maintenance corrective
-    _title(story, styles, "3. Maintenance corrective", level=3, space_after_pt=2)
-    p = (
-        "La maintenance corrective intervient après l’apparition d’un défaut ou lorsqu’une mesure dépasse les seuils "
-        "critiques fixés par les normes IEC, IEEE ou CIGRE. Elle consiste à réparer ou remplacer les éléments "
-        "défectueux (joints, ventilateurs, isolateurs, OLTC, huile, etc.). Dans le cas d’un transformateur, la "
-        "maintenance corrective peut inclure la filtration ou le remplacement de l’huile, l’intervention sur les "
-        "enroulements, ou le changement des composants mécaniques endommagés."
-    )
-    story.append(Paragraph(SAN(p), styles["BodyText"]))
-    story.append(Spacer(1, 6))
-
-    # 4. Maintenance prédictive
-    _title(story, styles, "4. Maintenance prédictive", level=3, space_after_pt=2)
-    p = (
-        "La maintenance prédictive utilise des méthodes avancées de diagnostic (analyse de tendances DGA, modélisation "
-        "thermique, capteurs IoT, IA) pour prédire les pannes avant qu’elles ne se produisent. Basée sur l’analyse "
-        "statistique des données historiques et en temps réel, elle permet d’anticiper précisément le moment optimal "
-        "pour intervenir. Ce type de maintenance est particulièrement adapté aux transformateurs critiques des réseaux HT/MT."
-    )
-    story.append(Paragraph(SAN(p), styles["BodyText"]))
-    story.append(Spacer(1, 10))
-
-    # ===============================
-    # Tableau 1 – Huile isolante
-    # ===============================
-    _title(story, styles, "1. Tableau – Huile isolante (valeurs normalisées)", level=3, space_after_pt=4)
-    data_oil = [
-        ["Paramètre", "Méthode", "Valeur normale", "Alerte", "Critique", "Référence"],
-        ["Rigidité diélectrique BDV (2,5 mm)", "Test BDV", "≥ 70 kV", "50–69 kV", "< 50 kV", "IEC 60156"],
-        ["Teneur en eau", "Karl Fischer", "≤ 20 ppm", "20–35 ppm", "> 35 ppm", "IEC 60814"],
-        ["Indice d’acidité", "Titrage (mg KOH/g)", "< 0.03", "0.03–0.15", "> 0.15", "IEC 62021"],
-        ["Tan δ à 90°C", "Mesure", "≤ 0.005", "0.005–0.02", "> 0.02", "IEC 60247"],
-        ["Viscosité (40°C)", "Viscosimètre", "8–12 cSt", "12–15 cSt", "> 15 cSt", "IEC 3104"],
-        ["Teneur en furane (2-FAL)", "Chromatographie", "< 0.1 ppm", "0.1–1 ppm", "> 1 ppm", "CIGRE"],
-    ]
-    widths_oil = [4.0*cm, 3.0*cm, 2.6*cm, 2.6*cm, 2.6*cm, 3.0*cm]
-    story.append(_mk_table(data_oil, widths=widths_oil, font_size=7))
-    story.append(Spacer(1, 6))
-
-    exp = (
-        "Explication : L’huile isolante est un élément essentiel de l’isolation et du refroidissement du transformateur. "
-        "Lorsque sa rigidité diélectrique ou son tan δ se dégradent, le risque de claquage interne augmente fortement. "
-        "Une forte teneur en eau, en acides ou en furanes indique un vieillissement avancé de l’huile ou du papier isolant. "
-        "Une huile en zone critique nécessite une filtration immédiate, voire un remplacement complet."
-    )
-    story.append(Paragraph(SAN(exp), styles["BodyText"]))
-    story.append(Spacer(1, 4))
-
-    story.append(Paragraph(SAN("Abréviations :"), styles["BodyText"]))
-    story.append(Paragraph(SAN("- BDV : Breakdown Voltage (rigidité diélectrique)."), styles["BodyText"]))
-    story.append(Paragraph(SAN("- ppm : parties par million (concentration)."), styles["BodyText"]))
-    story.append(Paragraph(SAN("- mg KOH/g : indice d’acidité mesuré en milligrammes d’hydroxyde de potassium par gramme d’huile."), styles["BodyText"]))
-    story.append(Paragraph(SAN("- tan δ : facteur de dissipation diélectrique (pertes dans l’isolant)."), styles["BodyText"]))
-    story.append(Paragraph(SAN("- 2-FAL : 2-Furfural, indicateur de vieillissement du papier isolant."), styles["BodyText"]))
-    story.append(Paragraph(SAN("- cSt : centistokes, unité de viscosité."), styles["BodyText"]))
-    story.append(Spacer(1, 10))
-
-    # ===============================
-    # Tableau 2 – DGA
-    # ===============================
-    _title(story, styles, "2. Tableau – Analyse des gaz dissous (DGA – IEC 60599)", level=3, space_after_pt=4)
-    data_dga = [
-        ["Gaz", "Valeur normale", "Alerte", "Critique", "Signification"],
-        ["H₂", "< 150 ppm", "150–700 ppm", "> 700 ppm", "Décharges partielles"],
-        ["CH₄", "< 80 ppm", "80–120 ppm", "> 120 ppm", "Surchauffe légère"],
-        ["C₂H₆", "< 65 ppm", "65–100 ppm", "> 100 ppm", "Surchauffe de l’huile"],
-        ["C₂H₄", "< 50 ppm", "50–200 ppm", "> 200 ppm", "Surchauffe élevée"],
-        ["C₂H₂", "< 3 ppm", "3–35 ppm", "> 35 ppm", "Arc / défaut grave"],
-        ["CO", "< 350 ppm", "350–1500 ppm", "> 1500 ppm", "Dégradation cellulose"],
-        ["CO₂", "< 2000 ppm", "2000–10000 ppm", "> 10000 ppm", "Vieillissement papier isolant"],
-    ]
-    widths_dga = [2.0*cm, 3.0*cm, 3.2*cm, 3.2*cm, 6.0*cm]
-    story.append(_mk_table(data_dga, widths=widths_dga, font_size=7))
-    story.append(Spacer(1, 6))
-
-    exp = (
-        "Explication : L’analyse des gaz dissous (DGA) est la méthode la plus fiable pour détecter des défauts internes "
-        "non visibles. Chaque gaz correspond à un type de défaut électrique ou thermique spécifique à l’intérieur du "
-        "transformateur. L’acétylène (C₂H₂), même en faible concentration, est souvent lié à des arcs internes et doit "
-        "alerter immédiatement. Une dérive progressive des valeurs dans le temps indique un début de défaillance et "
-        "nécessite une analyse de tendance."
-    )
-    story.append(Paragraph(SAN(exp), styles["BodyText"]))
-    story.append(Spacer(1, 4))
-
-    story.append(Paragraph(SAN("Abréviations :"), styles["BodyText"]))
-    story.append(Paragraph(SAN("- DGA : Dissolved Gas Analysis (analyse des gaz dissous)."), styles["BodyText"]))
-    story.append(Paragraph(SAN("- H₂ : Hydrogène."), styles["BodyText"]))
-    story.append(Paragraph(SAN("- CH₄ : Méthane."), styles["BodyText"]))
-    story.append(Paragraph(SAN("- C₂H₆ : Éthane."), styles["BodyText"]))
-    story.append(Paragraph(SAN("- C₂H₄ : Éthylène."), styles["BodyText"]))
-    story.append(Paragraph(SAN("- C₂H₂ : Acétylène."), styles["BodyText"]))
-    story.append(Paragraph(SAN("- CO / CO₂ : Monoxyde / Dioxyde de carbone."), styles["BodyText"]))
-    story.append(Spacer(1, 10))
-
-    # ===============================
-    # Tableau 3 – Essais électriques
-    # ===============================
-    _title(story, styles, "3. Tableau – Essais électriques (IEC 60076)", level=3, space_after_pt=4)
-    data_elec = [
-        ["Test", "Méthode / Appareil", "Valeur de référence", "Seuil d’alerte", "Référence"],
-        ["Résistance d’isolement", "Mégaohmmètre 5 kV", "> 1000 MΩ", "< 600 MΩ", "IEC 60076-3"],
-        ["Rapport de transformation (TTR)", "Rapporteur", "± 0.5 %", "> 0.5 %", "IEC 60076-1"],
-        ["Résistance d’enroulements", "Micro-ohmmètre", "Écart < 2 % entre phases", "> 2 %", "IEC 60076-1"],
-        ["Impédance de court-circuit", "Essai en charge", "10–12 %", "Variation > 3 %", "IEC 60076-5"],
-        ["Courant d’excitation", "Essai à vide", "≤ 0.5 % In", "> 1 % In", "—"],
-        ["Perte à vide", "Essai", "25–35 kW", "> 40 kW", "Plaque constructeur"],
-        ["Perte en charge", "Essai", "300–500 kW", "> 550 kW", "Plaque constructeur"],
-        ["Tenue diélectrique", "Essai IEC", "Conforme", "Non conforme", "IEC 60076-3"],
-    ]
-    widths_elec = [4.0*cm, 4.0*cm, 4.0*cm, 3.0*cm, 3.0*cm]
-    story.append(_mk_table(data_elec, widths=widths_elec, font_size=7))
-    story.append(Spacer(1, 6))
-
-    exp = (
-        "Explication : Les essais électriques permettent de vérifier l’état des enroulements, de l’isolation et du circuit "
-        "magnétique. Une variation anormale du rapport de transformation ou des impédances indique un déplacement "
-        "d’enroulement ou un court-circuit interne. Le courant d’excitation renseigne sur l’état du noyau magnétique et "
-        "sur d’éventuelles saturations. Les pertes à vide et en charge sont essentielles pour évaluer le rendement et la "
-        "santé globale du transformateur."
-    )
-    story.append(Paragraph(SAN(exp), styles["BodyText"]))
-    story.append(Spacer(1, 4))
-
-    story.append(Paragraph(SAN("Abréviations :"), styles["BodyText"]))
-    story.append(Paragraph(SAN("- TTR : Transformer Turns Ratio (rapport de transformation)."), styles["BodyText"]))
-    story.append(Paragraph(SAN("- MΩ : Mégaohms."), styles["BodyText"]))
-    story.append(Paragraph(SAN("- In : Courant nominal."), styles["BodyText"]))
-    story.append(Paragraph(SAN("- kW : Kilowatts (pertes)."), styles["BodyText"]))
-    story.append(Paragraph(SAN("- IEC : International Electrotechnical Commission."), styles["BodyText"]))
-    story.append(Spacer(1, 10))
-
-    # ===============================
-    # Tableau 4 – Thermique
-    # ===============================
-    _title(story, styles, "4. Tableau – Paramètres thermiques et refroidissement", level=3, space_after_pt=4)
-    data_th = [
-        ["Paramètre", "Valeur normale", "Alerte", "Critique"],
-        ["Température maximale huile (haut)", "≤ 90°C", "90–105°C", "> 105°C"],
-        ["Point chaud enroulements", "≤ 110°C", "110–130°C", "> 130°C"],
-        ["Gradient haut-bas réservoir", "≤ 15°C", "15–25°C", "> 25°C"],
-        ["Ventilateurs / Pompes ONAF", "100 % fonctionnels", "1 panne", "2+ pannes"],
-    ]
-    widths_th = [5.0*cm, 3.0*cm, 3.0*cm, 3.0*cm]
-    story.append(_mk_table(data_th, widths=widths_th, font_size=8))
-    story.append(Spacer(1, 6))
-
-    exp = (
-        "Explication : Le comportement thermique reflète directement la charge et la capacité de refroidissement du "
-        "transformateur. Une augmentation excessive du point chaud accélère fortement le vieillissement du papier isolant "
-        "interne. Un gradient de température trop élevé entre le haut et le bas du réservoir indique un mauvais transfert "
-        "thermique. La défaillance de plusieurs ventilateurs ou pompes de refroidissement est critique, surtout pour les "
-        "transformateurs ONAF."
-    )
-    story.append(Paragraph(SAN(exp), styles["BodyText"]))
-    story.append(Spacer(1, 4))
-
-    story.append(Paragraph(SAN("Abréviations :"), styles["BodyText"]))
-    story.append(Paragraph(SAN("- ONAF : Oil Natural Air Forced (huile naturelle, air forcé)."), styles["BodyText"]))
-    story.append(Paragraph(SAN("- °C : Degré Celsius."), styles["BodyText"]))
-    story.append(Spacer(1, 10))
-
-    # ===============================
-    # Tableau 5 – Inspection mécanique & visuelle
-    # ===============================
-    _title(story, styles, "5. Tableau – Inspection mécanique & visuelle", level=3, space_after_pt=4)
-    data_mech = [
-        ["Contrôle", "Critère normal", "Alerte", "Critique"],
-        ["Niveau d’huile", "Niveau nominal", "Baisse lente", "Baisse rapide / fuite"],
-        ["Isolateurs", "Propres, sans fissures", "Dépôts / traces d’effluve", "Fissure / casse"],
-        ["Joints et brides", "Étanches", "Suintement léger", "Fuite active"],
-        ["Bruit transformateur", "Bruit stable", "Bruit accru / vibration", "Claquements anormaux"],
-        ["Relais Buchholz", "Aucun gaz / RAS", "Présence de gaz", "Déclenchement alarme / défaut"],
-    ]
-    widths_mech = [4.0*cm, 4.5*cm, 4.0*cm, 4.0*cm]
-    story.append(_mk_table(data_mech, widths=widths_mech, font_size=8))
-    story.append(Spacer(1, 6))
-
-    exp = (
-        "Explication : L’inspection mécanique permet de détecter les défauts visibles avant qu’ils ne deviennent critiques. "
-        "Les isolateurs, les joints et les brides sont des points sensibles soumis à la chaleur, à l’humidité et aux "
-        "contraintes mécaniques. Le relais Buchholz est un indicateur important de dégagement de gaz à l’intérieur du "
-        "transformateur. Le bruit et les vibrations du transformateur fournissent de précieux indices sur des défauts "
-        "magnétiques ou mécaniques internes."
-    )
-    story.append(Paragraph(SAN(exp), styles["BodyText"]))
-    story.append(Spacer(1, 4))
-
-    story.append(Paragraph(SAN("Abréviations :"), styles["BodyText"]))
-    story.append(Paragraph(SAN("- RAS : Rien À Signaler."), styles["BodyText"]))
-    story.append(Paragraph(SAN("- Buchholz : Relais détecteur de gaz et de défauts internes."), styles["BodyText"]))
-    story.append(Paragraph(SAN("- HT/MT : Haute Tension / Moyenne Tension."), styles["BodyText"]))
-    story.append(Spacer(1, 10))
-
-    # ===============================
-    # Tableau 6 – Fréquences recommandées
-    # ===============================
-    _title(story, styles, "6. Tableau – Fréquences recommandées des contrôles", level=3, space_after_pt=4)
-    data_freq = [
-        ["Type de contrôle", "Fréquence recommandée"],
-        ["Inspection visuelle complète", "Mensuelle"],
-        ["Analyse d’huile (BDV, eau, acidité)", "Semestrielle"],
-        ["DGA (gaz dissous)", "Trimestrielle à semestrielle selon criticité"],
-        ["Essais électriques complets", "Annuelle"],
-        ["Thermographie infrarouge", "Annuelle"],
-        ["Contrôle OLTC", "Annuelle"],
-        ["Filtration / traitement huile (si besoin)", "Tous les 2 ans"],
-        ["Mesure des furanes (papier isolant)", "Tous les 3 ans"],
-    ]
-    story.append(_mk_table(data_freq, font_size=8))
-    story.append(Spacer(1, 6))
-
-    exp = (
-        "Explication : La fréquence de maintenance dépend de la charge, de l’environnement et de l’âge du transformateur. "
-        "Un transformateur fortement sollicité ou exposé à un environnement sévère nécessite une surveillance plus "
-        "rapprochée. Les fréquences indiquées servent de base et peuvent être ajustées selon le retour d’expérience et "
-        "les tendances mesurées. Un bon calendrier de maintenance augmente la fiabilité et prolonge la durée de vie de "
-        "l’équipement."
-    )
-    story.append(Paragraph(SAN(exp), styles["BodyText"]))
-    story.append(Spacer(1, 4))
-
-    story.append(Paragraph(SAN("Abréviations :"), styles["BodyText"]))
-    story.append(Paragraph(SAN("- OLTC : On-Load Tap Changer (changeur de prises en charge)."), styles["BodyText"]))
-    story.append(Paragraph(SAN("- BDV : Breakdown Voltage."), styles["BodyText"]))
-    story.append(Paragraph(SAN("- DGA : Dissolved Gas Analysis."), styles["BodyText"]))
-    story.append(Spacer(1, 10))
-
-    # ===============================
-    # Tableau 7 – Suivi de maintenance (vierge)
-    # ===============================
-    _title(story, styles, "7. Tableau de suivi de maintenance – Transformateur 220/20 kV – 100 MVA", level=3, space_after_pt=4)
-    header = ["Date", "Nom de l’Agent", "Paramètre contrôlé", "Valeur de référence",
-              "Résultat mesuré", "État (OK/NOK)", "Observations"]
-    rows = [
-        ["", "", "Rigidité diélectrique", "≥ 50 kV (IEC 60156)", "", "", ""],
-        ["", "", "Teneur en eau", "< 20 ppm (IEC 60814)", "", "", ""],
-        ["", "", "Indice d’acidité", "< 0.03 mg KOH/g (IEC 62021)", "", "", ""],
-        ["", "", "Tan δ à 90°C", "< 0.01 (IEC 60247)", "", "", ""],
-        ["", "", "Viscosité huile (40°C)", "8–12 cSt (IEC 3104)", "", "", ""],
-        ["", "", "2-FAL (furannes)", "< 0.1 ppm (CIGRE TB 771)", "", "", ""],
-        ["", "", "H₂", "< 100 ppm (IEC 60599)", "", "", ""],
-        ["", "", "CH₄", "< 50 ppm (IEC 60599)", "", "", ""],
-        ["", "", "C₂H₆", "< 50 ppm (IEC 60599)", "", "", ""],
-        ["", "", "C₂H₄", "< 50 ppm (IEC 60599)", "", "", ""],
-        ["", "", "C₂H₂", "< 1 ppm (IEC 60599)", "", "", ""],
-        ["", "", "CO", "< 350 ppm (IEC 60599)", "", "", ""],
-        ["", "", "CO₂", "< 2500 ppm (IEC 60599)", "", "", ""],
-        ["", "", "Résistance d’isolement 5 kV", "> 1000 MΩ (IEC 60076-3)", "", "", ""],
-        ["", "", "TTR (rapport de transformation)", "± 0.5 % (IEC 60076-1)", "", "", ""],
-        ["", "", "Résistance d’enroulement", "< 2 % diff entre phases (IEC 60076-1)", "", "", ""],
-        ["", "", "Impédance de court-circuit", "± 2 % nominal (IEC 60076-5)", "", "", ""],
-        ["", "", "Courant d'excitation", "≤ 0.5 % In (Constructeur)", "", "", ""],
-        ["", "", "Pertes à vide", "Selon plaque constructeur", "", "", ""],
-        ["", "", "Pertes en charge", "Selon plaque constructeur", "", "", ""],
-        ["", "", "Température huile haut", "< 95°C (IEC 60076-2)", "", "", ""],
-        ["", "", "Point chaud enroulements", "< 120°C (IEC 60076-2)", "", "", ""],
-        ["", "", "Gradient vertical", "< 15°C (IEC)", "", "", ""],
-        ["", "", "Ventilateurs / Pompes ONAF", "100 % fonctionnels", "", "", ""],
-        ["", "", "Niveau d’huile", "Niveau nominal", "", "", ""],
-        ["", "", "État isolateurs", "Propres / intacts", "", "", ""],
-        ["", "", "Relais Buchholz", "RAS / Aucun gaz", "", "", ""],
-        ["", "", "Bruit transformateur", "Régulier / stable", "", "", ""],
-    ]
-    data_suivi = [header] + rows
-    widths_suivi = [2.0*cm, 3.2*cm, 5.5*cm, 5.5*cm, 3.0*cm, 2.0*cm, 4.0*cm]
-    story.append(_mk_table(data_suivi, widths=widths_suivi, font_size=6.8))
-    story.append(Spacer(1, 6))
-
-    exp = (
-        "Explication : Ce tableau sert à consigner chaque intervention de maintenance préventive, conditionnelle ou "
-        "corrective. Il regroupe les principaux paramètres critiques pour la santé du transformateur, avec les valeurs "
-        "de référence associées. L’objectif est d’assurer la traçabilité, la régularité des inspections et la détection "
-        "précoce des dérives. Un tableau bien rempli constitue un élément essentiel du carnet de vie du transformateur."
-    )
-    story.append(Paragraph(SAN(exp), styles["BodyText"]))
-    story.append(Spacer(1, 4))
-
-    story.append(Paragraph(SAN("Comment remplir les colonnes :"), styles["BodyText"]))
-    story.append(Paragraph(SAN("- Date : indiquer la date de la mesure (format JJ/MM/AAAA)."), styles["BodyText"]))
-    story.append(Paragraph(SAN("- Technicien : mentionner le nom de la personne ayant réalisé les mesures."), styles["BodyText"]))
-    story.append(Paragraph(SAN("- Paramètre contrôlé : indiquer le paramètre (BDV, H₂, C₂H₂, TTR, isolement, température, etc.)."), styles["BodyText"]))
-    story.append(Paragraph(SAN("- Valeur de référence : recopier la valeur normative tirée des tableaux précédents."), styles["BodyText"]))
-    story.append(Paragraph(SAN("- Résultat mesuré : inscrire la valeur réellement mesurée sur le terrain."), styles["BodyText"]))
-    story.append(Paragraph(SAN("- État (OK/NOK) : cocher OK si conforme, NOK si la valeur dépasse les seuils d’alerte ou critiques."), styles["BodyText"]))
-    story.append(Paragraph(SAN("- Observations / Actions : noter les anomalies constatées et les actions prévues (filtration, resserrage, réparation, etc.)."), styles["BodyText"]))
-    story.append(Spacer(1, 10))
-
-    # ===============================
-    # Matériel à prévoir (grande table)
-    # ===============================
-    _title(story, styles, "6. Matériel à prévoir pour la maintenance du transfo 220/20 kV – 100 MVA", level=3, space_after_pt=4)
-    data_mat = [["Catégorie", "Pièce de rechange", "Quantité recommandée", "Criticité", "Remarques"]]
-    for sp in SPARE_PARTS:
-        data_mat.append([
-            SAN(sp["categorie"]),
-            SAN(sp["piece"]),
-            SAN(sp["qte_reco"]),
-            SAN(sp["criticite"]),
-            SAN(sp["remarques"]),
-        ])
-    widths_mat = [4.0*cm, 5.5*cm, 3.0*cm, 2.5*cm, 4.0*cm]
-    story.append(_mk_table(data_mat, widths=widths_mat, font_size=7))
-    story.append(Spacer(1, 8))
-
-    # Fin cahier
-    story.append(PageBreak())
-
 
 # ============================================================
 # 2) Annexes dynamiques : résultats d’analyse, tâches, matériels
@@ -1227,10 +906,116 @@ def _policy_from_beta(beta: float) -> str:
     if b is None:
         return "Non déterminée."
     if b > 1.0:
-        return "Usure (>1): CBM + remplacements préventifs ciblés, contrôle diélectrique, nettoyage/refroidissement."
+        return "Usure (>1) : maintenance préventive / conditionnelle renforcée avec remplacements ciblés."
     if b < 1.0:
-        return "Défauts précoces (<1): contrôles précoces, qualité d’installation, resserrage/inspection rapprochés."
-    return "Taux de panne ~constant (=1): préventif calendaire/opportuniste, surveillance standard."
+        return "Défauts précoces (<1) : contrôles précoces, fiabilisation, qualité d’installation et inspection rapprochée."
+    return "Taux de panne proche du constant (=1) : préventif calendaire ou surveillance standard."
+
+
+def _maintenance_type_explanation(mtype: str, beta: Any) -> str:
+    label = SAN(mtype).strip().lower()
+    if "correct" in label:
+        return "Ce type a été retenu car il faut corriger un défaut observé ou probable avant stabilisation."
+    if "condition" in label:
+        return "Ce type a été retenu car l’état de l’équipement doit guider le moment de l’intervention."
+    if "prévent" in label or "prevent" in label:
+        return "Ce type a été retenu car l’intervention doit être planifiée avant la panne pour limiter le risque."
+    if "predict" in label or "prédict" in label:
+        return "Ce type a été retenu car les tendances permettent d’anticiper l’intervention."
+    return _policy_from_beta(beta)
+
+
+def _build_choice_explanation(r: Dict[str, Any]) -> str:
+    beta = r.get("beta")
+    eta = r.get("eta_h", r.get("eta"))
+    gamma = r.get("gamma_h", r.get("gamma"))
+    model = r.get("model")
+    dist = r.get("distribution")
+    mtype = r.get("maintenance_type")
+    T_rec = r.get("T_recommended_h")
+    T_R = r.get("T_R_h")
+    T_cost = r.get("T_cost_h")
+    mtbf = r.get("MTBF")
+    mttr = r.get("MTTR")
+    thermal_status = r.get("thermal_status")
+    faa = r.get("FAA_max", r.get("faa_max"))
+    lol = r.get("loss_of_life_pct")
+    decision = r.get("decision_finale")
+    motif = r.get("motif_decision")
+
+    parts = []
+
+    if mtype:
+        parts.append(f"Type retenu : {SAN(mtype)}.")
+    if model or dist:
+        parts.append(f"Le modèle retenu est {SAN(model)} avec la loi {SAN(dist)}.")
+    if beta is not None:
+        parts.append(f"Le paramètre beta = {fnum(beta, 2)} a servi à orienter la politique de maintenance.")
+    if eta is not None:
+        parts.append(f"La durée caractéristique eta est estimée à {fnum(eta, 1)} h.")
+    if gamma is not None:
+        parts.append(f"Le décalage gamma vaut {fnum(gamma, 1)} h.")
+    if T_rec is not None:
+        parts.append(f"L’intervalle recommandé est {fnum(T_rec, 1)} h.")
+    if T_R is not None:
+        parts.append(f"L’intervalle fiabiliste vaut {fnum(T_R, 1)} h.")
+    if T_cost is not None:
+        parts.append(f"L’intervalle économique vaut {fnum(T_cost, 1)} h.")
+    if mtbf is not None:
+        parts.append(f"Le MTBF est de {fnum(mtbf, 1)} h.")
+    if mttr is not None:
+        parts.append(f"Le MTTR est de {fnum(mttr, 1)} h.")
+    if thermal_status not in (None, ""):
+        parts.append(f"Le statut thermique est {SAN(thermal_status)}.")
+    if faa is not None:
+        parts.append(f"Le FAA maximal est {fnum(faa, 3)}.")
+    if lol is not None:
+        parts.append(f"La perte de vie estimée est {fnum(lol, 3)} %.")
+    if decision:
+        parts.append(f"Décision finale : {SAN(decision)}.")
+    if motif:
+        parts.append(f"Motif : {SAN(motif)}")
+
+    return " ".join(parts) if parts else "Aucune explication détaillée disponible."
+
+
+def _build_influence_table(r: Dict[str, Any]):
+    beta = r.get("beta")
+    eta = r.get("eta_h", r.get("eta"))
+    gamma = r.get("gamma_h", r.get("gamma"))
+    model = r.get("model")
+    dist = r.get("distribution")
+    mtype = r.get("maintenance_type")
+    T_rec = r.get("T_recommended_h")
+    T_R = r.get("T_R_h")
+    T_cost = r.get("T_cost_h")
+    mtbf = r.get("MTBF")
+    mttr = r.get("MTTR")
+    thermal_status = r.get("thermal_status")
+    faa = r.get("FAA_max", r.get("faa_max"))
+    lol = r.get("loss_of_life_pct")
+    days_left = r.get("days_left")
+    decision = r.get("decision_finale")
+
+    return [
+        ["Paramètre", "Valeur", "Impact sur le choix"],
+        ["Type de maintenance retenu", SAN(mtype), _maintenance_type_explanation(SAN(mtype), beta)],
+        ["Modèle", SAN(model), "Le comportement global des défaillances influence la stratégie retenue."],
+        ["Loi", SAN(dist), "La loi de probabilité retenue structure l’estimation des durées et du risque."],
+        ["beta", fnum(beta, 2), "Indique défauts précoces, comportement aléatoire ou usure."],
+        ["eta (h)", fnum(eta, 1), "Donne une référence de durée de vie caractéristique."],
+        ["gamma (h)", fnum(gamma, 1), "Décalage éventuel du modèle."],
+        ["T_recommended (h)", fnum(T_rec, 1), "Intervalle principal proposé pour agir."],
+        ["T_R (h)", fnum(T_R, 1), "Intervalle issu du critère de fiabilité."],
+        ["T_cost (h)", fnum(T_cost, 1), "Intervalle issu du critère économique."],
+        ["MTBF (h)", fnum(mtbf, 1), "Renseigne l’espacement moyen des pannes."],
+        ["MTTR (h)", fnum(mttr, 1), "Renseigne le temps moyen de remise en état."],
+        ["Statut thermique", SAN(thermal_status), "Peut accélérer ou renforcer l’intervention."],
+        ["FAA max", fnum(faa, 3), "Indique l’accélération du vieillissement thermique."],
+        ["Perte de vie (%)", fnum(lol, 3), "Indique la consommation estimée de durée de vie."],
+        ["Jours restants", SAN(days_left), "Plus l’échéance est proche, plus la priorité augmente."],
+        ["Décision finale", SAN(decision), "Conclusion synthétique issue des paramètres disponibles."],
+    ]
 
 
 def _add_per_equipment_summaries(
@@ -1239,7 +1024,7 @@ def _add_per_equipment_summaries(
     metrics_table: List[Dict[str, Any]],
     kits_by_eq: Dict[str, List[Dict[str, Any]]] | None,
 ):
-    """Section : 'Résultats d’analyse par équipement' (partie dynamique)."""
+    """Section : résultats d’analyse par équipement."""
     if not metrics_table:
         return
 
@@ -1250,23 +1035,21 @@ def _add_per_equipment_summaries(
         orig_eq = (r or {}).get("equipment_code", "")
         eq_disp = SAN(orig_eq)
 
-        # compat: eta / eta_h
         beta = (r or {}).get("beta")
         eta = (r or {}).get("eta_h", (r or {}).get("eta"))
         gamma = (r or {}).get("gamma_h", (r or {}).get("gamma"))
-
-        # intervals (priorité affichage)
         T_rec = (r or {}).get("T_recommended_h")
         T_R = (r or {}).get("T_R_h")
         T_cost = (r or {}).get("T_cost_h")
         itv_opt = (r or {}).get("interval_opt_h", (r or {}).get("interval_h"))
-
         model = (r or {}).get("model")
         dist = (r or {}).get("distribution")
         mtype = (r or {}).get("maintenance_type")
-
         mtbf = (r or {}).get("MTBF")
         mttr = (r or {}).get("MTTR")
+        thermal_status = (r or {}).get("thermal_status")
+        faa = (r or {}).get("FAA_max", (r or {}).get("faa_max"))
+        lol = (r or {}).get("loss_of_life_pct")
 
         avail = None
         try:
@@ -1281,38 +1064,53 @@ def _add_per_equipment_summaries(
             ["Élément", "Valeur"],
             ["Type de maintenance (optimisation)", SAN(mtype)],
             ["Modèle / Loi", f"{SAN(model)} / {SAN(dist)}"],
-
-            ["β (forme)", fnum(beta, 2)],
-            ["η (échelle, h)", fnum(eta, 1)],
-            ["γ (décalage, h)", fnum(gamma, 1)],
-
+            ["beta (forme)", fnum(beta, 2)],
+            ["eta (échelle, h)", fnum(eta, 1)],
+            ["gamma (décalage, h)", fnum(gamma, 1)],
             ["T_recommended (h)", fnum(T_rec, 1)],
             ["T_R (h)", fnum(T_R, 1)],
             ["T_cost (h)", fnum(T_cost, 1)],
             ["Intervalle opt (h) (fallback)", fnum(itv_opt, 1)],
-
             ["MTBF (h)", fnum(mtbf, 1)],
             ["MTTR (h)", fnum(mttr, 1)],
             ["Disponibilité (%)", fnum(avail, 1)],
+            ["Statut thermique", SAN(thermal_status)],
+            ["FAA max", fnum(faa, 3)],
+            ["Perte de vie (%)", fnum(lol, 3)],
         ]
         story.append(_mk_table(data_param, font_size=8))
         story.append(Spacer(1, 4))
 
-        _title(story, styles, "Politique recommandée", level=3, space_after_pt=2)
+        _title(story, styles, "Choix retenu pour le cas d’étude", level=3, space_after_pt=2)
+        story.append(Paragraph(SAN(_build_choice_explanation(r)), styles["BodyText"]))
+        story.append(Spacer(1, 6))
 
-        # Si maintenance_type existe, on l'utilise aussi en explication,
-        # sinon fallback beta.
+        _title(story, styles, "Paramètres ayant influencé le choix", level=3, space_after_pt=2)
+        story.append(_mk_table(_build_influence_table(r), font_size=7.5))
+        story.append(Spacer(1, 6))
+
+        _title(story, styles, "Politique recommandée", level=3, space_after_pt=2)
         pol = ""
         if mtype:
-            pol += f"Type recommandé (optimisation) : {mtype}. "
+            pol += f"Type recommandé (optimisation) : {SAN(mtype)}. "
         pol += _policy_from_beta(beta)
         story.append(Paragraph(SAN(pol), styles["BodyText"]))
         story.append(Spacer(1, 6))
 
-        _title(story, styles, "Kit de pièces recommandé (résumé)", level=3, space_after_pt=2)
-        has_kit = bool((kits_by_eq or {}).get(str(orig_eq)))
-        if has_kit:
-            story.append(Paragraph(SAN("Un kit est recommandé. Voir module Inventaire pour la liste à jour."), styles["BodyText"]))
+        _title(story, styles, "Kit de pièces recommandé", level=3, space_after_pt=2)
+        kit_list = (kits_by_eq or {}).get(str(orig_eq), [])
+        if kit_list:
+            story.append(Paragraph(SAN("Les pièces suivantes sont recommandées pour cet équipement :"), styles["BodyText"]))
+            kit_data = [["Pièce", "Quantité", "Criticité", "Remarques"]]
+            for item in kit_list[:12]:
+                item = item if isinstance(item, dict) else {}
+                kit_data.append([
+                    SAN(item.get("piece", "")),
+                    SAN(item.get("qte_reco", item.get("qte", ""))),
+                    SAN(item.get("criticite", "")),
+                    _compact(item.get("remarques", ""), 70),
+                ])
+            story.append(_mk_table(kit_data, font_size=7))
         else:
             story.append(Paragraph(SAN("Aucune pièce recommandée détectée (ou stock non activé)."), styles["BodyText"]))
         story.append(Spacer(1, 8))
@@ -1322,7 +1120,6 @@ def _table_from_tasks_due(tasks_due: List[Dict[str, Any]]):
     if not tasks_due:
         return None
 
-    # Table enrichie: optimisation visible
     data = [[
         "Équipement",
         "Type maint.",
@@ -1351,22 +1148,20 @@ def _table_from_tasks_due(tasks_due: List[Dict[str, Any]]):
             SAN(td.get("status", "")),
         ])
 
-    # Largeur adaptée A4 (marges déjà prises)
     widths = [
-    2.2*cm,  # eq
-    2.8*cm,  # type (un peu plus)
-    2.0*cm,  # interval
-    1.7*cm,  # source
-    2.3*cm,  # due
-    1.6*cm,  # days
-    1.9*cm,  # Trec
-    1.7*cm,  # TR
-    1.8*cm,  # Tcost
-    1.7*cm,  # status
-]
+        2.2*cm,
+        2.8*cm,
+        2.0*cm,
+        1.7*cm,
+        2.3*cm,
+        1.6*cm,
+        1.9*cm,
+        1.7*cm,
+        1.8*cm,
+        1.7*cm,
+    ]
 
     return _mk_table(data, widths=widths, font_size=7.5)
-
 
 
 DEFAULT_TOOLS = [
@@ -1406,7 +1201,7 @@ DEFAULT_TOOLS = [
 
 
 def _add_tools_section(story, styles, tools_checklist: List[Dict[str, Any]] | None):
-    """Liste courte d’outils/EPI (en plus du grand tableau de pièces)."""
+    """Liste d’outils/EPI en plus du grand tableau des pièces."""
     _title(story, styles, "Matériels à prévoir pour l’entretien (instruments et EPI)", level=2, space_after_pt=2)
     tools = tools_checklist if (isinstance(tools_checklist, list) and tools_checklist) else DEFAULT_TOOLS
     data = [["Catégorie", "Outil/Instrument", "Description", "Qté", "Unité", "Calibrage/État", "Remarques"]]
@@ -1424,6 +1219,8 @@ def _add_tools_section(story, styles, tools_checklist: List[Dict[str, Any]] | No
     widths = [2.8*cm, 3.0*cm, 4.0*cm, 1.1*cm, 1.1*cm, 2.0*cm, 2.3*cm]
     story.append(_mk_table(data, widths=widths, font_size=8))
     story.append(Spacer(1, 6))
+
+
 def _export_pm_plan_with_kits_pdf_fallback(
     tasks_due: List[Dict[str, Any]],
     kits_by_eq: Dict[str, List[Dict[str, Any]]],
@@ -1433,8 +1230,7 @@ def _export_pm_plan_with_kits_pdf_fallback(
     tools_checklist: List[Dict[str, Any]] | None,
 ) -> str:
     """
-    Version simplifiée pour plateformes sans ReportLab (ex: Streamlit Cloud).
-    Utilise FPDF si disponible, sinon lève une erreur explicite.
+    Version simplifiée pour plateformes sans ReportLab.
     """
     if not HAVE_FPDF:
         raise RuntimeError(
@@ -1462,43 +1258,47 @@ def _export_pm_plan_with_kits_pdf_fallback(
     pdf.set_font("Arial", "", 10)
     pdf.multi_cell(0, 5, SAN(
         "Ce document a été généré dans un environnement où ReportLab n'est pas disponible "
-        "(par exemple Streamlit Cloud). Le contenu détaillé (tables mises en page) reste "
+        "(par exemple Streamlit Cloud). Le contenu détaillé avec mise en page complète reste "
         "disponible lorsque l'application est exécutée en local avec ReportLab installé."
     ))
     pdf.ln(4)
 
-    # Petite synthèse dynamique pour ne pas perdre l'info
     if metrics_table:
         pdf.set_font("Arial", "B", 11)
-        pdf.cell(0, 6, SAN("Synthèse paramètres par équipement:"), ln=1)
+        pdf.cell(0, 6, SAN("Synthèse paramètres par équipement :"), ln=1)
         pdf.set_font("Arial", "", 9)
         for r in metrics_table:
             eq = SAN(str(r.get("equipment_code", "")))
             beta = fnum(r.get("beta"), 2)
-            eta = fnum(r.get("eta"), 1)
-            itv = fnum(r.get("interval_opt_h"), 1)
-            pdf.multi_cell(0, 5, SAN(f"- {eq} | β={beta}, η={eta} h, intervalle opt ≈ {itv} h"))
+            eta = fnum(r.get("eta_h", r.get("eta")), 1)
+            itv = fnum(r.get("T_recommended_h", r.get("interval_opt_h")), 1)
+            mtype = SAN(r.get("maintenance_type", ""))
+            pdf.multi_cell(
+                0,
+                5,
+                SAN(f"- {eq} | type={mtype} | beta={beta}, eta={eta} h, intervalle recommandé ≈ {itv} h")
+            )
         pdf.ln(3)
 
     if tasks_due:
         pdf.set_font("Arial", "B", 11)
-        pdf.cell(0, 6, SAN("Tâches de maintenance dues (résumé):"), ln=1)
+        pdf.cell(0, 6, SAN("Tâches de maintenance dues (résumé) :"), ln=1)
         pdf.set_font("Arial", "", 9)
-        for t in tasks_due[:40]:  # limiter la taille
+        for t in tasks_due[:40]:
             eq = SAN(str(t.get("equipment_code", "")))
-            title_t = SAN(str(t.get("title", "")))
+            title_t = SAN(str(t.get("title", t.get("maintenance_type", ""))))
             due = SAN(str(t.get("next_due_date", "")))
-            pdf.multi_cell(0, 5, f"- [{eq}] {title_t} (échéance: {due})")
+            pdf.multi_cell(0, 5, SAN(f"- [{eq}] {title_t} (échéance : {due})"))
         pdf.ln(3)
 
     if tools_checklist:
         pdf.set_font("Arial", "B", 11)
-        pdf.cell(0, 6, SAN("Matériels / Outils à prévoir (résumé):"), ln=1)
+        pdf.cell(0, 6, SAN("Matériels / Outils à prévoir (résumé) :"), ln=1)
         pdf.set_font("Arial", "", 9)
         for it in tools_checklist[:40]:
             cat = SAN(str(it.get("categorie", "")))
             outil = SAN(str(it.get("outil", "")))
-            pdf.multi_cell(0, 5, f"- [{cat}] {outil}")
+            pdf.multi_cell(0, 5, SAN(f"- [{cat}] {outil}"))
         pdf.ln(3)
 
     pdf.output(str(out_path))
@@ -1515,20 +1315,19 @@ def export_pm_plan_with_kits_pdf(
     metrics_table: List[Dict[str, Any]],
     out_dir: str | Path = "reports",
     title: str = "Plan de maintenance - Procédure, Tâches, Matériels",
-    procedure_docx: str | Path | None = None,   # plus utilisé, juste pour compat
+    procedure_docx: str | Path | None = None,
     *,
-    include_kits: bool = False,                 # compat ancien code
+    include_kits: bool = False,
     tools_checklist: List[Dict[str, Any]] | None = None,
-    consumption_summary=None,                   # compat appelant
+    consumption_summary=None,
 ) -> str:
     """
     Ordre final :
       1) Cahier de maintenance complet (texte + tableaux statiques)
-      2) Résultats d’analyse par équipement (β, η, γ, MTBF, MTTR, politique)
+      2) Résultats d’analyse par équipement
       3) Tâches de maintenance dues (tableau global)
       4) Matériels à prévoir (instruments, EPI…)
     """
-    # Fallback si ReportLab n'est pas disponible (Streamlit Cloud, etc.)
     if not HAVE_REPORTLAB:
         return _export_pm_plan_with_kits_pdf_fallback(
             tasks_due, kits_by_eq, metrics_table, out_dir, title, tools_checklist
@@ -1552,17 +1351,16 @@ def export_pm_plan_with_kits_pdf(
     story: List[Any] = []
     story.append(Paragraph(SAN(title), styles["Title"]))
     story.append(Paragraph(SAN(datetime.datetime.now().strftime("%d/%m/%Y %H:%M")), styles["BodyText"]))
-
     story.append(Spacer(1, 10))
 
-    # 1) Cahier de maintenance (statique, reconstitué à la main)
+    # 1) Cahier de maintenance complet
     _add_cahier_maintenance(story, styles)
     story.append(PageBreak())
 
     # 2) Résultats par équipement
     _add_per_equipment_summaries(story, styles, metrics_table, kits_by_eq)
 
-    # 3) Tâches de maintenance dues (tableau global)
+    # 3) Tâches de maintenance dues
     _title(story, styles, "Tâches de maintenance dues (tableau global)", level=2, space_after_pt=3)
     tbl_due = _table_from_tasks_due(tasks_due)
     if tbl_due is None:
@@ -1571,7 +1369,7 @@ def export_pm_plan_with_kits_pdf(
         story.append(tbl_due)
     story.append(Spacer(1, 8))
 
-    # 4) Matériels (outillage, EPI…)
+    # 4) Matériels / outils / EPI
     _add_tools_section(story, styles, tools_checklist)
 
     story.append(Spacer(1, 8))
