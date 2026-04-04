@@ -4,7 +4,8 @@ from __future__ import annotations
 from pathlib import Path
 import io
 import hashlib
-from typing import Any, Optional
+import math
+from typing import Any, Optional, Dict, List
 
 import numpy as np
 import pandas as pd
@@ -13,6 +14,7 @@ import streamlit as st
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from scipy import stats as sst
 
 from core.reliability.weibull import fit_weibull
 from core.reliability.policy import suggested_actions
@@ -38,7 +40,7 @@ require_login()
 render_shell("pages/3_Optimisation_verified.py")
 render_page_header(
     "Optimisation",
-    "Intervalles recommandés, coûts, fiabilité et préparation du planning de maintenance.",
+    "Reprise des indicateurs, calcul complet des intervalles optimaux et décision finale de maintenance.",
     "🧠",
 )
 
@@ -82,9 +84,18 @@ def dataframe_hash(dataframe: pd.DataFrame) -> str:
     return hashlib.md5(dataframe.to_csv(index=False).encode("utf-8")).hexdigest()
 
 
-def recommend_maintenance_type(
-    reliability_result: dict[str, Any],
-) -> str:
+def rename_columns_for_display(dataframe: pd.DataFrame) -> pd.DataFrame:
+    if dataframe is None or dataframe.empty:
+        return dataframe
+    renamed_dataframe = dataframe.copy()
+    renamed_dataframe = renamed_dataframe.rename(columns={
+        column: DISPLAY_COLUMN_NAMES.get(column, column)
+        for column in renamed_dataframe.columns
+    })
+    return renamed_dataframe
+
+
+def recommend_maintenance_type(reliability_result: dict[str, Any]) -> str:
     process_name = str(reliability_result.get("model") or "").upper()
     process_variant = str(reliability_result.get("process_variant") or "").upper()
     decision = reliability_result.get("decision", {}) or {}
@@ -113,25 +124,41 @@ def recommend_maintenance_type(
     return "Maintenance préventive planifiée"
 
 
-def recommend_interval(
-    maintenance_type: str,
+def choose_recommended_interval(
     reliability_interval_hours: Any,
     economic_interval_hours: Any,
-) -> Optional[float]:
-    candidate_values = [
-        float(value)
-        for value in [reliability_interval_hours, economic_interval_hours]
-        if is_positive_number(value)
-    ]
-    if not candidate_values:
-        return None
+    reliability_at_economic_interval: Any,
+    reliability_floor: float,
+) -> tuple[Optional[float], str]:
+    tr = safe_number(reliability_interval_hours)
+    tc = safe_number(economic_interval_hours)
+    rtc = safe_number(reliability_at_economic_interval)
 
-    maintenance_type_lower = maintenance_type.lower()
+    if tr is None and tc is None:
+        return None, "Aucun intervalle exploitable n’a pu être calculé."
 
-    if "corrective" in maintenance_type_lower and "fiabilisation" in maintenance_type_lower:
-        return None
+    if tc is None and tr is not None:
+        return tr, "T_cost n’est pas disponible. T_R est retenu automatiquement."
 
-    return float(min(candidate_values))
+    if tr is None and tc is not None:
+        return tc, "T_R n’est pas disponible. T_cost est retenu automatiquement."
+
+    if rtc is not None and rtc < reliability_floor:
+        return tr, (
+            f"R(T_cost) = {rtc:.3f} est inférieur au seuil {reliability_floor:.2f}. "
+            "T_R est retenu automatiquement."
+        )
+
+    if tc >= tr:
+        return tc, (
+            f"T_cost = {tc:.1f} h maximise le nombre de jours avant maintenance et respecte "
+            f"le seuil de fiabilité ({reliability_floor:.2f})."
+        )
+
+    return tr, (
+        f"T_R = {tr:.1f} h est plus grand ou plus prudent dans le cas présent. "
+        "Il est retenu comme intervalle recommandé."
+    )
 
 
 def build_optimization_note(
@@ -139,82 +166,346 @@ def build_optimization_note(
     economic_interval_hours: Any,
     reliability_interval_hours: Any,
     recommended_interval_hours: Any,
+    reliability_at_economic_interval: Any,
+    decision_rule_text: str,
 ) -> str:
     characteristic_life_value = safe_number(characteristic_life_hours)
     economic_interval_value = safe_number(economic_interval_hours)
     reliability_interval_value = safe_number(reliability_interval_hours)
     recommended_interval_value = safe_number(recommended_interval_hours)
+    reliability_at_economic_value = safe_number(reliability_at_economic_interval)
 
     if recommended_interval_value is None:
         return "Aucun intervalle exploitable n’a pu être retenu automatiquement pour cet équipement."
 
     parts = [f"Intervalle retenu : {recommended_interval_value:.1f} heures."]
-
     if reliability_interval_value is not None:
-        parts.append(f"Intervalle issu du critère de fiabilité : {reliability_interval_value:.1f} heures.")
-
+        parts.append(f"T_R = {reliability_interval_value:.1f} heures.")
     if economic_interval_value is not None:
-        parts.append(f"Intervalle issu du critère économique : {economic_interval_value:.1f} heures.")
-
+        parts.append(f"T_cost = {economic_interval_value:.1f} heures.")
+    if reliability_at_economic_value is not None:
+        parts.append(f"R(T_cost) = {reliability_at_economic_value:.3f}.")
     if characteristic_life_value is not None:
         parts.append(f"Vie caractéristique estimée : {characteristic_life_value:.1f} heures.")
-        ratio = recommended_interval_value / max(characteristic_life_value, 1e-9)
-        if ratio < 0.5:
-            parts.append("La décision retenue reste prudente par rapport à la vie caractéristique.")
-        elif ratio <= 1.0:
-            parts.append("La décision retenue reste cohérente avec la vie caractéristique estimée.")
-        else:
-            parts.append("L’intervalle retenu dépasse la vie caractéristique : une vigilance renforcée est nécessaire.")
-
+    parts.append(decision_rule_text)
     return " ".join(parts)
+
+
+def days_from_hours(hours: Any) -> Optional[float]:
+    value = safe_number(hours)
+    if value is None:
+        return None
+    return value / 24.0
+
+
+def get_distribution_and_parameters(reliability_result: Dict[str, Any]):
+    if str(reliability_result.get("model") or "").upper() != "RP":
+        return None, None
+
+    distribution_name = reliability_result.get("distribution")
+    raw_parameters = (reliability_result.get("params") or {}).get("raw")
+    if not raw_parameters:
+        return None, None
+
+    if distribution_name == "expon":
+        return sst.expon, raw_parameters
+    if distribution_name == "norm":
+        return sst.norm, raw_parameters
+    if distribution_name == "lognorm":
+        return sst.lognorm, raw_parameters
+    if distribution_name in {"weibull_2p", "weibull_3p"}:
+        return sst.weibull_min, raw_parameters
+    return None, None
+
+
+def compute_rp_curve(reliability_result: Dict[str, Any], time_axis: np.ndarray, curve_name: str) -> Optional[np.ndarray]:
+    distribution_object, distribution_parameters = get_distribution_and_parameters(reliability_result)
+    if distribution_object is None or distribution_parameters is None:
+        return None
+
+    try:
+        if curve_name == "survival":
+            return np.asarray(distribution_object.sf(time_axis, *distribution_parameters), dtype=float)
+        if curve_name == "cdf":
+            return np.asarray(distribution_object.cdf(time_axis, *distribution_parameters), dtype=float)
+        if curve_name == "pdf":
+            return np.asarray(distribution_object.pdf(time_axis, *distribution_parameters), dtype=float)
+        if curve_name == "hazard":
+            survival_values = distribution_object.sf(time_axis, *distribution_parameters)
+            density_values = distribution_object.pdf(time_axis, *distribution_parameters)
+            return np.divide(
+                density_values,
+                survival_values,
+                out=np.full_like(density_values, np.nan, dtype=float),
+                where=survival_values > 1e-12,
+            )
+    except Exception:
+        return None
+    return None
+
+
+def compute_nhpp_curve(reliability_result: Dict[str, Any], time_axis: np.ndarray, curve_name: str) -> Optional[np.ndarray]:
+    parameters = reliability_result.get("params", {}) or {}
+    beta_value = safe_number(parameters.get("beta"))
+    eta_value = safe_number(parameters.get("eta"))
+
+    if beta_value is None or eta_value is None or beta_value <= 0 or eta_value <= 0:
+        return None
+
+    safe_time_axis = np.maximum(time_axis, 1e-6)
+    cumulative_events = (safe_time_axis / eta_value) ** beta_value
+    intensity = (beta_value / eta_value) * ((safe_time_axis / eta_value) ** (beta_value - 1.0))
+    survival_like = np.exp(-cumulative_events)
+    cumulative_probability = 1.0 - survival_like
+    density_like = intensity * survival_like
+
+    if curve_name == "survival":
+        return survival_like
+    if curve_name == "cdf":
+        return cumulative_probability
+    if curve_name == "pdf":
+        return density_like
+    if curve_name == "hazard":
+        return intensity
+    return None
+
+
+def compute_bpp_curve(reliability_result: Dict[str, Any], ttf_series: list[float], time_axis: np.ndarray, curve_name: str) -> Optional[np.ndarray]:
+    parameters = reliability_result.get("params", {}) or {}
+    mu_value = safe_number(parameters.get("mu"))
+    alpha_value = safe_number(parameters.get("alpha"))
+    beta_kernel_value = safe_number(parameters.get("beta_kernel"))
+
+    if mu_value is None or alpha_value is None or beta_kernel_value is None:
+        return None
+    if mu_value < 0 or alpha_value < 0 or beta_kernel_value <= 0:
+        return None
+
+    event_times = np.cumsum(np.asarray(ttf_series, dtype=float))
+    if event_times.size == 0:
+        return None
+
+    safe_time_axis = np.maximum(time_axis, 1e-6)
+    intensity = np.full_like(safe_time_axis, fill_value=mu_value, dtype=float)
+
+    for event_time in event_times:
+        mask = safe_time_axis >= event_time
+        if np.any(mask):
+            intensity[mask] += alpha_value * np.exp(-beta_kernel_value * (safe_time_axis[mask] - event_time))
+
+    cumulative_intensity = np.zeros_like(safe_time_axis, dtype=float)
+    if len(safe_time_axis) > 1:
+        delta = np.diff(safe_time_axis)
+        trapezoids = 0.5 * (intensity[1:] + intensity[:-1]) * delta
+        cumulative_intensity[1:] = np.cumsum(trapezoids)
+
+    survival_like = np.exp(-cumulative_intensity)
+    cumulative_probability = 1.0 - survival_like
+    density_like = intensity * survival_like
+
+    if curve_name == "survival":
+        return survival_like
+    if curve_name == "cdf":
+        return cumulative_probability
+    if curve_name == "pdf":
+        return density_like
+    if curve_name == "hazard":
+        return intensity
+    return None
+
+
+def compute_model_based_curve(reliability_result: Dict[str, Any], ttf_series: list[float], time_axis: np.ndarray, curve_name: str) -> Optional[np.ndarray]:
+    model_name = str(reliability_result.get("model") or "").upper()
+
+    if model_name == "RP":
+        return compute_rp_curve(reliability_result, time_axis, curve_name)
+    if model_name == "NHPP":
+        return compute_nhpp_curve(reliability_result, time_axis, curve_name)
+    if model_name == "BPP":
+        return compute_bpp_curve(reliability_result, ttf_series, time_axis, curve_name)
+    return None
+
+
+def build_time_horizon_for_equipment(reliability_result: Dict[str, Any], ttf_series: list[float], extra_values: Optional[list[float]] = None) -> float:
+    values = np.asarray(ttf_series, dtype=float)
+    values = values[np.isfinite(values)]
+    values = values[values > 0]
+
+    if values.size == 0:
+        return 100.0
+
+    parameters = reliability_result.get("params", {}) or {}
+    eta_value = safe_number(parameters.get("eta"))
+
+    base_horizon = max(
+        50.0,
+        float(np.max(values)) * 2.0,
+        float(np.mean(values)) * 6.0,
+        float(np.quantile(values, 0.90)) * 4.0,
+    )
+
+    if eta_value is not None and eta_value > 0:
+        base_horizon = max(base_horizon, eta_value * 1.5)
+
+    extra_values = extra_values or []
+    positive_extras = [float(value) for value in extra_values if is_positive_number(value)]
+    if positive_extras:
+        base_horizon = max(base_horizon, max(positive_extras) * 1.25)
+
+    return base_horizon
+
+
+def build_curve_figure(
+    equipment_code: str,
+    reliability_result: Dict[str, Any],
+    ttf_series: list[float],
+    interval_tr: Any,
+    interval_tc: Any,
+    interval_rec: Any,
+) -> plt.Figure:
+    interval_tr_value = safe_number(interval_tr)
+    interval_tc_value = safe_number(interval_tc)
+    interval_rec_value = safe_number(interval_rec)
+
+    time_horizon = build_time_horizon_for_equipment(
+        reliability_result,
+        ttf_series,
+        extra_values=[interval_tr_value, interval_tc_value, interval_rec_value],
+    )
+    time_axis = np.linspace(1e-6, time_horizon, 400)
+
+    figure, axes = plt.subplots(2, 2, figsize=(11, 7))
+    axes = axes.ravel()
+    curve_definitions = [
+        ("survival", "Fiabilité R(t)", "R(t)"),
+        ("cdf", "Fonction de répartition F(t)", "F(t)"),
+        ("pdf", "Densité f(t)", "f(t)"),
+        ("hazard", "Taux de défaillance λ(t)", "λ(t)"),
+    ]
+
+    for axis, (curve_name, title, y_label) in zip(axes, curve_definitions):
+        curve_values = compute_model_based_curve(
+            reliability_result=reliability_result,
+            ttf_series=ttf_series,
+            time_axis=time_axis,
+            curve_name=curve_name,
+        )
+        if curve_values is None:
+            axis.text(0.5, 0.5, "Courbe indisponible", ha="center", va="center", transform=axis.transAxes)
+        else:
+            axis.plot(time_axis, curve_values, linewidth=2, label=f"{equipment_code} - {title}")
+
+        if interval_rec_value is not None:
+            axis.axvline(
+                interval_rec_value,
+                color="green",
+                linestyle="-",
+                linewidth=2.2,
+                label=f"T_recommandé = {interval_rec_value:.1f} h",
+            )
+
+        if interval_tr_value is not None:
+            color_tr = "green" if interval_rec_value is not None and abs(interval_rec_value - interval_tr_value) < 1e-9 else "red"
+            label_tr = f"T_R = {interval_tr_value:.1f} h"
+            if interval_rec_value is not None and abs(interval_rec_value - interval_tr_value) < 1e-9:
+                label_tr += " (retenu)"
+            axis.axvline(interval_tr_value, color=color_tr, linestyle="--", linewidth=1.6, label=label_tr)
+
+        if interval_tc_value is not None:
+            color_tc = "green" if interval_rec_value is not None and abs(interval_rec_value - interval_tc_value) < 1e-9 else "red"
+            label_tc = f"T_cost = {interval_tc_value:.1f} h"
+            if interval_rec_value is not None and abs(interval_rec_value - interval_tc_value) < 1e-9:
+                label_tc += " (retenu)"
+            axis.axvline(interval_tc_value, color=color_tc, linestyle=":", linewidth=1.8, label=label_tc)
+
+        axis.set_title(title)
+        axis.set_xlabel("Temps (heures)")
+        axis.set_ylabel(y_label)
+        axis.grid(True, alpha=0.3)
+        handles, labels = axis.get_legend_handles_labels()
+        seen = set()
+        unique_handles = []
+        unique_labels = []
+        for handle, label in zip(handles, labels):
+            if label not in seen:
+                seen.add(label)
+                unique_handles.append(handle)
+                unique_labels.append(label)
+        if unique_labels:
+            axis.legend(unique_handles, unique_labels, fontsize=8)
+
+    figure.suptitle(f"Courbes fiabilistes et intervalles d’optimisation - {equipment_code}", fontsize=12)
+    figure.tight_layout()
+    return figure
+
+
+def render_formula_block():
+    st.markdown("### Étapes et formules appliquées")
+    st.markdown(
+        """
+**Étape 1 — Reprise des indicateurs calculés précédemment**  
+On reprend les résultats fiabilistes déjà calculés : processus retenu, loi choisie, paramètres, MTTF, MTBF, MTTR et disponibilité.
+
+**Étape 2 — Calcul des deux intervalles candidats**  
+- **T_R** : intervalle issu du critère de fiabilité
+- **T_cost** : intervalle issu du critère économique
+
+**Étape 3 — Règle de décision finale**  
+On retient l’intervalle qui maximise les jours avant maintenance tout en respectant le seuil minimal de fiabilité.
+        """
+    )
+    st.latex(r"R(T)=\exp\left(-\left(\frac{T-\gamma}{\eta}\right)^\beta\right)")
+    st.latex(r"T_{recommand\acute{e}}=\max(T_{cost},T_R)")
+    st.latex(r"\text{Si } R(T_{cost})<0.70,\ \text{alors } T_{recommand\acute{e}}=T_R")
+    st.markdown(
+        """
+**Étape 4 — Lecture décisionnelle**  
+- si **R(T_cost) < 0.70**, on refuse automatiquement **T_cost**
+- sinon, on choisit la valeur la plus grande entre **T_cost** et **T_R**
+- les jours avant maintenance sont calculés par : **jours = T / 24**
+        """
+    )
 
 
 DISPLAY_COLUMN_NAMES = {
     "equipment_code": "Code équipement",
     "model": "Processus retenu",
     "process_variant": "Variant du processus",
-    "distribution": "Loi de probabilité retenue",
-    "mk_p": "Valeur p du test de Mann-Kendall",
-    "mk_direction": "Sens du test de Mann-Kendall",
-    "laplace_p": "Valeur p du test de Laplace",
-    "laplace_direction": "Sens du test de Laplace",
+    "distribution": "Loi choisie",
+    "mk_p": "p de Mann-Kendall",
+    "mk_direction": "Sens Mann-Kendall",
+    "laplace_p": "p de Laplace",
+    "laplace_direction": "Sens Laplace",
     "spearman_r": "Coefficient de Spearman",
-    "spearman_p": "Valeur p du test de Spearman",
-    "MTTF_h": "Temps moyen avant défaillance (heures)",
-    "MTBF_h": "Temps moyen entre défaillances (heures)",
-    "MTTR_h": "Temps moyen de réparation (heures)",
-    "availability_pct": "Disponibilité intrinsèque (%)",
-    "beta": "Paramètre bêta",
-    "eta_h": "Paramètre êta (heures)",
-    "gamma_h": "Paramètre gamma (heures)",
-    "beta_weibull_ref": "Bêta Weibull de référence",
-    "eta_weibull_ref_h": "Êta Weibull de référence (heures)",
-    "gamma_weibull_ref_h": "Gamma Weibull de référence (heures)",
-    "T_R_h": "Intervalle issu du critère de fiabilité (heures)",
-    "T_cost_h": "Intervalle issu du critère économique (heures)",
-    "R(T_cost)": "Fiabilité au niveau de l’intervalle économique",
-    "C_min_per_h": "Coût minimal par heure",
-    "T_recommended_h": "Intervalle recommandé (heures)",
+    "spearman_p": "p de Spearman",
+    "MTTF_h": "MTTF (h)",
+    "MTBF_h": "MTBF (h)",
+    "MTTR_h": "MTTR (h)",
+    "availability_pct": "Disponibilité (%)",
+    "beta": "Bêta",
+    "eta_h": "Êta (h)",
+    "gamma_h": "Gamma (h)",
+    "beta_weibull_ref": "Bêta Weibull référence",
+    "eta_weibull_ref_h": "Êta Weibull référence (h)",
+    "gamma_weibull_ref_h": "Gamma Weibull référence (h)",
+    "T_R_h": "T_R (h)",
+    "T_cost_h": "T_cost (h)",
+    "R(T_cost)": "R(T_cost)",
+    "C_min_per_h": "C_min / h",
+    "T_recommended_h": "T_recommandé (h)",
+    "days_T_R": "Jours avant maintenance via T_R",
+    "days_T_cost": "Jours avant maintenance via T_cost",
+    "days_recommended": "Jours avant maintenance retenus",
+    "recommended_source": "Source de l’intervalle retenu",
     "maintenance_type": "Type de maintenance recommandé",
-    "decision_reason": "Justification de la décision fiabiliste",
+    "decision_reason": "Justification fiabiliste",
+    "optimization_decision": "Règle de décision d’optimisation",
     "optimization_note": "Note d’optimisation",
     "trend_direction": "Sens global de la tendance",
     "trend_confidence": "Niveau de confiance sur la tendance",
-    "reliability_adjustment_accepted": "Ajustement fiabiliste accepté",
+    "reliability_adjustment_accepted": "Ajustement accepté",
     "reliability_ok": "Conformité fiabiliste",
 }
-
-
-def rename_columns_for_display(dataframe: pd.DataFrame) -> pd.DataFrame:
-    if dataframe is None or dataframe.empty:
-        return dataframe
-    renamed_dataframe = dataframe.copy()
-    renamed_dataframe = renamed_dataframe.rename(columns={
-        column: DISPLAY_COLUMN_NAMES.get(column, column)
-        for column in renamed_dataframe.columns
-    })
-    return renamed_dataframe
-
 
 DETAIL_TABLE_LABELS = {
     "trend_results": "Résultats détaillés des tests de tendance",
@@ -318,15 +609,15 @@ if not selected_equipment_codes:
 
 economic_col_1, economic_col_2, economic_col_3, economic_col_4 = st.columns(4)
 with economic_col_1:
-    target_reliability = st.slider("Fiabilité cible", 0.50, 0.99, 0.80, 0.01)
+    target_reliability = st.slider("Fiabilité cible R*", 0.50, 0.99, 0.80, 0.01)
 with economic_col_2:
-    preventive_cost = st.number_input("Coût préventif", min_value=0.0, value=1.0, step=0.1)
+    preventive_cost = st.number_input("Coût préventif Cp", min_value=0.0, value=1.0, step=0.1)
 with economic_col_3:
-    corrective_cost = st.number_input("Coût correctif", min_value=0.0, value=5.0, step=0.5)
+    corrective_cost = st.number_input("Coût correctif Cf", min_value=0.0, value=5.0, step=0.5)
 with economic_col_4:
     minimum_reliability_for_economic_interval = st.slider(
-        "Fiabilité minimale pour le calcul économique",
-        0.0,
+        "Seuil minimal accepté pour R(T_cost)",
+        0.50,
         0.99,
         0.70,
         0.01,
@@ -343,13 +634,17 @@ if not economic_optimization_enabled:
 weibull_reference_fits: dict[str, Any] = {}
 pipeline_results_by_equipment: dict[str, dict[str, Any]] = {}
 detail_tables_by_equipment: dict[str, dict[str, pd.DataFrame]] = {}
-optimization_rows: list[dict[str, Any]] = []
+optimization_rows: list[dict[str, Any]] = {}
+optimization_rows = []
+ttf_by_equipment: dict[str, list[float]] = {}
 
 for equipment_code in selected_equipment_codes:
     equipment_dataframe = source_dataframe[source_dataframe["equipment_code"] == equipment_code].copy()
     time_to_failure_series = series_to_positive_list(equipment_dataframe["ttf_h"])
     if not time_to_failure_series or len(time_to_failure_series) < 3:
         continue
+
+    ttf_by_equipment[equipment_code] = time_to_failure_series
 
     repair_time_series = None
     if "duree_rep_h" in equipment_dataframe.columns:
@@ -425,12 +720,25 @@ for equipment_code, weibull_fit in weibull_reference_fits.items():
     reliability_at_economic_interval = (economic_results_by_equipment.get(equipment_code) or {}).get("R_at_T")
     minimum_hourly_cost = (economic_results_by_equipment.get(equipment_code) or {}).get("C_min")
 
-    recommended_maintenance_type = recommend_maintenance_type(reliability_result)
-    recommended_interval_hours = recommend_interval(
-        recommended_maintenance_type,
-        reliability_interval_hours,
-        economic_interval_hours,
+    recommended_interval_hours, optimization_decision = choose_recommended_interval(
+        reliability_interval_hours=reliability_interval_hours,
+        economic_interval_hours=economic_interval_hours,
+        reliability_at_economic_interval=reliability_at_economic_interval,
+        reliability_floor=float(minimum_reliability_for_economic_interval),
     )
+
+    tr_value = safe_number(reliability_interval_hours)
+    tc_value = safe_number(economic_interval_hours)
+    rec_value = safe_number(recommended_interval_hours)
+
+    if rec_value is not None and tr_value is not None and abs(rec_value - tr_value) < 1e-9:
+        recommended_source = "T_R"
+    elif rec_value is not None and tc_value is not None and abs(rec_value - tc_value) < 1e-9:
+        recommended_source = "T_cost"
+    else:
+        recommended_source = "Indéterminé"
+
+    recommended_maintenance_type = recommend_maintenance_type(reliability_result)
 
     mann_kendall_test_result = tests.get("trend_mk", {}) or {}
     laplace_test_result = tests.get("trend_laplace", {}) or {}
@@ -449,8 +757,8 @@ for equipment_code, weibull_fit in weibull_reference_fits.items():
             "mk_direction": mann_kendall_test_result.get("direction"),
             "laplace_p": laplace_test_result.get("p"),
             "laplace_direction": laplace_test_result.get("direction"),
-            "spearman_r": dependence_test_result.get("spearman_r"),
-            "spearman_p": dependence_test_result.get("spearman_p"),
+            "spearman_r": dependence_test_result.get("spearman_r") or dependence_test_result.get("r"),
+            "spearman_p": dependence_test_result.get("spearman_p") or dependence_test_result.get("p"),
             "trend_direction": decision.get("trend_direction"),
             "trend_confidence": decision.get("trend_confidence"),
             "MTTF_h": indicators.get("theoretical_mttf_h") or indicators.get("empirical_mttf_h"),
@@ -465,18 +773,25 @@ for equipment_code, weibull_fit in weibull_reference_fits.items():
             "gamma_weibull_ref_h": weibull_gamma_reference,
             "reliability_adjustment_accepted": reliability_adjustment_accepted,
             "reliability_ok": reliability_is_ok,
-            "T_R_h": safe_number(reliability_interval_hours),
-            "T_cost_h": safe_number(economic_interval_hours),
+            "T_R_h": tr_value,
+            "T_cost_h": tc_value,
             "R(T_cost)": safe_number(reliability_at_economic_interval),
             "C_min_per_h": safe_number(minimum_hourly_cost),
-            "T_recommended_h": safe_number(recommended_interval_hours),
+            "T_recommended_h": rec_value,
+            "days_T_R": days_from_hours(tr_value),
+            "days_T_cost": days_from_hours(tc_value),
+            "days_recommended": days_from_hours(rec_value),
+            "recommended_source": recommended_source,
             "maintenance_type": recommended_maintenance_type,
             "decision_reason": decision.get("reason"),
+            "optimization_decision": optimization_decision,
             "optimization_note": build_optimization_note(
                 primary_eta,
                 economic_interval_hours,
                 reliability_interval_hours,
                 recommended_interval_hours,
+                reliability_at_economic_interval,
+                optimization_decision,
             ),
         }
     )
@@ -498,43 +813,48 @@ st.session_state["opt_meta"] = {
 # -------------------------------------------------------------------
 # Affichages
 # -------------------------------------------------------------------
+metric_col_1, metric_col_2, metric_col_3, metric_col_4 = st.columns(4)
+with metric_col_1:
+    st.metric("Équipements optimisés", len(optimization_dataframe))
+with metric_col_2:
+    st.metric(
+        "Jours max avant maintenance",
+        format_number(optimization_dataframe["days_recommended"].dropna().max() if "days_recommended" in optimization_dataframe.columns and optimization_dataframe["days_recommended"].notna().any() else None, 1),
+    )
+with metric_col_3:
+    st.metric(
+        "Fiabilité moyenne à T_cost",
+        format_number(optimization_dataframe["R(T_cost)"].dropna().mean() if "R(T_cost)" in optimization_dataframe.columns and optimization_dataframe["R(T_cost)"].notna().any() else None, 3),
+    )
+with metric_col_4:
+    st.metric(
+        "Disponibilité moyenne",
+        format_number(optimization_dataframe["availability_pct"].dropna().mean() if optimization_dataframe["availability_pct"].notna().any() else None, 2),
+    )
+
 page_tabs = st.tabs([
-    "Paramètres issus de l’analyse",
-    "Résultat de l’optimisation",
+    "Indicateurs repris",
+    "Phase d’optimisation",
     "Courbes",
     "Détail par équipement",
     "Exports",
 ])
 
 with page_tabs[0]:
-    st.subheader("Paramètres issus de l’analyse")
+    st.subheader("Indicateurs repris depuis la phase précédente")
 
-    trend_dataframe = optimization_dataframe[
-        [
-            "equipment_code",
-            "mk_p",
-            "mk_direction",
-            "laplace_p",
-            "laplace_direction",
-            "trend_direction",
-            "trend_confidence",
-        ]
-    ].copy()
-
-    dependence_dataframe = optimization_dataframe[
-        [
-            "equipment_code",
-            "spearman_r",
-            "spearman_p",
-        ]
-    ].copy()
-
-    reliability_dataframe = optimization_dataframe[
+    indicators_view = optimization_dataframe[
         [
             "equipment_code",
             "model",
             "process_variant",
             "distribution",
+            "mk_p",
+            "mk_direction",
+            "laplace_p",
+            "laplace_direction",
+            "spearman_r",
+            "spearman_p",
             "MTTF_h",
             "MTBF_h",
             "MTTR_h",
@@ -542,45 +862,36 @@ with page_tabs[0]:
             "beta",
             "eta_h",
             "gamma_h",
-            "reliability_adjustment_accepted",
         ]
     ].copy()
-
-    st.markdown("#### Tendance")
-    st.dataframe(rename_columns_for_display(trend_dataframe), use_container_width=True, hide_index=True)
-
-    st.markdown("#### Dépendance")
-    st.dataframe(rename_columns_for_display(dependence_dataframe), use_container_width=True, hide_index=True)
-
-    st.markdown("#### Fiabilité")
-    st.dataframe(rename_columns_for_display(reliability_dataframe), use_container_width=True, hide_index=True)
+    st.dataframe(rename_columns_for_display(indicators_view), use_container_width=True, hide_index=True)
 
 with page_tabs[1]:
-    st.subheader("Résultat de l’optimisation")
+    st.subheader("Phase d’optimisation complète")
+    render_formula_block()
 
     optimization_view = optimization_dataframe[
         [
             "equipment_code",
             "model",
-            "process_variant",
             "distribution",
             "beta",
             "eta_h",
             "gamma_h",
-            "beta_weibull_ref",
-            "eta_weibull_ref_h",
-            "gamma_weibull_ref_h",
             "T_R_h",
             "T_cost_h",
-            "T_recommended_h",
             "R(T_cost)",
+            "T_recommended_h",
+            "days_T_R",
+            "days_T_cost",
+            "days_recommended",
+            "recommended_source",
             "C_min_per_h",
             "maintenance_type",
-            "reliability_ok",
+            "optimization_decision",
             "optimization_note",
         ]
     ].copy()
-
     st.dataframe(rename_columns_for_display(optimization_view), use_container_width=True, hide_index=True)
 
     st.success(
@@ -592,49 +903,36 @@ with page_tabs[1]:
         st.success(f"Fichier écrit : {FALLBACK_OPTIMIZATION_FILE}")
 
 with page_tabs[2]:
-    st.subheader("Courbes de fiabilité de référence économique")
+    st.subheader("Courbes fiabilistes avec intervalles d’optimisation")
 
-    eta_values = [float(getattr(fit, "eta", 1.0) or 1.0) for fit in weibull_reference_fits.values()]
-    maximum_time = max(eta_values) * 1.6 if eta_values else 1000.0
+    selected_equipment_for_curves = st.selectbox(
+        "Équipement pour les courbes",
+        options=optimization_dataframe["equipment_code"].tolist(),
+        key="optimization_curve_equipment",
+    )
 
-    interval_candidates = []
-    for _, row in optimization_dataframe.iterrows():
-        if is_positive_number(row.get("T_R_h")):
-            interval_candidates.append(float(row["T_R_h"]))
-        if is_positive_number(row.get("T_cost_h")):
-            interval_candidates.append(float(row["T_cost_h"]))
+    selected_row_for_curves = optimization_dataframe[
+        optimization_dataframe["equipment_code"] == selected_equipment_for_curves
+    ].iloc[0].to_dict()
+    selected_reliability_for_curves = (pipeline_results_by_equipment.get(selected_equipment_for_curves, {}) or {}).get("reliability", {}) or {}
+    selected_ttf_for_curves = ttf_by_equipment.get(selected_equipment_for_curves, [])
 
-    if interval_candidates:
-        maximum_time = max(maximum_time, max(interval_candidates) * 1.2)
-
-    time_axis = np.linspace(0, max(maximum_time, 1.0), 350)
-    figure, axis = plt.subplots()
-
-    for equipment_code, fit in weibull_reference_fits.items():
-        beta_value = float(getattr(fit, "beta", 1.0))
-        eta_value = float(getattr(fit, "eta", 1.0))
-        gamma_value = float(getattr(fit, "gamma", 0.0) or 0.0)
-
-        reliability_curve = np.ones_like(time_axis, dtype=float)
-        mask = time_axis > gamma_value
-        reliability_curve[mask] = np.exp(-(((time_axis[mask] - gamma_value) / max(eta_value, 1e-9)) ** max(beta_value, 1e-9)))
-
-        process_name = ((pipeline_results_by_equipment.get(equipment_code, {}) or {}).get("reliability", {}) or {}).get("model", "?")
-        process_variant = ((pipeline_results_by_equipment.get(equipment_code, {}) or {}).get("reliability", {}) or {}).get("process_variant", "?")
-
-        axis.plot(
-            time_axis,
-            reliability_curve,
-            linewidth=2,
-            label=f"{equipment_code} | {process_name} / {process_variant} | bêta={beta_value:.2f}, êta={eta_value:.1f}",
-        )
-
-    axis.grid(True, alpha=0.3)
-    axis.set_xlabel("Temps (heures)")
-    axis.set_ylabel("Fiabilité")
-    axis.set_title("Courbe de fiabilité de référence")
-    axis.legend(fontsize=8)
+    figure = build_curve_figure(
+        equipment_code=selected_equipment_for_curves,
+        reliability_result=selected_reliability_for_curves,
+        ttf_series=selected_ttf_for_curves,
+        interval_tr=selected_row_for_curves.get("T_R_h"),
+        interval_tc=selected_row_for_curves.get("T_cost_h"),
+        interval_rec=selected_row_for_curves.get("T_recommended_h"),
+    )
     st.pyplot(figure, clear_figure=True)
+
+    st.info(
+        f"T_recommandé = {format_number(selected_row_for_curves.get('T_recommended_h'), 1)} h "
+        f"({format_number(selected_row_for_curves.get('days_recommended'), 1)} jours) | "
+        f"source retenue : {selected_row_for_curves.get('recommended_source', '—')}."
+    )
+    st.caption(selected_row_for_curves.get("optimization_decision", "—"))
 
 with page_tabs[3]:
     st.subheader("Détail par équipement")
@@ -642,37 +940,48 @@ with page_tabs[3]:
     selected_equipment_for_detail = st.selectbox(
         "Équipement détaillé",
         options=optimization_dataframe["equipment_code"].tolist(),
+        key="optimization_detail_equipment",
     )
     selected_row = optimization_dataframe[optimization_dataframe["equipment_code"] == selected_equipment_for_detail].iloc[0].to_dict()
     selected_pipeline_result = pipeline_results_by_equipment.get(selected_equipment_for_detail, {}) or {}
+    selected_reliability_result = selected_pipeline_result.get("reliability", {}) or {}
     selected_detail_tables = selected_pipeline_result.get("tables", {}) or {}
 
     st.markdown(
         f"### {selected_equipment_for_detail}\n"
         f"- **Processus retenu** : **{selected_row.get('model', '—')}**\n"
         f"- **Variant du processus** : **{selected_row.get('process_variant', '—')}**\n"
-        f"- **Loi de probabilité retenue** : **{selected_row.get('distribution', '—')}**\n"
-        f"- **Paramètres principaux** : **bêta = {format_number(selected_row.get('beta'), 2)}**, "
-        f"**êta = {format_number(selected_row.get('eta_h'), 1)} heures**, "
-        f"**gamma = {format_number(selected_row.get('gamma_h'), 1)} heures**\n"
-        f"- **Intervalle issu du critère économique** : **{format_number(selected_row.get('T_cost_h'), 1)} heures**\n"
-        f"- **Intervalle issu du critère de fiabilité** : **{format_number(selected_row.get('T_R_h'), 1)} heures**\n"
-        f"- **Intervalle recommandé** : **{format_number(selected_row.get('T_recommended_h'), 1)} heures**\n"
+        f"- **Loi choisie** : **{selected_row.get('distribution', '—')}**\n"
+        f"- **MTTF** : **{format_number(selected_row.get('MTTF_h'), 1)} h**\n"
+        f"- **MTBF** : **{format_number(selected_row.get('MTBF_h'), 1)} h**\n"
+        f"- **MTTR** : **{format_number(selected_row.get('MTTR_h'), 1)} h**\n"
+        f"- **Disponibilité** : **{format_number(selected_row.get('availability_pct'), 2)} %**\n"
+        f"- **Bêta / Êta / Gamma** : **{format_number(selected_row.get('beta'), 2)} / {format_number(selected_row.get('eta_h'), 1)} / {format_number(selected_row.get('gamma_h'), 1)}**\n"
+        f"- **T_R** : **{format_number(selected_row.get('T_R_h'), 1)} h**\n"
+        f"- **T_cost** : **{format_number(selected_row.get('T_cost_h'), 1)} h**\n"
+        f"- **R(T_cost)** : **{format_number(selected_row.get('R(T_cost)'), 3)}**\n"
+        f"- **T_recommandé** : **{format_number(selected_row.get('T_recommended_h'), 1)} h**\n"
+        f"- **Jours avant maintenance retenus** : **{format_number(selected_row.get('days_recommended'), 1)} jours**\n"
         f"- **Type de maintenance recommandé** : **{selected_row.get('maintenance_type', '—')}**"
     )
 
-    if selected_row.get("decision_reason"):
-        st.caption(str(selected_row["decision_reason"]))
-
     st.info(selected_row.get("optimization_note", "—"))
 
+    with st.expander("Voir la logique de décision détaillée", expanded=True):
+        st.markdown(
+            f"""
+- **Règle appliquée** : {selected_row.get('optimization_decision', '—')}
+- **Source retenue** : {selected_row.get('recommended_source', '—')}
+- **Justification fiabiliste** : {selected_row.get('decision_reason', '—')}
+            """
+        )
+
     st.markdown("#### Actions suggérées")
-    for action in suggested_actions(
-        float(selected_row["beta_weibull_ref"]) if is_positive_number(selected_row.get("beta_weibull_ref")) else 1.0
-    ):
+    beta_reference = float(selected_row["beta_weibull_ref"]) if is_positive_number(selected_row.get("beta_weibull_ref")) else 1.0
+    for action in suggested_actions(beta_reference):
         st.markdown(f"- {action}")
 
-    detail_tabs = st.tabs(["Fiabilité", "Tableaux exportables"])
+    detail_tabs = st.tabs(["Tableaux d’analyse", "Tableaux exportables"])
 
     with detail_tabs[0]:
         for table_key, section_title in [
@@ -688,10 +997,32 @@ with page_tabs[3]:
                 st.dataframe(rename_columns_for_display(table_dataframe), use_container_width=True, hide_index=True)
 
     with detail_tabs[1]:
-        for table_key, table_dataframe in selected_detail_tables.items():
-            if isinstance(table_dataframe, pd.DataFrame) and not table_dataframe.empty:
-                st.markdown(f"##### {DETAIL_TABLE_LABELS.get(table_key, table_key)}")
-                st.dataframe(rename_columns_for_display(table_dataframe), use_container_width=True, hide_index=True)
+        exportable_rows = pd.DataFrame(
+            [
+                {
+                    "equipment_code": selected_row.get("equipment_code"),
+                    "model": selected_row.get("model"),
+                    "process_variant": selected_row.get("process_variant"),
+                    "distribution": selected_row.get("distribution"),
+                    "MTTF_h": selected_row.get("MTTF_h"),
+                    "MTBF_h": selected_row.get("MTBF_h"),
+                    "MTTR_h": selected_row.get("MTTR_h"),
+                    "availability_pct": selected_row.get("availability_pct"),
+                    "beta": selected_row.get("beta"),
+                    "eta_h": selected_row.get("eta_h"),
+                    "gamma_h": selected_row.get("gamma_h"),
+                    "T_R_h": selected_row.get("T_R_h"),
+                    "T_cost_h": selected_row.get("T_cost_h"),
+                    "R(T_cost)": selected_row.get("R(T_cost)"),
+                    "T_recommended_h": selected_row.get("T_recommended_h"),
+                    "days_recommended": selected_row.get("days_recommended"),
+                    "recommended_source": selected_row.get("recommended_source"),
+                    "maintenance_type": selected_row.get("maintenance_type"),
+                    "optimization_decision": selected_row.get("optimization_decision"),
+                }
+            ]
+        )
+        st.dataframe(rename_columns_for_display(exportable_rows), use_container_width=True, hide_index=True)
 
 with page_tabs[4]:
     st.subheader("Exports")
@@ -731,21 +1062,20 @@ with page_tabs[4]:
                     intervals_by_equipment[equipment_code] = {
                         "T_R": current_row.get("T_R_h"),
                         "T_cost": current_row.get("T_cost_h"),
+                        "T_recommended": current_row.get("T_recommended_h"),
                         "R_at_T": current_row.get("R(T_cost)"),
                         "C_min": current_row.get("C_min_per_h"),
+                        "recommended_source": current_row.get("recommended_source"),
+                        "days_recommended": current_row.get("days_recommended"),
+                        "decision_text": current_row.get("optimization_decision"),
                     }
-
-                compatibility_reliability_results = {
-                    equipment_code: (pipeline_results_by_equipment.get(equipment_code, {}) or {}).get("reliability", {})
-                    for equipment_code in pipeline_results_by_equipment.keys()
-                }
 
                 try:
                     output_path = export_optimization_report_pdf(
                         df=source_dataframe[source_dataframe["equipment_code"].isin(selected_equipment_codes)].copy(),
                         fits=weibull_reference_fits,
                         intervals=intervals_by_equipment,
-                        organigram_by_eq=compatibility_reliability_results,
+                        organigram_by_eq=pipeline_results_by_equipment,
                         out_dir=str(BASE_DIR / "reports"),
                         df_out=optimization_dataframe,
                         meta={
@@ -761,7 +1091,7 @@ with page_tabs[4]:
                         source_dataframe[source_dataframe["equipment_code"].isin(selected_equipment_codes)].copy(),
                         weibull_reference_fits,
                         intervals_by_equipment,
-                        compatibility_reliability_results,
+                        pipeline_results_by_equipment,
                         out_dir=str(BASE_DIR / "reports"),
                     )
 
@@ -772,11 +1102,11 @@ with page_tabs[4]:
 
         pdf_path = st.session_state.get("opt_pdf_path")
         if pdf_path and Path(pdf_path).exists():
-            with open(pdf_path, "rb") as file:
-                st.download_button(
-                    "Télécharger le PDF d’optimisation",
-                    data=file,
-                    file_name=Path(pdf_path).name,
-                    mime="application/pdf",
-                    use_container_width=True,
-                )
+            pdf_bytes = Path(pdf_path).read_bytes()
+            st.download_button(
+                "Télécharger le PDF d’optimisation",
+                data=pdf_bytes,
+                file_name=Path(pdf_path).name,
+                mime="application/pdf",
+                use_container_width=True,
+            )

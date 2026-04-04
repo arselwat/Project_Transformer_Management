@@ -1,27 +1,18 @@
-
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import Any, Dict, List, Optional
 import datetime
 import math
 import unicodedata
 
 try:
-    from reportlab.lib.styles import ParagraphStyle
-    from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_JUSTIFY
-    from reportlab.lib.pagesizes import A4
     from reportlab.lib import colors
-    from reportlab.lib.units import mm, cm
-    from reportlab.lib.styles import getSampleStyleSheet
-    from reportlab.platypus import (
-        SimpleDocTemplate,
-        Paragraph,
-        Spacer,
-        Table,
-        TableStyle,
-        PageBreak,
-    )
+    from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY, TA_LEFT
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import cm, mm
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
     HAVE_REPORTLAB = True
 except Exception:
     HAVE_REPORTLAB = False
@@ -37,67 +28,62 @@ except Exception:
     HAVE_FPDF = False
 
 
-# =========================
-# Helpers
-# =========================
-def SAN(s: Any) -> str:
-    s = "" if s is None else str(s)
-    s = (
-        s.replace("’", "'").replace("‘", "'")
-         .replace("“", '"').replace("”", '"')
-         .replace("–", "-").replace("—", "-")
-         .replace("•", "-").replace("…", "...")
-         .replace("\u00A0", " ")
+SPARE_PARTS: List[Dict[str, Any]] = [
+    {"categorie": "Étanchéité & cuve", "piece": "Joints plats de cuve", "qte_reco": "1 jeu", "criticite": "Élevée", "remarques": "Pour interventions lourdes"},
+    {"categorie": "Isolation & traversées", "piece": "Traversée HT", "qte_reco": "1 unité", "criticite": "Élevée", "remarques": "Pièce critique"},
+    {"categorie": "OLTC", "piece": "Contacts mobiles OLTC", "qte_reco": "1 kit", "criticite": "Très élevée", "remarques": "Révision lourde"},
+    {"categorie": "Protection & mesure", "piece": "Relais Buchholz", "qte_reco": "1 unité", "criticite": "Élevée", "remarques": "Pièce de sécurité"},
+    {"categorie": "Consommables", "piece": "Huile isolante neuve", "qte_reco": "1 fût / IBC", "criticite": "Très élevée", "remarques": "Appoint ou traitement"},
+]
+
+DEFAULT_TOOLS = [
+    {"categorie": "Mesure & essais", "outil": "Micro-ohmmètre", "description": "Résistance d’enroulements", "qte": 1, "unite": "pcs", "calibrage": "OK", "remarques": ""},
+    {"categorie": "Mesure & essais", "outil": "Mégohmmètre 5 kV", "description": "Résistance d’isolement", "qte": 1, "unite": "pcs", "calibrage": "OK", "remarques": ""},
+    {"categorie": "Outils", "outil": "Clés dynamométriques", "description": "Serrage au couple", "qte": 1, "unite": "set", "calibrage": "OK", "remarques": ""},
+    {"categorie": "Sécurité", "outil": "EPI complets", "description": "Gants, casque, visière, tenue", "qte": 1, "unite": "set", "calibrage": "N/A", "remarques": ""},
+]
+
+
+def SAN(value: Any) -> str:
+    text = "" if value is None else str(value)
+    text = (
+        text.replace("’", "'").replace("‘", "'")
+        .replace("“", '"').replace("”", '"')
+        .replace("–", "-").replace("—", "-")
+        .replace("•", "-").replace("…", "...")
+        .replace("≤", "<=").replace("≥", ">=")
+        .replace("β", "beta").replace("η", "eta").replace("γ", "gamma")
+        .replace("\u00A0", " ")
     )
-    s = (
-        s.replace("≤", "<=").replace("≥", ">=").replace("±", "+/-")
-         .replace("Ω", "Ohm").replace("δ", "delta")
-         .replace("β", "beta").replace("η", "eta").replace("γ", "gamma")
-         .replace("θ", "theta")
-         .replace("°C", " degC")
-    )
-    s = unicodedata.normalize("NFKD", s)
-    return s.encode("latin-1", "ignore").decode("latin-1", "ignore")
+    text = unicodedata.normalize("NFKD", text)
+    return text.encode("latin-1", "ignore").decode("latin-1", "ignore")
 
 
 def fnum(v: Any, nd: int = 1, default: str = "-") -> str:
     try:
         if v is None:
             return default
-        if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+        numeric = float(v)
+        if math.isnan(numeric) or math.isinf(numeric):
             return default
-        return f"{float(v):.{nd}f}"
+        return f"{numeric:.{nd}f}"
     except Exception:
         return default
 
 
 def safe_float(v: Any, default: Optional[float] = None) -> Optional[float]:
     try:
-        if v is None:
+        numeric = float(v)
+        if math.isnan(numeric) or math.isinf(numeric):
             return default
-        x = float(v)
-        if math.isnan(x) or math.isinf(x):
-            return default
-        return x
+        return numeric
     except Exception:
         return default
 
 
-def _compact(text: Any, max_len: int = 160) -> str:
+def _compact(text: Any, max_len: int = 140) -> str:
     s = SAN(text).replace("\n", " ").strip()
-    if len(s) <= max_len:
-        return s
-    return s[: max_len - 3] + "..."
-
-
-def _title(story, styles, text: str, level: int = 3, space_after_pt: int = 6):
-    h = {1: "Heading1", 2: "Heading2", 3: "Heading3"}.get(level, "Heading3")
-    story.append(Paragraph(SAN(text), styles[h]))
-    story.append(Spacer(1, space_after_pt))
-
-
-def _body_style(styles):
-    return styles["Justify"] if "Justify" in styles.byName else styles["BodyText"]
+    return s if len(s) <= max_len else s[: max_len - 3] + "..."
 
 
 def _page_available_width(left_margin_mm: float = 16, right_margin_mm: float = 16) -> float:
@@ -108,509 +94,218 @@ def _scale_widths(widths, available_width):
     if not widths:
         return widths
     total = sum(widths)
-    if total <= 0:
-        return widths
-    if total <= available_width:
+    if total <= 0 or total <= available_width:
         return widths
     factor = available_width / total
     return [w * factor for w in widths]
 
 
-def _auto_widths_from_data(data, available_width, min_col_mm=16, max_col_mm=65):
+def _auto_widths_from_data(data, available_width, min_col_mm=16, max_col_mm=70):
     if not data:
         return None
     ncols = max(len(r) for r in data)
     lengths = [8] * ncols
-
     for row in data[:40]:
-        for i in range(ncols):
-            cell = row[i] if i < len(row) else ""
-            lengths[i] = max(lengths[i], min(len(str(cell)), 60))
-
-    total_len = sum(lengths) if sum(lengths) > 0 else ncols
-    widths = [(length / total_len) * available_width for length in lengths]
-    min_w = min_col_mm * mm
-    max_w = max_col_mm * mm
-    widths = [min(max(w, min_w), max_w) for w in widths]
+        for idx in range(ncols):
+            cell = row[idx] if idx < len(row) else ""
+            lengths[idx] = max(lengths[idx], min(len(str(cell)), 60))
+    total = sum(lengths) if sum(lengths) > 0 else ncols
+    widths = [(length / total) * available_width for length in lengths]
+    widths = [max(min_col_mm * mm, min(max_col_mm * mm, w)) for w in widths]
     return _scale_widths(widths, available_width)
 
 
-def _mk_table(
-    data,
-    widths=None,
-    font_size=8,
-    header_font_size=None,
-    header_center=True,
-    available_width=None,
-):
+def _mk_table(data, widths=None, font_size=8, available_width=None):
     if available_width is None:
         available_width = _page_available_width()
-
-    header_font_size = header_font_size or max(font_size, 8)
 
     body_style = ParagraphStyle(
         name=f"tbl_body_{font_size}_{len(data)}",
         fontName="Helvetica",
         fontSize=font_size,
-        leading=max(10, int(font_size * 1.35)),
-        spaceBefore=0,
-        spaceAfter=0,
+        leading=max(9, int(font_size * 1.35)),
         alignment=TA_LEFT,
         wordWrap="CJK",
         splitLongWords=True,
     )
-
     head_style = ParagraphStyle(
         name=f"tbl_head_{font_size}_{len(data)}",
         fontName="Helvetica-Bold",
-        fontSize=header_font_size,
-        leading=max(10, int(header_font_size * 1.2)),
-        spaceBefore=0,
-        spaceAfter=0,
-        alignment=TA_CENTER if header_center else TA_LEFT,
+        fontSize=max(8, font_size),
+        leading=max(10, int(font_size * 1.25)),
+        alignment=TA_CENTER,
         wordWrap="CJK",
         splitLongWords=True,
     )
 
     def to_para(x, style):
-        s = SAN(x).replace("\n", "<br/>")
-        return Paragraph(s, style)
+        return Paragraph(SAN(x).replace("\n", "<br/>"), style)
 
     wrapped = []
-    for i, row in enumerate(data):
-        style = head_style if i == 0 else body_style
+    for row_idx, row in enumerate(data):
+        style = head_style if row_idx == 0 else body_style
         wrapped.append([to_para(cell, style) for cell in row])
 
-    if widths is not None:
-        widths = _scale_widths(widths, available_width)
-    else:
+    if widths is None:
         widths = _auto_widths_from_data(data, available_width)
+    else:
+        widths = _scale_widths(widths, available_width)
 
-    t = Table(
-        wrapped,
-        repeatRows=1,
-        colWidths=widths,
-        splitByRow=1,
-    )
-
-    t.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.whitesmoke),
+    tbl = Table(wrapped, repeatRows=1, colWidths=widths, splitByRow=1)
+    tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F3F4F6")),
         ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
-        ("GRID", (0, 0), (-1, -1), 0.3, colors.grey),
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.black),
+        ("BOX", (0, 0), (-1, -1), 1.1, colors.black),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
         ("LEFTPADDING", (0, 0), (-1, -1), 4),
         ("RIGHTPADDING", (0, 0), (-1, -1), 4),
         ("TOPPADDING", (0, 0), (-1, -1), 3),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
-        ("LINEBELOW", (0, 0), (-1, 0), 0.8, colors.grey),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#FAFAFA")]),
     ]))
-
-    return t
-
-
-SPARE_PARTS: List[Dict[str, Any]] = [
-    {"categorie": "Étanchéité & cuve", "piece": "Joints plats de cuve (couvercle)", "qte_reco": "1 jeu complet", "criticite": "Élevée", "remarques": "Pour interventions lourdes (ouverture de cuve)"},
-    {"categorie": "Étanchéité & cuve", "piece": "Joints de brides de radiateurs", "qte_reco": "Assortiment", "criticite": "Élevée", "remarques": "Très utile en cas de fuite d’huile sur radiateurs"},
-    {"categorie": "Étanchéité & cuve", "piece": "Joints du conservateur d’huile", "qte_reco": "1 jeu", "criticite": "Moyenne", "remarques": "Prévoir modèle conforme constructeur"},
-    {"categorie": "Isolation & traversées", "piece": "Isolateurs de traversée HT", "qte_reco": "1 unité par type critique", "criticite": "Élevée", "remarques": "Si un isolateur casse, arrêt de longue durée sans spare"},
-    {"categorie": "Isolation & traversées", "piece": "Isolateurs de traversée MT", "qte_reco": "1–2 unités", "criticite": "Élevée", "remarques": "À adapter au schéma de raccordement"},
-    {"categorie": "OLTC", "piece": "Jeu de contacts mobiles OLTC", "qte_reco": "1 kit complet", "criticite": "Très élevée", "remarques": "Pièce critique, à remplacer en révision lourde"},
-    {"categorie": "OLTC", "piece": "Jeu de contacts fixes OLTC", "qte_reco": "1 kit complet", "criticite": "Très élevée", "remarques": "Souvent remplacé avec les contacts mobiles"},
-    {"categorie": "OLTC", "piece": "Ressorts de contacts OLTC", "qte_reco": "1 kit", "criticite": "Élevée", "remarques": "Perte de pression = mauvais contact = échauffement"},
-    {"categorie": "Refroidissement", "piece": "Ventilateurs complets", "qte_reco": "1–2 pcs", "criticite": "Élevée", "remarques": "En cas de panne, surtout en forte charge"},
-    {"categorie": "Refroidissement", "piece": "Pompes à huile de circulation", "qte_reco": "1 pompe en spare", "criticite": "Très élevée", "remarques": "Critique pour ONAF en forte charge"},
-    {"categorie": "Protection & mesure", "piece": "Relais Buchholz (complet)", "qte_reco": "1 unité", "criticite": "Élevée", "remarques": "Utile si modèle spécifique constructeur"},
-    {"categorie": "Protection & mesure", "piece": "Indicateurs de niveau d’huile", "qte_reco": "1 unité", "criticite": "Moyenne", "remarques": "En cas de casse ou blocage de flotteur"},
-    {"categorie": "Instrumentation & contrôle", "piece": "Sondes PT100 / PT1000", "qte_reco": "3–5 pcs", "criticite": "Élevée", "remarques": "Pour mesure température enroulements / huile"},
-    {"categorie": "Instrumentation & contrôle", "piece": "Relais auxiliaires", "qte_reco": "5–10 pcs", "criticite": "Moyenne", "remarques": "Très utilisés dans circuits de commande"},
-    {"categorie": "Consommables & annexes", "piece": "Silice déshydratante dessiccateur principal", "qte_reco": "Plusieurs recharges", "criticite": "Élevée", "remarques": "Limite l’humidité dans l’huile"},
-    {"categorie": "Consommables & annexes", "piece": "Huile isolante neuve", "qte_reco": "1 fût / IBC", "criticite": "Très élevée", "remarques": "Pour appoints après fuite ou traitement"},
-]
-
-DEFAULT_TOOLS = [
-    {"categorie": "Mesure & Essais", "outil": "Micro-ohmmètre", "description": "Résistance d’enroulements", "qte": 1, "unite": "pcs", "calibrage": "OK", "remarques": "200 A si possible"},
-    {"categorie": "Mesure & Essais", "outil": "Mégohmmètre 5 kV", "description": "Résistance d’isolement", "qte": 1, "unite": "pcs", "calibrage": "OK", "remarques": ""},
-    {"categorie": "Mesure & Essais", "outil": "Testeur BDV huile", "description": "Rigidité diélectrique", "qte": 1, "unite": "pcs", "calibrage": "OK", "remarques": ""},
-    {"categorie": "Mesure & Essais", "outil": "Caméra thermographique", "description": "Inspection échauffements", "qte": 1, "unite": "pcs", "calibrage": "OK", "remarques": ""},
-    {"categorie": "Échantillonnage huile", "outil": "Bouteilles + seringues", "description": "Prélèvements huile", "qte": 1, "unite": "set", "calibrage": "N/A", "remarques": ""},
-    {"categorie": "Traitement huile", "outil": "Unité de filtration", "description": "Déshydratation/filtration huile", "qte": 1, "unite": "pcs", "calibrage": "OK", "remarques": "si intervention prévue"},
-    {"categorie": "Outils", "outil": "Clés dynamométriques", "description": "Serrage au couple", "qte": 1, "unite": "set", "calibrage": "OK", "remarques": ""},
-    {"categorie": "Sécurité (EPI)", "outil": "Gants, visière, tenue arc-flash", "description": "Protection intervention BT/HTA", "qte": 1, "unite": "set", "calibrage": "N/A", "remarques": ""},
-]
+    return tbl
 
 
-def _add_cahier_maintenance(story, styles):
-    body = _body_style(styles)
-
-    _title(story, styles, "Cahier de Maintenance", level=1, space_after_pt=4)
-    _title(story, styles, "Transformateur 220/20 kV – 100 MVA", level=2, space_after_pt=6)
-
-    intro = (
-        "Ce cahier regroupe les principaux tableaux de valeurs de référence et les consignes de suivi "
-        "pour la maintenance d’un transformateur de puissance 220/20 kV – 100 MVA, conformément aux "
-        "références IEC et CIGRE. La maintenance appliquée à un transformateur de puissance se divise "
-        "en plusieurs catégories complémentaires, chacune ayant un rôle précis dans la fiabilité et la "
-        "durée de vie de l’équipement."
-    )
-    story.append(Paragraph(SAN(intro), body))
-    story.append(Spacer(1, 8))
-
-    sections = [
-        ("1. Maintenance préventive", "La maintenance préventive regroupe toutes les actions planifiées visant à éviter l’apparition de pannes. Elle comprend les inspections visuelles, les mesures électriques, les analyses d’huile et le contrôle du système de refroidissement."),
-        ("2. Maintenance conditionnelle", "La maintenance conditionnelle repose sur l’analyse continue de l’état réel du transformateur. Elle utilise les mesures, les capteurs et les diagnostics pour intervenir lorsque les indicateurs montrent un début de dérive."),
-        ("3. Maintenance corrective", "La maintenance corrective intervient après l’apparition d’un défaut ou lorsqu’une mesure dépasse les seuils critiques fixés par les normes IEC, IEEE ou CIGRE."),
-        ("4. Maintenance prédictive", "La maintenance prédictive utilise des méthodes avancées de diagnostic et l’analyse des tendances pour prédire les pannes avant qu’elles ne se produisent."),
-    ]
-    for title, text in sections:
-        _title(story, styles, title, level=3, space_after_pt=3)
-        story.append(Paragraph(SAN(text), body))
-        story.append(Spacer(1, 6))
-
-    _title(story, styles, "Tableau – Huile isolante (valeurs normalisées)", level=3, space_after_pt=4)
-    tbl1 = [
-        ["Paramètre", "Méthode", "Normale", "Alerte", "Critique", "Référence"],
-        ["Rigidité diélectrique BDV (2,5 mm)", "Test BDV", ">= 70 kV", "50-69 kV", "< 50 kV", "IEC 60156"],
-        ["Teneur en eau", "Karl Fischer", "<= 20 ppm", "20-35 ppm", "> 35 ppm", "IEC 60814"],
-        ["Indice d’acidité", "Titrage", "< 0.03", "0.03-0.15", "> 0.15", "IEC 62021"],
-        ["Tan δ à 90°C", "Mesure", "<= 0.005", "0.005-0.02", "> 0.02", "IEC 60247"],
-        ["Teneur en furane (2-FAL)", "Chromatographie", "< 0.1 ppm", "0.1-1 ppm", "> 1 ppm", "CIGRE"],
-    ]
-    story.append(_mk_table(tbl1, widths=[3.4*cm, 2.8*cm, 2.4*cm, 2.4*cm, 2.4*cm, 2.6*cm], font_size=7))
-    story.append(Spacer(1, 4))
-    story.append(Paragraph(SAN("Explication : L’huile isolante est un élément essentiel de l’isolation et du refroidissement du transformateur. La surveillance de sa qualité permet de détecter les dérives avant qu’elles ne deviennent critiques."), body))
-    story.append(Spacer(1, 8))
-
-    _title(story, styles, "Tableau – Analyse des gaz dissous (DGA)", level=3, space_after_pt=4)
-    tbl2 = [
-        ["Gaz", "Normale", "Alerte", "Critique", "Signification"],
-        ["H₂", "< 150 ppm", "150-700 ppm", "> 700 ppm", "Décharges partielles"],
-        ["CH₄", "< 80 ppm", "80-120 ppm", "> 120 ppm", "Surchauffe légère"],
-        ["C₂H₂", "< 3 ppm", "3-35 ppm", "> 35 ppm", "Arc / défaut grave"],
-        ["CO", "< 350 ppm", "350-1500 ppm", "> 1500 ppm", "Dégradation cellulose"],
-        ["CO₂", "< 2000 ppm", "2000-10000 ppm", "> 10000 ppm", "Vieillissement papier isolant"],
-    ]
-    story.append(_mk_table(tbl2, widths=[1.6*cm, 2.6*cm, 2.8*cm, 2.8*cm, 6.4*cm], font_size=7))
-    story.append(Spacer(1, 4))
-    story.append(Paragraph(SAN("Explication : L’analyse des gaz dissous est l’une des méthodes les plus efficaces pour révéler des défauts internes non visibles dans le transformateur."), body))
-    story.append(Spacer(1, 8))
-
-    _title(story, styles, "Tableau – Essais électriques", level=3, space_after_pt=4)
-    tbl3 = [
-        ["Test", "Méthode", "Valeur de référence", "Alerte", "Référence"],
-        ["Résistance d’isolement", "Mégohmmètre 5 kV", "> 1000 MΩ", "< 600 MΩ", "IEC 60076-3"],
-        ["Rapport de transfo (TTR)", "Rapporteur", "+/- 0.5 %", "> 0.5 %", "IEC 60076-1"],
-        ["Résistance d’enroulements", "Micro-ohmmètre", "Écart < 2 % phases", "> 2 %", "IEC 60076-1"],
-        ["Impédance de court-circuit", "Essai en charge", "10-12 %", "Δ > 3 %", "IEC 60076-5"],
-        ["Courant d’excitation", "Essai à vide", "<= 0.5 % In", "> 1 % In", "Constructeur"],
-    ]
-    story.append(_mk_table(tbl3, widths=[3.8*cm, 4.0*cm, 3.5*cm, 2.8*cm, 3.0*cm], font_size=7))
-    story.append(Spacer(1, 4))
-    story.append(Paragraph(SAN("Explication : Les essais électriques permettent de vérifier l’état des enroulements, de l’isolation et du circuit magnétique."), body))
-    story.append(Spacer(1, 8))
-
-    _title(story, styles, "Tableau – Paramètres thermiques et refroidissement", level=3, space_after_pt=4)
-    tbl4 = [
-        ["Paramètre", "Normale", "Alerte", "Critique"],
-        ["Température huile haut", "<= 90°C", "90-105°C", "> 105°C"],
-        ["Point chaud enroulements", "<= 110°C", "110-130°C", "> 130°C"],
-        ["Gradient haut-bas réservoir", "<= 15°C", "15-25°C", "> 25°C"],
-        ["Ventilateurs / Pompes ONAF", "100 % fonctionnels", "1 panne", ">= 2 pannes"],
-    ]
-    story.append(_mk_table(tbl4, widths=[6.0*cm, 3.6*cm, 3.6*cm, 3.6*cm], font_size=7))
-    story.append(Spacer(1, 4))
-    story.append(Paragraph(SAN("Explication : Ces seuils restent dans le cahier comme référence générale de maintenance. Ils ne sont pas injectés automatiquement dans la décision dynamique du logiciel."), body))
-    story.append(Spacer(1, 8))
-
-    _title(story, styles, "Tableau – Fréquences recommandées des contrôles", level=3, space_after_pt=4)
-    tbl5 = [
-        ["Type de contrôle", "Fréquence recommandée"],
-        ["Inspection visuelle complète", "Mensuelle"],
-        ["Analyse d’huile", "Semestrielle"],
-        ["DGA (gaz dissous)", "Trimestrielle à semestrielle"],
-        ["Essais électriques complets", "Annuelle"],
-        ["Thermographie infrarouge", "Annuelle"],
-        ["Contrôle OLTC", "Annuelle"],
-    ]
-    story.append(_mk_table(tbl5, widths=[8.8*cm, 8.2*cm], font_size=7))
-    story.append(Spacer(1, 8))
-
-    _title(story, styles, "Tableau de suivi de maintenance", level=3, space_after_pt=4)
-    header = ["Date", "Agent", "Paramètre contrôlé", "Valeur de référence", "Résultat mesuré", "État", "Observations"]
-    rows = [
-        ["", "", "Rigidité diélectrique", ">= 50 kV", "", "", ""],
-        ["", "", "Teneur en eau", "< 20 ppm", "", "", ""],
-        ["", "", "Indice d’acidité", "< 0.03", "", "", ""],
-        ["", "", "TTR", "+/- 0.5 %", "", "", ""],
-        ["", "", "Résistance d’enroulement", "< 2 % diff. phases", "", "", ""],
-        ["", "", "Température huile haut", "< 95°C", "", "", ""],
-        ["", "", "Point chaud enroulements", "< 120°C", "", "", ""],
-        ["", "", "État isolateurs", "Propres / intacts", "", "", ""],
-    ]
-    story.append(_mk_table([header] + rows, widths=[1.6*cm, 2.2*cm, 4.0*cm, 4.3*cm, 2.4*cm, 1.5*cm, 2.8*cm], font_size=6.5))
-    story.append(Spacer(1, 8))
-
-    _title(story, styles, "Pièces de rechange recommandées", level=3, space_after_pt=4)
-    data_sp = [["Catégorie", "Pièce de rechange", "Quantité recommandée", "Criticité", "Remarques"]]
-    for sp in SPARE_PARTS:
-        data_sp.append([
-            SAN(sp.get("categorie", "")),
-            SAN(sp.get("piece", "")),
-            SAN(sp.get("qte_reco", "")),
-            SAN(sp.get("criticite", "")),
-            SAN(sp.get("remarques", "")),
-        ])
-    story.append(_mk_table(data_sp, widths=[3.0*cm, 6.2*cm, 2.6*cm, 2.2*cm, 3.8*cm], font_size=7))
-    story.append(Spacer(1, 10))
+def _title(story, styles, text: str, level: int = 2, space_after_pt: int = 6, color=None):
+    style_name = {1: "Heading1", 2: "Heading2", 3: "Heading3"}.get(level, "Heading3")
+    if color is None:
+        story.append(Paragraph(SAN(text), styles[style_name]))
+    else:
+        custom = ParagraphStyle(
+            name=f"custom_{style_name}_{text}",
+            parent=styles[style_name],
+            textColor=color,
+        )
+        story.append(Paragraph(SAN(text), custom))
+    story.append(Spacer(1, space_after_pt))
 
 
-def _policy_from_beta(beta: float) -> str:
-    try:
-        b = float(beta)
-    except Exception:
-        b = None
-    if b is None:
-        return "Politique non déterminée."
-    if b > 1.0:
-        return "Usure (>1) : maintenance préventive / conditionnelle renforcée avec remplacements ciblés."
-    if b < 1.0:
-        return "Défauts précoces (<1) : contrôles précoces, fiabilisation, qualité d’installation et inspection rapprochée."
-    return "Taux de panne proche du constant (=1) : préventif calendaire ou surveillance standard."
-
-
-def _maintenance_type_explanation(mtype: str, beta: Any) -> str:
-    label = SAN(mtype).strip().lower()
-    if "correct" in label:
-        return "Ce type a été retenu car il faut corriger un défaut observé ou probable avant stabilisation."
-    if "condition" in label:
-        return "Ce type a été retenu car l’état de l’équipement doit guider le moment de l’intervention."
-    if "prévent" in label or "prevent" in label:
-        return "Ce type a été retenu car l’intervention doit être planifiée avant la panne pour limiter le risque."
-    if "predict" in label or "prédict" in label:
-        return "Ce type a été retenu car les tendances permettent d’anticiper l’intervention."
-    return _policy_from_beta(beta)
-
-
-def _build_choice_explanation(r: Dict[str, Any]) -> str:
-    beta = r.get("beta")
-    eta = r.get("eta_h", r.get("eta"))
-    gamma = r.get("gamma_h", r.get("gamma"))
-    model = r.get("model")
-    dist = r.get("distribution")
-    mtype = r.get("maintenance_type")
-    T_rec = r.get("T_recommended_h")
-    T_R = r.get("T_R_h")
-    T_cost = r.get("T_cost_h")
-    mtbf = r.get("MTBF")
-    mttr = r.get("MTTR")
-    decision = r.get("decision_finale")
-    motif = r.get("motif_decision")
-
+def _build_choice_explanation(row: Dict[str, Any]) -> str:
     parts = []
-    if mtype:
-        parts.append(f"Type retenu : {SAN(mtype)}.")
-    if model or dist:
-        parts.append(f"Le modèle retenu est {SAN(model)} avec la loi {SAN(dist)}.")
-    if beta is not None:
-        parts.append(f"Le paramètre beta = {fnum(beta, 2)} a servi à orienter la politique de maintenance.")
-    if eta is not None:
-        parts.append(f"La durée caractéristique eta est estimée à {fnum(eta, 1)} h.")
-    if gamma is not None:
-        parts.append(f"Le décalage gamma vaut {fnum(gamma, 1)} h.")
-    if T_rec is not None:
-        parts.append(f"L’intervalle recommandé est {fnum(T_rec, 1)} h.")
-    if T_R is not None:
-        parts.append(f"L’intervalle fiabiliste vaut {fnum(T_R, 1)} h.")
-    if T_cost is not None:
-        parts.append(f"L’intervalle économique vaut {fnum(T_cost, 1)} h.")
-    if mtbf is not None:
-        parts.append(f"Le MTBF est de {fnum(mtbf, 1)} h.")
-    if mttr is not None:
-        parts.append(f"Le MTTR est de {fnum(mttr, 1)} h.")
-    if decision:
-        parts.append(f"Décision finale : {SAN(decision)}.")
-    if motif:
-        parts.append(f"Motif : {SAN(motif)}")
+    if row.get("maintenance_choice"):
+        parts.append(f"Choix final retenu : {SAN(row.get('maintenance_choice'))}.")
+    if row.get("maintenance_choice_reason"):
+        parts.append(f"Justification : {SAN(row.get('maintenance_choice_reason'))}.")
+    if row.get("model") or row.get("distribution"):
+        parts.append(f"Le processus est {SAN(row.get('model'))} avec la loi {SAN(row.get('distribution'))}.")
+    if row.get("beta") is not None:
+        parts.append(f"Le paramètre beta = {fnum(row.get('beta'), 2)} influence directement le type de maintenance.")
+    if row.get("eta_h") is not None:
+        parts.append(f"La durée caractéristique eta vaut {fnum(row.get('eta_h'), 1)} h.")
+    if row.get("T_recommended_h") is not None:
+        parts.append(f"L’intervalle recommandé est {fnum(row.get('T_recommended_h'), 1)} h.")
+    if row.get("days_left") is not None:
+        parts.append(f"Il reste {row.get('days_left')} jours avant l’échéance calculée.")
+    if row.get("final_decision"):
+        parts.append(f"Décision finale : {SAN(row.get('final_decision'))}.")
+    if row.get("final_reason"):
+        parts.append(f"Motif : {SAN(row.get('final_reason'))}.")
     return " ".join(parts) if parts else "Aucune explication détaillée disponible."
 
 
-def _build_influence_table(r: Dict[str, Any]):
-    beta = r.get("beta")
-    eta = r.get("eta_h", r.get("eta"))
-    gamma = r.get("gamma_h", r.get("gamma"))
-    model = r.get("model")
-    dist = r.get("distribution")
-    mtype = r.get("maintenance_type")
-    T_rec = r.get("T_recommended_h")
-    T_R = r.get("T_R_h")
-    T_cost = r.get("T_cost_h")
-    mtbf = r.get("MTBF")
-    mttr = r.get("MTTR")
-    days_left = r.get("days_left")
-    decision = r.get("decision_finale")
-
+def _build_influence_table(row: Dict[str, Any]):
     return [
         ["Paramètre", "Valeur", "Impact sur le choix"],
-        ["Type de maintenance retenu", SAN(mtype), _maintenance_type_explanation(SAN(mtype), beta)],
-        ["Modèle", SAN(model), "Le comportement global des défaillances influence la stratégie retenue."],
-        ["Loi", SAN(dist), "La loi de probabilité retenue structure l’estimation des durées et du risque."],
-        ["beta", fnum(beta, 2), "Indique défauts précoces, comportement aléatoire ou usure."],
-        ["eta (h)", fnum(eta, 1), "Donne une référence de durée de vie caractéristique."],
-        ["gamma (h)", fnum(gamma, 1), "Décalage éventuel du modèle."],
-        ["T_recommended (h)", fnum(T_rec, 1), "Intervalle principal proposé pour agir."],
-        ["T_R (h)", fnum(T_R, 1), "Intervalle issu du critère de fiabilité."],
-        ["T_cost (h)", fnum(T_cost, 1), "Intervalle issu du critère économique."],
-        ["MTBF (h)", fnum(mtbf, 1), "Renseigne l’espacement moyen des pannes."],
-        ["MTTR (h)", fnum(mttr, 1), "Renseigne le temps moyen de remise en état."],
-        ["Jours restants", SAN(days_left), "Plus l’échéance est proche, plus la priorité augmente."],
-        ["Décision finale", SAN(decision), "Conclusion synthétique issue des paramètres disponibles."],
+        ["Choix final", SAN(row.get("maintenance_choice", "")), "Type de maintenance retenu après synthèse des facteurs."],
+        ["Type initial", SAN(row.get("maintenance_type", "")), "Suggestion initiale provenant de l’optimisation."],
+        ["Modèle", SAN(row.get("model", "")), "Le comportement global des défaillances influence la stratégie retenue."],
+        ["Loi", SAN(row.get("distribution", "")), "La loi retenue structure l’estimation des durées et du risque."],
+        ["beta", fnum(row.get("beta"), 2), "Indique défauts précoces, comportement aléatoire ou usure."],
+        ["eta (h)", fnum(row.get("eta_h"), 1), "Référence de durée de vie caractéristique."],
+        ["gamma (h)", fnum(row.get("gamma_h"), 1), "Décalage éventuel du modèle."],
+        ["T_recommended (h)", fnum(row.get("T_recommended_h"), 1), "Intervalle principal proposé."],
+        ["T_R (h)", fnum(row.get("T_R_h"), 1), "Intervalle issu du critère de fiabilité."],
+        ["T_cost (h)", fnum(row.get("T_cost_h"), 1), "Intervalle issu du critère économique."],
+        ["Jours restants", SAN(row.get("days_left", "")), "Plus l’échéance est proche, plus la priorité augmente."],
+        ["Niveau de priorité", SAN(row.get("priority_level", "")), "Les cas critiques sont mis en évidence en rouge."],
     ]
 
 
-def _add_per_equipment_summaries(story, styles, metrics_table: List[Dict[str, Any]], kits_by_eq: Dict[str, List[Dict[str, Any]]] | None):
-    body = _body_style(styles)
-    if not metrics_table:
-        return
-
-    _title(story, styles, "Résultats d’analyse par équipement", level=2, space_after_pt=4)
-
-    for r in metrics_table:
-        r = r if isinstance(r, dict) else {}
-        orig_eq = (r or {}).get("equipment_code", "")
-        eq_disp = SAN(orig_eq)
-
-        beta = (r or {}).get("beta")
-        eta = (r or {}).get("eta_h", (r or {}).get("eta"))
-        gamma = (r or {}).get("gamma_h", (r or {}).get("gamma"))
-        T_rec = (r or {}).get("T_recommended_h")
-        T_R = (r or {}).get("T_R_h")
-        T_cost = (r or {}).get("T_cost_h")
-        itv_opt = (r or {}).get("interval_opt_h", (r or {}).get("interval_h"))
-        model = (r or {}).get("model")
-        dist = (r or {}).get("distribution")
-        mtype = (r or {}).get("maintenance_type")
-        mtbf = (r or {}).get("MTBF")
-        mttr = (r or {}).get("MTTR")
-
-        avail = None
+def _apply_critical_style(table, data: List[List[Any]], priority_col: Optional[int] = None):
+    if not HAVE_REPORTLAB or colors is None:
+        return table
+    styles = []
+    for idx, row in enumerate(data[1:], start=1):
         try:
-            if mtbf is not None and mttr is not None and (float(mtbf) + float(mttr)) > 0:
-                avail = 100.0 * float(mtbf) / (float(mtbf) + float(mttr))
-        except Exception:
-            avail = None
-
-        _title(story, styles, f"Fiche intervention – {eq_disp}", level=3, space_after_pt=2)
-
-        data_param = [
-            ["Élément", "Valeur"],
-            ["Type de maintenance (optimisation)", SAN(mtype)],
-            ["Modèle / Loi", f"{SAN(model)} / {SAN(dist)}"],
-            ["beta (forme)", fnum(beta, 2)],
-            ["eta (échelle, h)", fnum(eta, 1)],
-            ["gamma (décalage, h)", fnum(gamma, 1)],
-            ["T_recommended (h)", fnum(T_rec, 1)],
-            ["T_R (h)", fnum(T_R, 1)],
-            ["T_cost (h)", fnum(T_cost, 1)],
-            ["Intervalle opt (h) (fallback)", fnum(itv_opt, 1)],
-            ["MTBF (h)", fnum(mtbf, 1)],
-            ["MTTR (h)", fnum(mttr, 1)],
-            ["Disponibilité (%)", fnum(avail, 1)],
-        ]
-        story.append(_mk_table(data_param, font_size=8))
-        story.append(Spacer(1, 4))
-
-        _title(story, styles, "Choix retenu pour le cas d’étude", level=3, space_after_pt=2)
-        story.append(Paragraph(SAN(_build_choice_explanation(r)), body))
-        story.append(Spacer(1, 6))
-
-        _title(story, styles, "Paramètres ayant influencé le choix", level=3, space_after_pt=2)
-        story.append(_mk_table(_build_influence_table(r), font_size=7.5))
-        story.append(Spacer(1, 6))
-
-        _title(story, styles, "Politique recommandée", level=3, space_after_pt=2)
-        pol = ""
-        if mtype:
-            pol += f"Type recommandé (optimisation) : {SAN(mtype)}. "
-        pol += _policy_from_beta(beta)
-        story.append(Paragraph(SAN(pol), body))
-        story.append(Spacer(1, 6))
-
-        _title(story, styles, "Kit de pièces recommandé", level=3, space_after_pt=2)
-        kit_list = (kits_by_eq or {}).get(str(orig_eq), [])
-        if kit_list:
-            story.append(Paragraph(SAN("Les pièces suivantes sont recommandées pour cet équipement :"), body))
-            kit_data = [["Pièce", "Quantité", "Criticité", "Remarques"]]
-            for item in kit_list[:12]:
-                item = item if isinstance(item, dict) else {}
-                kit_data.append([
-                    SAN(item.get("piece", "")),
-                    SAN(item.get("qte_reco", item.get("qte", ""))),
-                    SAN(item.get("criticite", "")),
-                    _compact(item.get("remarques", ""), 70),
+            target = str(row[priority_col]).strip().lower() if priority_col is not None and priority_col < len(row) else ""
+            if target == "critique":
+                styles.extend([
+                    ("BACKGROUND", (0, idx), (-1, idx), colors.HexColor("#fff1f2")),
+                    ("TEXTCOLOR", (0, idx), (-1, idx), colors.HexColor("#b91c1c")),
+                    ("FONTNAME", (0, idx), (-1, idx), "Helvetica-Bold"),
                 ])
-            story.append(_mk_table(kit_data, font_size=7))
-        else:
-            story.append(Paragraph(SAN("Aucune pièce recommandée détectée (ou stock non activé)."), body))
-        story.append(Spacer(1, 8))
+        except Exception:
+            pass
+    if styles:
+        table.setStyle(TableStyle(styles))
+    return table
 
 
-def _table_from_tasks_due(tasks_due: List[Dict[str, Any]]):
+def _tasks_table(tasks_due: List[Dict[str, Any]], available_width: float):
     if not tasks_due:
         return None
-
-    data = [[
-        "Équipement",
-        "Type maint.",
-        "Intervalle (h)",
-        "Source",
-        "Échéance",
-        "Jours restants",
-        "T_rec (h)",
-        "T_R (h)",
-        "T_cost (h)",
-        "Statut",
-    ]]
-
-    for t in tasks_due:
-        td = t if isinstance(t, dict) else {}
+    data = [["Équipement", "Choix final", "Priorité", "Échéance", "Jours restants", "Intervalle (h)", "Décision"]]
+    for task in tasks_due:
         data.append([
-            SAN(td.get("equipment_code", "")),
-            SAN(td.get("maintenance_type", "")),
-            fnum(td.get("interval_h"), 1),
-            SAN(td.get("interval_source", "")),
-            SAN(td.get("next_due_date", "")),
-            SAN(td.get("days_left", "")),
-            fnum(td.get("T_recommended_h"), 1),
-            fnum(td.get("T_R_h"), 1),
-            fnum(td.get("T_cost_h"), 1),
-            SAN(td.get("status", "")),
+            SAN(task.get("equipment_code", "")),
+            SAN(task.get("maintenance_choice", task.get("maintenance_type", ""))),
+            SAN(task.get("priority_level", "")),
+            SAN(task.get("next_due_date", "")),
+            SAN(task.get("days_left", "")),
+            fnum(task.get("interval_h"), 1),
+            SAN(task.get("final_decision", "")),
         ])
+    table = _mk_table(data, available_width=available_width, font_size=7.5)
+    return _apply_critical_style(table, data, priority_col=2)
 
-    widths = [2.2*cm, 2.8*cm, 2.0*cm, 1.7*cm, 2.3*cm, 1.6*cm, 1.9*cm, 1.7*cm, 1.8*cm, 1.7*cm]
-    return _mk_table(data, widths=widths, font_size=7.5)
+
+def _summary_table(metrics_table: List[Dict[str, Any]], available_width: float):
+    data = [["Équipement", "Choix final", "Modèle", "Loi", "beta", "eta (h)", "Intervalle (h)", "Jours", "Priorité"]]
+    for row in metrics_table:
+        data.append([
+            SAN(row.get("equipment_code", "")),
+            SAN(row.get("maintenance_choice", row.get("maintenance_type", ""))),
+            SAN(row.get("model", "")),
+            SAN(row.get("distribution", "")),
+            fnum(row.get("beta"), 2),
+            fnum(row.get("eta_h"), 1),
+            fnum(row.get("interval_h", row.get("T_recommended_h")), 1),
+            SAN(row.get("days_left", "")),
+            SAN(row.get("priority_level", "")),
+        ])
+    table = _mk_table(data, available_width=available_width, font_size=7.3)
+    return _apply_critical_style(table, data, priority_col=8)
 
 
-def _add_tools_section(story, styles, tools_checklist: List[Dict[str, Any]] | None):
-    body = _body_style(styles)
-    _title(story, styles, "Matériels à prévoir pour l’entretien (instruments et EPI)", level=2, space_after_pt=2)
-    story.append(Paragraph(SAN("Cette section complète le cahier de maintenance par la liste des instruments, outils et équipements de protection individuelle nécessaires aux interventions."), body))
-    story.append(Spacer(1, 4))
+def _add_reference_sections(story, styles, available_width: float, tools_checklist):
+    _title(story, styles, "Références matérielles", level=2, space_after_pt=4)
+
+    spare_data = [["Catégorie", "Pièce", "Qté recommandée", "Criticité", "Remarques"]]
+    for item in SPARE_PARTS:
+        spare_data.append([
+            SAN(item["categorie"]),
+            SAN(item["piece"]),
+            SAN(item["qte_reco"]),
+            SAN(item["criticite"]),
+            SAN(item["remarques"]),
+        ])
+    story.append(_mk_table(spare_data, available_width=available_width, font_size=7))
+    story.append(Spacer(1, 8))
 
     tools = tools_checklist if (isinstance(tools_checklist, list) and tools_checklist) else DEFAULT_TOOLS
-    data = [["Catégorie", "Outil/Instrument", "Description", "Qté", "Unité", "Calibrage/État", "Remarques"]]
-    for it in tools:
-        it = it if isinstance(it, dict) else {}
-        data.append([
-            SAN(it.get("categorie", "")),
-            SAN(it.get("outil", "")),
-            SAN(it.get("description", "")),
-            SAN(it.get("qte", "")),
-            SAN(it.get("unite", "")),
-            SAN(it.get("calibrage", "")),
-            SAN(it.get("remarques", "")),
+    tools_data = [["Catégorie", "Outil", "Description", "Qté", "Unité", "État"]]
+    for item in tools:
+        tools_data.append([
+            SAN(item.get("categorie", "")),
+            SAN(item.get("outil", "")),
+            SAN(item.get("description", "")),
+            SAN(item.get("qte", "")),
+            SAN(item.get("unite", "")),
+            SAN(item.get("calibrage", "")),
         ])
-    widths = [2.8*cm, 3.0*cm, 4.0*cm, 1.1*cm, 1.1*cm, 2.0*cm, 2.3*cm]
-    story.append(_mk_table(data, widths=widths, font_size=8))
-    story.append(Spacer(1, 6))
+    story.append(_mk_table(tools_data, available_width=available_width, font_size=7))
+    story.append(Spacer(1, 8))
 
 
 def _export_pm_plan_with_kits_pdf_fallback(
@@ -622,15 +317,10 @@ def _export_pm_plan_with_kits_pdf_fallback(
     tools_checklist: List[Dict[str, Any]] | None,
 ) -> str:
     if not HAVE_FPDF:
-        raise RuntimeError(
-            "Génération PDF non disponible (ReportLab et FPDF indisponibles). "
-            "Installez soit reportlab, soit fpdf2 dans l'environnement."
-        )
-
+        raise RuntimeError("Génération PDF non disponible : ReportLab et FPDF sont indisponibles.")
     out_dir = Path(out_dir)
     out_dir.mkdir(exist_ok=True, parents=True)
-    date_now = datetime.datetime.now().strftime("%Y%m%d-%H%M")
-    out_path = out_dir / f"pm_plan_kits_{date_now}.pdf"
+    out_path = out_dir / f"pm_plan_kits_{datetime.datetime.now().strftime('%Y%m%d-%H%M')}.pdf"
 
     pdf = FPDF()
     pdf.set_auto_page_break(auto=True, margin=15)
@@ -642,38 +332,36 @@ def _export_pm_plan_with_kits_pdf_fallback(
     pdf.cell(0, 6, SAN(datetime.datetime.now().strftime("%d/%m/%Y %H:%M")), ln=1)
     pdf.ln(4)
 
-    pdf.set_font("Arial", "B", 12)
-    pdf.cell(0, 7, SAN("Résumé simplifié"), ln=1)
-    pdf.set_font("Arial", "", 10)
-    pdf.multi_cell(0, 5, SAN(
-        "Le rapport de maintenance complet utilise ReportLab pour une mise en page avancée. "
-        "Ce mode simplifié garde les mêmes informations principales lorsque ReportLab n'est pas disponible."
-    ))
-    pdf.ln(4)
-
-    if metrics_table:
-        pdf.set_font("Arial", "B", 11)
-        pdf.cell(0, 6, SAN("Synthèse paramètres par équipement :"), ln=1)
-        pdf.set_font("Arial", "", 9)
-        for r in metrics_table:
-            eq = SAN(str(r.get("equipment_code", "")))
-            beta = fnum(r.get("beta"), 2)
-            eta = fnum(r.get("eta_h", r.get("eta")), 1)
-            itv = fnum(r.get("T_recommended_h", r.get("interval_opt_h")), 1)
-            mtype = SAN(r.get("maintenance_type", ""))
-            pdf.multi_cell(0, 5, SAN(f"- {eq} | type={mtype} | beta={beta}, eta={eta} h, intervalle recommandé ≈ {itv} h"))
-        pdf.ln(3)
+    pdf.set_font("Arial", "B", 11)
+    pdf.cell(0, 6, SAN("Résumé"), ln=1)
+    pdf.set_font("Arial", "", 9)
+    for row in metrics_table[:25]:
+        priority = str(row.get("priority_level", ""))
+        label = "[CRITIQUE]" if priority == "Critique" else "-"
+        pdf.multi_cell(
+            0, 5,
+            SAN(
+                f"{label} {row.get('equipment_code', '')} | choix={row.get('maintenance_choice', row.get('maintenance_type', ''))} | "
+                f"beta={fnum(row.get('beta'), 2)} | jours={row.get('days_left', '')}"
+            ),
+        )
+    pdf.ln(2)
 
     if tasks_due:
         pdf.set_font("Arial", "B", 11)
-        pdf.cell(0, 6, SAN("Tâches de maintenance dues :"), ln=1)
+        pdf.cell(0, 6, SAN("Tâches dues"), ln=1)
         pdf.set_font("Arial", "", 9)
-        for t in tasks_due[:40]:
-            eq = SAN(str(t.get("equipment_code", "")))
-            title_t = SAN(str(t.get("title", t.get("maintenance_type", ""))))
-            due = SAN(str(t.get("next_due_date", "")))
-            pdf.multi_cell(0, 5, SAN(f"- [{eq}] {title_t} (échéance : {due})"))
-        pdf.ln(3)
+        for task in tasks_due[:40]:
+            priority = str(task.get("priority_level", ""))
+            label = "[CRITIQUE]" if priority == "Critique" else "-"
+            pdf.multi_cell(
+                0,
+                5,
+                SAN(
+                    f"{label} [{task.get('equipment_code', '')}] {task.get('maintenance_choice', task.get('maintenance_type', ''))} "
+                    f"| échéance : {task.get('next_due_date', '')}"
+                ),
+            )
 
     pdf.output(str(out_path))
     return str(out_path)
@@ -684,7 +372,7 @@ def export_pm_plan_with_kits_pdf(
     kits_by_eq: Dict[str, List[Dict[str, Any]]],
     metrics_table: List[Dict[str, Any]],
     out_dir: str | Path = "reports",
-    title: str = "Plan de maintenance - Procédure, Tâches, Matériels",
+    title: str = "Plan de maintenance - Procédure, tâches, matériels",
     procedure_docx: str | Path | None = None,
     *,
     include_kits: bool = False,
@@ -692,14 +380,23 @@ def export_pm_plan_with_kits_pdf(
     consumption_summary=None,
 ) -> str:
     if not HAVE_REPORTLAB:
-        return _export_pm_plan_with_kits_pdf_fallback(
-            tasks_due, kits_by_eq, metrics_table, out_dir, title, tools_checklist
-        )
+        return _export_pm_plan_with_kits_pdf_fallback(tasks_due, kits_by_eq, metrics_table, out_dir, title, tools_checklist)
 
     out_dir = Path(out_dir)
     out_dir.mkdir(exist_ok=True, parents=True)
-    date_now = datetime.datetime.now().strftime("%Y%m%d-%H%M")
-    out_path = out_dir / f"pm_plan_kits_{date_now}.pdf"
+    out_path = out_dir / f"pm_plan_kits_{datetime.datetime.now().strftime('%Y%m%d-%H%M')}.pdf"
+
+    styles = getSampleStyleSheet()
+    styles.add(
+        ParagraphStyle(
+            name="Justify",
+            parent=styles["BodyText"],
+            fontName="Helvetica",
+            fontSize=9,
+            leading=13,
+            alignment=TA_JUSTIFY,
+        )
+    )
 
     doc = SimpleDocTemplate(
         str(out_path),
@@ -708,63 +405,74 @@ def export_pm_plan_with_kits_pdf(
         bottomMargin=15 * mm,
         leftMargin=16 * mm,
         rightMargin=16 * mm,
-    )
-    styles = getSampleStyleSheet()
-    styles.add(
-        ParagraphStyle(
-            name="Justify",
-            fontName="Helvetica",
-            fontSize=9,
-            leading=12,
-            alignment=TA_JUSTIFY,
-        )
+        title=SAN(title),
     )
 
+    available_width = _page_available_width()
     story: List[Any] = []
-    body = _body_style(styles)
-
     story.append(Paragraph(SAN(title), styles["Title"]))
     story.append(Paragraph(SAN(datetime.datetime.now().strftime("%d/%m/%Y %H:%M")), styles["BodyText"]))
     story.append(Spacer(1, 10))
-    story.append(
-        Paragraph(
-            SAN(
-                "Le présent document rassemble le cahier de maintenance général, les résultats d’analyse par équipement, "
-                "les tâches dues et la liste des matériels utiles à l’entretien. Les textes narratifs sont présentés de "
-                "manière justifiée afin d’améliorer la lisibilité et la présentation finale."
-            ),
-            body,
-        )
-    )
+
+    _title(story, styles, "Résumé du plan de maintenance", level=2, space_after_pt=4)
+    story.append(Paragraph(
+        SAN(
+            "Le choix final de maintenance est établi à partir du processus retenu, des paramètres fiabilistes, "
+            "des intervalles calculés, des jours restants avant échéance et du niveau de priorité. "
+            "Les cas critiques sont mis en évidence en rouge dans ce document."
+        ),
+        styles["Justify"],
+    ))
     story.append(Spacer(1, 8))
 
-    _add_cahier_maintenance(story, styles)
-    story.append(PageBreak())
+    if metrics_table:
+        story.append(_summary_table(metrics_table, available_width))
+        story.append(Spacer(1, 10))
 
-    _add_per_equipment_summaries(story, styles, metrics_table, kits_by_eq)
+    if tasks_due:
+        _title(story, styles, "Tâches de maintenance dues", level=2, space_after_pt=4, color=colors.HexColor("#b91c1c"))
+        due_table = _tasks_table(tasks_due, available_width)
+        if due_table is not None:
+            story.append(due_table)
+            story.append(Spacer(1, 10))
 
-    _title(story, styles, "Tâches de maintenance dues (tableau global)", level=2, space_after_pt=3)
-    story.append(
-        Paragraph(
-            SAN(
-                "Le tableau ci-dessous reprend les interventions arrivant à échéance dans la fenêtre retenue. "
-                "Il permet d’ordonner les actions opérationnelles à partir des intervalles calculés par le logiciel."
-            ),
-            body,
-        )
-    )
-    story.append(Spacer(1, 4))
-    tbl_due = _table_from_tasks_due(tasks_due)
-    if tbl_due is None:
-        story.append(Paragraph(SAN("Aucune tâche due actuellement."), body))
-    else:
-        story.append(tbl_due)
-    story.append(Spacer(1, 8))
+    for row in metrics_table:
+        is_critical = str(row.get("priority_level", "")) == "Critique"
+        title_color = colors.HexColor("#b91c1c") if is_critical else None
+        _title(story, styles, f"Fiche équipement - {row.get('equipment_code', '')}", level=3, space_after_pt=3, color=title_color)
 
-    _add_tools_section(story, styles, tools_checklist)
+        summary = [
+            ["Élément", "Valeur"],
+            ["Choix final", SAN(row.get("maintenance_choice", row.get("maintenance_type", "")))],
+            ["Type initial", SAN(row.get("maintenance_type", ""))],
+            ["Modèle / Loi", f"{SAN(row.get('model', ''))} / {SAN(row.get('distribution', ''))}"],
+            ["beta", fnum(row.get("beta"), 2)],
+            ["eta (h)", fnum(row.get("eta_h"), 1)],
+            ["gamma (h)", fnum(row.get("gamma_h"), 1)],
+            ["Intervalle recommandé (h)", fnum(row.get("T_recommended_h"), 1)],
+            ["Intervalle fiabiliste (h)", fnum(row.get("T_R_h"), 1)],
+            ["Intervalle économique (h)", fnum(row.get("T_cost_h"), 1)],
+            ["Jours restants", SAN(row.get("days_left", ""))],
+            ["Niveau de priorité", SAN(row.get("priority_level", ""))],
+            ["Décision finale", SAN(row.get("final_decision", ""))],
+        ]
+        equipment_table = _mk_table(summary, available_width=available_width, font_size=7.6)
+        if is_critical:
+            equipment_table.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#fff7f7")),
+                ("TEXTCOLOR", (0, 0), (-1, -1), colors.HexColor("#991b1b")),
+            ]))
+        story.append(equipment_table)
+        story.append(Spacer(1, 4))
 
-    story.append(Spacer(1, 8))
-    story.append(Paragraph(SAN(f"Rapport généré le {datetime.datetime.now().strftime('%d/%m/%Y %H:%M')}"), body))
+        story.append(Paragraph(SAN(_build_choice_explanation(row)), styles["Justify"]))
+        story.append(Spacer(1, 5))
+
+        story.append(_mk_table(_build_influence_table(row), available_width=available_width, font_size=7.2))
+        story.append(Spacer(1, 8))
+
+    _add_reference_sections(story, styles, available_width, tools_checklist)
+    story.append(Paragraph(SAN(f"Rapport généré le {datetime.datetime.now().strftime('%d/%m/%Y %H:%M')}"), styles["BodyText"]))
 
     doc.build(story)
     return str(out_path)

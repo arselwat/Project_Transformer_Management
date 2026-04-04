@@ -586,7 +586,8 @@ def export_merged_report_pdf(
                 "Ce document regroupe exclusivement les indicateurs fiabilistes utilisés par la page Indicateurs. "
                 "Il présente la synthèse fiabiliste, les paramètres beta, eta et gamma, les grandeurs MTTF, MTBF et MTTR, "
                 "la disponibilité, le pipeline de décision, ainsi que les courbes R(t), F(t), f(t) et h(t). "
-                "Aucune section thermique n'est injectée dans ce rapport."
+                "Il est destiné à être partagé avec les équipes de maintenance pour faciliter la compréhension des résultats fiabilistes et la prise de décision."
+                
             ),
             styles["Justify"],
         )

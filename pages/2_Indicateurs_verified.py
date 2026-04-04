@@ -1,10 +1,9 @@
-
 from __future__ import annotations
 
 from io import BytesIO
 from pathlib import Path
 import math
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -34,7 +33,7 @@ require_login()
 render_shell("pages/2_Indicateurs_verified.py")
 render_page_header(
     "Indicateurs",
-    "Tests de tendance, dépendance, paramètres fiabilistes et courbes détaillées.",
+    "Lecture ciblée du processus retenu, de la loi choisie, de l’ajustement, des indicateurs calculés et des courbes fiabilistes.",
     "📊",
 )
 
@@ -78,59 +77,64 @@ DISPLAY_COLUMN_NAMES = {
     "equipment_code": "Code équipement",
     "model": "Processus retenu",
     "process_variant": "Variant du processus",
-    "distribution": "Loi de probabilité retenue",
-    "MTTF_h": "Temps moyen avant défaillance (heures)",
-    "MTBF_h": "Temps moyen entre défaillances (heures)",
-    "MTTR_h": "Temps moyen de réparation (heures)",
-    "availability_pct": "Disponibilité intrinsèque (%)",
-    "beta": "Paramètre bêta",
-    "eta_h": "Paramètre êta (heures)",
-    "gamma_h": "Paramètre gamma (heures)",
-    "mk_p": "Valeur p du test de Mann-Kendall",
-    "mk_direction": "Sens du test de Mann-Kendall",
-    "laplace_p": "Valeur p du test de Laplace",
-    "laplace_direction": "Sens du test de Laplace",
-    "spearman_r": "Coefficient de Spearman",
-    "spearman_p": "Valeur p du test de Spearman",
+    "distribution": "Loi choisie",
+    "MTTF_h": "MTTF (h)",
+    "MTBF_h": "MTBF (h)",
+    "MTTR_h": "MTTR (h)",
+    "availability_pct": "Disponibilité (%)",
+    "beta": "Bêta",
+    "eta_h": "Êta (h)",
+    "gamma_h": "Gamma (h)",
+    "mk_p": "p Mann-Kendall",
+    "mk_direction": "Sens Mann-Kendall",
+    "laplace_p": "p Laplace",
+    "laplace_direction": "Sens Laplace",
+    "spearman_r": "Coeff. Spearman",
+    "spearman_p": "p Spearman",
     "Test": "Test",
-    "Statistique": "Statistique du test",
+    "Statistique": "Statistique",
     "p_value": "Valeur p",
     "Décision": "Décision",
     "Direction": "Sens",
     "Méthode": "Méthode",
     "r": "Coefficient",
-    "Dépendance": "Dépendance détectée",
-    "Tendance": "Tendance détectée",
-    "Direction tendance": "Sens global de la tendance",
+    "Dépendance": "Dépendance",
+    "Tendance": "Tendance",
+    "Direction tendance": "Sens global",
     "Processus retenu": "Processus retenu",
-    "Variant": "Variant du processus",
+    "Variant": "Variant",
     "Hypothèse entité": "Hypothèse sur l’entité",
     "Justification": "Justification",
     "Modèle": "Modèle candidat",
     "Paramètres": "Paramètres",
     "Méthode estimation": "Méthode d’estimation",
     "LogLik": "Log-vraisemblance",
-    "AIC": "Critère d'information d’Akaike",
-    "KS p": "Valeur p du test de Kolmogorov-Smirnov",
-    "Chi2 p": "Valeur p du test du chi carré",
-    "CvM p": "Valeur p du test de Cramér-von Mises",
-    "Acceptée": "Ajustement accepté",
-    "Retenue": "Modèle retenu",
-    "Processus": "Processus retenu",
-    "Distribution": "Loi retenue",
-    "Eta": "Paramètre êta",
-    "Gamma": "Paramètre gamma",
-    "Lambda_HPP (1/h)": "Taux constant du processus homogène (1/h)",
-    "Mu": "Taux de base",
-    "Alpha": "Paramètre alpha",
-    "Beta_kernel": "Paramètre bêta du noyau",
+    "AIC": "AIC",
+    "KS p": "p Kolmogorov-Smirnov",
+    "Chi2 p": "p Chi carré",
+    "CvM p": "p Cramér-von Mises",
+    "Acceptée": "Acceptée",
+    "Retenue": "Retenue",
+    "Processus": "Processus",
+    "Distribution": "Loi",
+    "Eta": "Êta",
+    "Gamma": "Gamma",
+    "Lambda_HPP (1/h)": "Lambda_HPP (1/h)",
+    "Mu": "Mu",
+    "Alpha": "Alpha",
+    "Beta_kernel": "Bêta noyau",
     "Branch_ratio": "Ratio de branchement",
     "Ajustement accepté": "Ajustement accepté",
-    "MTTF (h)": "Temps moyen avant défaillance (heures)",
-    "MTBF (h)": "Temps moyen entre défaillances (heures)",
-    "MTTR (h)": "Temps moyen de réparation (heures)",
-    "Disponibilité": "Disponibilité intrinsèque",
-    "Taux de défaillance moyen (1/h)": "Taux moyen de défaillance (1/h)",
+    "MTTF (h)": "MTTF (h)",
+    "MTBF (h)": "MTBF (h)",
+    "MTTR (h)": "MTTR (h)",
+    "Disponibilité": "Disponibilité",
+    "Taux de défaillance moyen (1/h)": "Taux moyen (1/h)",
+    "t_ref_h": "Temps de référence t* (h)",
+    "R_t_ref": "Fiabilité R(t*)",
+    "F_t_ref": "Répartition F(t*)",
+    "f_t_ref": "Densité f(t*)",
+    "lambda_t_ref": "Taux λ(t*)",
 }
 
 
@@ -155,7 +159,7 @@ DETAIL_TABLE_LABELS = {
 
 
 def get_distribution_and_parameters(reliability_result: Dict[str, Any]):
-    if reliability_result.get("model") != "RP":
+    if str(reliability_result.get("model") or "").upper() != "RP":
         return None, None
 
     distribution_name = reliability_result.get("distribution")
@@ -200,15 +204,6 @@ def compute_rp_curve(
                 out=np.full_like(density_values, np.nan, dtype=float),
                 where=survival_values > 1e-12,
             )
-        elif curve_name == "cum_mean_events":
-            indicators = reliability_result.get("indicators", {}) or {}
-            mean_time_between_failures = safe_float(
-                indicators.get("theoretical_mttf_h") or indicators.get("empirical_mttf_h"),
-                None,
-            )
-            if mean_time_between_failures is None or mean_time_between_failures <= 0:
-                return None
-            values = time_axis / mean_time_between_failures
         else:
             return None
 
@@ -230,7 +225,6 @@ def compute_nhpp_curve(
         return None
 
     safe_time_axis = np.maximum(time_axis, 1e-6)
-
     mean_cumulative_events = (safe_time_axis / eta_value) ** beta_value
     intensity = (beta_value / eta_value) * ((safe_time_axis / eta_value) ** (beta_value - 1.0))
     survival_like = np.exp(-mean_cumulative_events)
@@ -245,8 +239,6 @@ def compute_nhpp_curve(
         return density_like
     if curve_name == "hazard":
         return intensity
-    if curve_name == "cum_mean_events":
-        return mean_cumulative_events
 
     return None
 
@@ -297,8 +289,6 @@ def compute_bpp_curve(
         return density_like
     if curve_name == "hazard":
         return intensity
-    if curve_name == "cum_mean_events":
-        return cumulative_intensity
 
     return None
 
@@ -321,57 +311,10 @@ def compute_model_based_curve(
     return None
 
 
-def build_curve_explanation(
-    reliability_result: Dict[str, Any],
-    curve_name: str,
-) -> str:
-    model_name = str(reliability_result.get("model") or "").upper()
-
-    if curve_name == "survival":
-        if model_name == "RP":
-            return "R(t) représente la probabilité qu’aucune défaillance ne survienne avant le temps t."
-        if model_name == "NHPP":
-            return "Ici, la courbe joue le rôle d’une probabilité de non-événement jusqu’au temps t dans un processus non homogène."
-        return "Ici, la courbe représente une probabilité conditionnelle de non-événement compte tenu de la dépendance entre événements."
-
-    if curve_name == "cdf":
-        if model_name == "RP":
-            return "F(t) représente la probabilité cumulée qu’une défaillance soit déjà survenue avant le temps t."
-        if model_name == "NHPP":
-            return "Ici, F(t) représente la probabilité cumulée d’avoir observé au moins un événement avant le temps t."
-        return "Ici, F(t) représente une probabilité cumulée conditionnelle d’apparition d’au moins un événement."
-
-    if curve_name == "pdf":
-        if model_name == "RP":
-            return "f(t) montre dans quelles zones de temps les défaillances sont les plus probables."
-        if model_name == "NHPP":
-            return "Ici, f(t) représente une densité du premier événement dans le processus non homogène."
-        return "Ici, f(t) représente une densité conditionnelle d’apparition d’un événement."
-
-    if curve_name == "hazard":
-        if model_name == "RP":
-            return "h(t) est le taux instantané de défaillance : plus il est élevé, plus le risque immédiat de défaillance est fort."
-        if model_name == "NHPP":
-            return "λ(t) est l’intensité instantanée du processus : elle montre si l’arrivée des événements s’accélère ou ralentit."
-        return "λ(t) est l’intensité conditionnelle du processus avec dépendance : elle dépend aussi des événements passés."
-
-    if curve_name == "cum_mean_events":
-        if model_name == "RP":
-            return "Cette courbe donne une approximation du nombre cumulé moyen de défaillances."
-        if model_name == "NHPP":
-            return "m(t) représente le nombre cumulé moyen d’événements attendu dans le modèle non homogène."
-        return "Cette courbe représente l’intensité cumulée ou le cumul moyen conditionnel des événements."
-
-    return "Courbe non documentée."
-
-
 def build_time_horizon_for_equipment(
     reliability_result: Dict[str, Any],
     ttf_series: list[float],
 ) -> float:
-    model_name = str(reliability_result.get("model") or "").upper()
-    parameters = reliability_result.get("params", {}) or {}
-
     values = np.asarray(ttf_series, dtype=float)
     values = values[np.isfinite(values)]
     values = values[values > 0]
@@ -382,99 +325,181 @@ def build_time_horizon_for_equipment(
     max_ttf = float(np.max(values))
     mean_ttf = float(np.mean(values))
     q90_ttf = float(np.quantile(values, 0.90))
+    eta_value = safe_float((reliability_result.get("params") or {}).get("eta"), None)
 
-    eta_value = safe_float(parameters.get("eta"), None)
-
-    base_horizon = max(
-        50.0,
-        max_ttf * 2.0,
-        mean_ttf * 6.0,
-        q90_ttf * 4.0,
-    )
-
-    if model_name == "RP":
-        if eta_value is not None and eta_value > 0:
-            return max(base_horizon, eta_value * 1.5)
-        return base_horizon
-
-    if model_name == "NHPP":
-        nhpp_horizon = base_horizon
-        if eta_value is not None and eta_value > 0:
-            nhpp_horizon = min(base_horizon, eta_value * 1.25)
-        return max(25.0, nhpp_horizon)
-
-    if model_name == "BPP":
-        return base_horizon
-
+    base_horizon = max(50.0, max_ttf * 2.0, mean_ttf * 6.0, q90_ttf * 4.0)
+    if eta_value is not None and eta_value > 0:
+        base_horizon = max(base_horizon, eta_value * 1.5)
     return base_horizon
 
 
-def build_group_time_horizon(
-    results_by_equipment: Dict[str, Dict[str, Any]],
-    ttf_series_by_equipment: Dict[str, list[float]],
-    equipment_codes: list[str],
+def build_reference_time(
+    reliability_result: Dict[str, Any],
+    ttf_series: list[float],
 ) -> float:
-    horizons = []
-    for equipment_code in equipment_codes:
-        result = results_by_equipment.get(equipment_code, {})
-        reliability_result = result.get("reliability", {}) or {}
-        ttf_series = ttf_series_by_equipment.get(equipment_code, [])
-        horizons.append(build_time_horizon_for_equipment(reliability_result, ttf_series))
+    indicators = reliability_result.get("indicators", {}) or {}
+    candidates = [
+        safe_float(indicators.get("mtbf_h"), None),
+        safe_float(indicators.get("theoretical_mttf_h"), None),
+        safe_float(indicators.get("empirical_mttf_h"), None),
+    ]
+    if ttf_series:
+        series_np = np.asarray(ttf_series, dtype=float)
+        series_np = series_np[np.isfinite(series_np)]
+        series_np = series_np[series_np > 0]
+        if series_np.size:
+            candidates.extend([
+                float(np.median(series_np)),
+                float(np.mean(series_np)),
+            ])
+    positive_candidates = [float(value) for value in candidates if value is not None and value > 0]
+    return positive_candidates[0] if positive_candidates else 1.0
 
-    if not horizons:
-        return 100.0
 
-    if len(horizons) == 1:
-        return float(horizons[0])
+def build_scalar_indicators_dataframe(
+    reliability_result: Dict[str, Any],
+    ttf_series: list[float],
+) -> pd.DataFrame:
+    indicators = reliability_result.get("indicators", {}) or {}
+    params = reliability_result.get("params", {}) or {}
+    availability = indicators.get("availability_intrinsic")
 
-    return float(np.quantile(np.asarray(horizons, dtype=float), 0.75))
+    t_ref = build_reference_time(reliability_result, ttf_series)
+    evaluation_axis = np.asarray([max(t_ref, 1e-6)], dtype=float)
+
+    survival_values = compute_model_based_curve(reliability_result, ttf_series, evaluation_axis, "survival")
+    cdf_values = compute_model_based_curve(reliability_result, ttf_series, evaluation_axis, "cdf")
+    density_values = compute_model_based_curve(reliability_result, ttf_series, evaluation_axis, "pdf")
+    hazard_values = compute_model_based_curve(reliability_result, ttf_series, evaluation_axis, "hazard")
+
+    return pd.DataFrame([
+        {
+            "t_ref_h": t_ref,
+            "R_t_ref": None if survival_values is None else float(survival_values[0]),
+            "F_t_ref": None if cdf_values is None else float(cdf_values[0]),
+            "f_t_ref": None if density_values is None else float(density_values[0]),
+            "lambda_t_ref": None if hazard_values is None else float(hazard_values[0]),
+            "MTTF_h": indicators.get("theoretical_mttf_h") or indicators.get("empirical_mttf_h"),
+            "MTBF_h": indicators.get("mtbf_h"),
+            "MTTR_h": indicators.get("mttr_h"),
+            "availability_pct": None if availability is None else 100.0 * float(availability),
+            "beta": params.get("beta"),
+            "eta_h": params.get("eta"),
+            "gamma_h": params.get("gamma"),
+        }
+    ])
 
 
-def export_tables_to_excel(results_by_equipment: Dict[str, Dict[str, Any]]) -> bytes:
-    buffer = BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        summary_rows = []
+def get_decisive_block(
+    reliability_result: Dict[str, Any],
+    tables: Dict[str, pd.DataFrame],
+) -> Tuple[str, pd.DataFrame]:
+    model_name = str(reliability_result.get("model") or "").upper()
 
-        for equipment_code, result in results_by_equipment.items():
-            tables = result.get("tables") or {}
-            for table_name, table_dataframe in tables.items():
-                if isinstance(table_dataframe, pd.DataFrame) and not table_dataframe.empty:
-                    readable_name = DETAIL_TABLE_LABELS.get(table_name, table_name)
-                    sheet_name = f"{str(equipment_code)[:14]}_{readable_name}"[:31]
-                    rename_columns_for_display(table_dataframe).to_excel(
-                        writer,
-                        sheet_name=sheet_name,
-                        index=False,
-                    )
+    if model_name == "NHPP":
+        return "Étape décisive : Tendance", tables.get("trend_results", pd.DataFrame())
+    if model_name == "BPP":
+        return "Étape décisive : Dépendance", tables.get("dependence_results", pd.DataFrame())
 
-            reliability_result = result.get("reliability", {}) or {}
-            indicators = reliability_result.get("indicators", {}) or {}
+    process_choice_df = tables.get("process_choice", pd.DataFrame())
+    if process_choice_df.empty:
+        process_choice_df = pd.DataFrame([
+            {
+                "Processus retenu": reliability_result.get("model"),
+                "Variant": reliability_result.get("process_variant"),
+                "Hypothèse entité": "Renouvellement / comportement sans tendance ni dépendance dominante",
+                "Justification": "Le chemin de décision aboutit au processus RP/HPP.",
+            }
+        ])
+    return "Étape décisive : RP / HPP", process_choice_df
 
-            summary_rows.append(
-                {
-                    "equipment_code": equipment_code,
-                    "model": reliability_result.get("model"),
-                    "process_variant": reliability_result.get("process_variant"),
-                    "distribution": reliability_result.get("distribution"),
-                    "MTTF_h": indicators.get("theoretical_mttf_h") or indicators.get("empirical_mttf_h"),
-                    "MTBF_h": indicators.get("mtbf_h"),
-                    "MTTR_h": indicators.get("mttr_h"),
-                    "availability_pct": None if indicators.get("availability_intrinsic") is None else 100.0 * float(indicators.get("availability_intrinsic")),
-                    "beta": (reliability_result.get("params") or {}).get("beta"),
-                    "eta_h": (reliability_result.get("params") or {}).get("eta"),
-                    "gamma_h": (reliability_result.get("params") or {}).get("gamma"),
-                }
-            )
 
-        if summary_rows:
-            rename_columns_for_display(pd.DataFrame(summary_rows)).to_excel(
-                writer,
-                sheet_name="Synthese",
-                index=False,
-            )
+def get_selected_law_dataframe(
+    reliability_result: Dict[str, Any],
+    tables: Dict[str, pd.DataFrame],
+) -> pd.DataFrame:
+    fit_candidates = tables.get("fit_candidates", pd.DataFrame())
+    if isinstance(fit_candidates, pd.DataFrame) and not fit_candidates.empty:
+        selected_rows = fit_candidates.copy()
+        if "Retenue" in selected_rows.columns:
+            retained_mask = selected_rows["Retenue"].astype(str).str.lower().isin(["true", "vrai", "oui", "1"])
+            if retained_mask.any():
+                selected_rows = selected_rows[retained_mask]
+        if "Acceptée" in selected_rows.columns:
+            accepted_mask = selected_rows["Acceptée"].astype(str).str.lower().isin(["true", "vrai", "oui", "1"])
+            if accepted_mask.any():
+                selected_rows = selected_rows[accepted_mask]
+        if not selected_rows.empty:
+            preferred_columns = [
+                column
+                for column in [
+                    "Modèle",
+                    "Paramètres",
+                    "Méthode estimation",
+                    "LogLik",
+                    "AIC",
+                    "KS p",
+                    "Chi2 p",
+                    "CvM p",
+                    "Acceptée",
+                    "Retenue",
+                ]
+                if column in selected_rows.columns
+            ]
+            if preferred_columns:
+                return selected_rows[preferred_columns].head(1).reset_index(drop=True)
+            return selected_rows.head(1).reset_index(drop=True)
 
-    buffer.seek(0)
-    return buffer.getvalue()
+    params = reliability_result.get("params", {}) or {}
+    return pd.DataFrame([
+        {
+            "Processus": reliability_result.get("model"),
+            "Distribution": reliability_result.get("distribution"),
+            "Paramètres": f"beta={format_number(params.get('beta'), 3)} ; eta={format_number(params.get('eta'), 2)} ; gamma={format_number(params.get('gamma'), 2)}",
+            "Méthode estimation": "MLE / pipeline interne",
+        }
+    ])
+
+
+def build_adjustment_dataframe(
+    reliability_result: Dict[str, Any],
+) -> pd.DataFrame:
+    goodness = reliability_result.get("goodness", {}) or {}
+    return pd.DataFrame([
+        {
+            "AIC": goodness.get("aic"),
+            "KS p": goodness.get("ks_p"),
+            "Chi2 p": goodness.get("chi2_p"),
+            "CvM p": goodness.get("cvm_p"),
+            "Ajustement accepté": goodness.get("accepted"),
+        }
+    ])
+
+
+def build_equipment_summary_row(
+    equipment_code: str,
+    reliability_result: Dict[str, Any],
+    ttf_series: list[float],
+) -> dict[str, Any]:
+    indicators = reliability_result.get("indicators", {}) or {}
+    params = reliability_result.get("params", {}) or {}
+    scalar_indicators = build_scalar_indicators_dataframe(reliability_result, ttf_series).iloc[0].to_dict()
+
+    return {
+        "equipment_code": equipment_code,
+        "model": reliability_result.get("model"),
+        "process_variant": reliability_result.get("process_variant"),
+        "distribution": reliability_result.get("distribution"),
+        "MTTF_h": indicators.get("theoretical_mttf_h") or indicators.get("empirical_mttf_h"),
+        "MTBF_h": indicators.get("mtbf_h"),
+        "MTTR_h": indicators.get("mttr_h"),
+        "availability_pct": None if indicators.get("availability_intrinsic") is None else 100.0 * float(indicators.get("availability_intrinsic")),
+        "beta": params.get("beta"),
+        "eta_h": params.get("eta"),
+        "gamma_h": params.get("gamma"),
+        "R_t_ref": scalar_indicators.get("R_t_ref"),
+        "lambda_t_ref": scalar_indicators.get("lambda_t_ref"),
+    }
 
 
 # -------------------------------------------------------------------
@@ -498,27 +523,26 @@ if "equipment_code" not in source_dataframe.columns or "ttf_h" not in source_dat
 with st.expander("Comprendre les principales variables affichées sur cette page", expanded=False):
     st.markdown(
         """
-**Temps moyen avant défaillance** : durée moyenne attendue avant une panne.
-
-**Temps moyen entre défaillances** : durée moyenne séparant deux défaillances successives.
-
-**Temps moyen de réparation** : durée moyenne nécessaire pour remettre l’équipement en service.
-
-**Disponibilité intrinsèque** : part du temps où l’équipement est disponible.
-
-**Paramètre bêta** : décrit la forme du vieillissement.
+**Bêta** : décrit la forme du vieillissement.
 - inférieur à 1 : défauts précoces
 - proche de 1 : comportement aléatoire
 - supérieur à 1 : usure
 
-**Paramètre êta** : durée de vie caractéristique estimée.
+**Êta** : durée de vie caractéristique estimée.
 
-**Paramètre gamma** : éventuel décalage temporel dans le modèle.
+**Gamma** : éventuel décalage temporel dans le modèle.
 
-**Processus retenu** :
-- RP : renouvellement avec durées supposées indépendantes
-- NHPP : processus évolutif dans le temps
-- BPP : processus avec dépendance entre événements
+**R(t\*)** : probabilité de bon fonctionnement au temps de référence t\*.
+
+**f(t\*)** : densité de probabilité au temps de référence t\*.
+
+**λ(t\*)** : taux instantané de défaillance au temps de référence t\*.
+
+**MTTF** : temps moyen avant défaillance.
+
+**MTBF** : temps moyen entre défaillances.
+
+**MTTR** : temps moyen de réparation.
         """
     )
 
@@ -551,7 +575,6 @@ if not selected_equipment_codes:
 results_by_equipment: Dict[str, Dict[str, Any]] = {}
 summary_rows: list[dict[str, Any]] = []
 ttf_series_by_equipment: Dict[str, list[float]] = {}
-equipment_without_curves: list[str] = []
 
 for equipment_code in selected_equipment_codes:
     equipment_dataframe = source_dataframe[source_dataframe["equipment_code"].astype(str) == str(equipment_code)].copy()
@@ -575,29 +598,9 @@ for equipment_code in selected_equipment_codes:
         st.warning(f"{equipment_code} : {error}")
         continue
 
-    results_by_equipment[str(equipment_code)] = result
-
     reliability_result = result.get("reliability", {}) or {}
-    indicators = reliability_result.get("indicators", {}) or {}
-
-    summary_rows.append(
-        {
-            "equipment_code": equipment_code,
-            "model": reliability_result.get("model"),
-            "process_variant": reliability_result.get("process_variant"),
-            "distribution": reliability_result.get("distribution"),
-            "MTTF_h": indicators.get("theoretical_mttf_h") or indicators.get("empirical_mttf_h"),
-            "MTBF_h": indicators.get("mtbf_h"),
-            "MTTR_h": indicators.get("mttr_h"),
-            "availability_pct": None if indicators.get("availability_intrinsic") is None else 100.0 * float(indicators.get("availability_intrinsic")),
-            "beta": (reliability_result.get("params") or {}).get("beta"),
-            "eta_h": (reliability_result.get("params") or {}).get("eta"),
-            "gamma_h": (reliability_result.get("params") or {}).get("gamma"),
-        }
-    )
-
-    if str(reliability_result.get("model") or "").upper() not in {"RP", "NHPP", "BPP"}:
-        equipment_without_curves.append(str(equipment_code))
+    results_by_equipment[str(equipment_code)] = result
+    summary_rows.append(build_equipment_summary_row(str(equipment_code), reliability_result, time_to_failure_list))
 
 if not results_by_equipment:
     st.error("Pas assez de temps entre défaillances exploitables (au moins 3 valeurs positives).")
@@ -611,6 +614,12 @@ selected_equipment_for_detail = st.selectbox(
 )
 selected_result = results_by_equipment[selected_equipment_for_detail]
 selected_tables = selected_result.get("tables", {}) or {}
+selected_reliability_result = selected_result.get("reliability", {}) or {}
+selected_ttf_series = ttf_series_by_equipment.get(selected_equipment_for_detail, [])
+selected_indicators_dataframe = build_scalar_indicators_dataframe(selected_reliability_result, selected_ttf_series)
+decisive_title, decisive_dataframe = get_decisive_block(selected_reliability_result, selected_tables)
+selected_law_dataframe = get_selected_law_dataframe(selected_reliability_result, selected_tables)
+adjustment_dataframe = build_adjustment_dataframe(selected_reliability_result)
 
 
 # -------------------------------------------------------------------
@@ -623,11 +632,11 @@ with metric_col_2:
     total_failure_count = int(
         len(source_dataframe[source_dataframe["equipment_code"].astype(str).isin(list(results_by_equipment.keys()))])
     )
-    st.metric("Nombre total d’enregistrements de défaillance", total_failure_count)
+    st.metric("Nombre total de défaillances", total_failure_count)
 with metric_col_3:
     availability_series = summary_dataframe["availability_pct"].dropna()
     st.metric(
-        "Disponibilité moyenne",
+        "Disponibilité moyenne (%)",
         format_number(availability_series.mean(), 2) if not availability_series.empty else "—",
     )
 with metric_col_4:
@@ -637,265 +646,122 @@ with metric_col_4:
         format_number(beta_series.max(), 2) if not beta_series.empty else "—",
     )
 
+st.subheader("Synthèse des équipements analysés")
+overview_columns = [
+    "equipment_code",
+    "model",
+    "process_variant",
+    "distribution",
+    "MTTF_h",
+    "MTBF_h",
+    "MTTR_h",
+    "availability_pct",
+    "beta",
+    "eta_h",
+    "gamma_h",
+]
+st.dataframe(
+    rename_columns_for_display(summary_dataframe[overview_columns]),
+    use_container_width=True,
+    hide_index=True,
+)
 
-page_tabs = st.tabs([
-    "Vue d’ensemble",
-    "Tendance",
-    "Dépendance",
-    "Fiabilité",
-    "Courbes fiabilistes",
-    "Téléchargements",
+st.divider()
+
+# -------------------------------------------------------------------
+# Detailed reading
+# -------------------------------------------------------------------
+st.subheader(f"{decisive_title} — {selected_equipment_for_detail}")
+if decisive_dataframe is None or decisive_dataframe.empty:
+    st.info("Aucune table disponible pour cette étape.")
+else:
+    st.dataframe(rename_columns_for_display(decisive_dataframe), use_container_width=True, hide_index=True)
+
+st.subheader("Loi choisie")
+st.dataframe(rename_columns_for_display(selected_law_dataframe), use_container_width=True, hide_index=True)
+
+st.subheader("Processus d’ajustement")
+st.dataframe(rename_columns_for_display(adjustment_dataframe), use_container_width=True, hide_index=True)
+
+st.subheader("Indicateurs calculés")
+st.dataframe(rename_columns_for_display(selected_indicators_dataframe), use_container_width=True, hide_index=True)
+
+# -------------------------------------------------------------------
+# Graphs
+# -------------------------------------------------------------------
+st.subheader("Graphiques")
+time_horizon = build_time_horizon_for_equipment(selected_reliability_result, selected_ttf_series)
+time_axis = np.linspace(1e-6, time_horizon, 400)
+
+graph_tabs = st.tabs([
+    "Fiabilité R(t)",
+    "Répartition F(t)",
+    "Densité f(t)",
+    "Taux λ(t)",
 ])
 
-with page_tabs[0]:
-    st.subheader("Vue d’ensemble")
-    st.dataframe(rename_columns_for_display(summary_dataframe), use_container_width=True, hide_index=True)
+curve_specs = [
+    ("survival", "Fiabilité R(t)", "R(t)"),
+    ("cdf", "Fonction de répartition F(t)", "F(t)"),
+    ("pdf", "Densité de probabilité f(t)", "f(t)"),
+    ("hazard", "Taux de défaillance λ(t)", "λ(t)"),
+]
 
-with page_tabs[1]:
-    st.subheader(f"Tendance — {selected_equipment_for_detail}")
-    trend_dataframe = selected_tables.get("trend_results", pd.DataFrame())
-    if trend_dataframe.empty:
-        st.info("Aucun tableau de tendance disponible.")
-    else:
-        st.dataframe(rename_columns_for_display(trend_dataframe), use_container_width=True, hide_index=True)
-
-with page_tabs[2]:
-    st.subheader(f"Dépendance — {selected_equipment_for_detail}")
-    dependence_dataframe = selected_tables.get("dependence_results", pd.DataFrame())
-    if dependence_dataframe.empty:
-        st.info("Aucun tableau de dépendance disponible.")
-    else:
-        st.dataframe(rename_columns_for_display(dependence_dataframe), use_container_width=True, hide_index=True)
-
-with page_tabs[3]:
-    st.subheader(f"Fiabilité — {selected_equipment_for_detail}")
-
-    reliability_view = summary_dataframe[
-        summary_dataframe["equipment_code"] == selected_equipment_for_detail
-    ][
-        [
-            "equipment_code",
-            "model",
-            "process_variant",
-            "distribution",
-            "MTTF_h",
-            "MTBF_h",
-            "MTTR_h",
-            "availability_pct",
-            "beta",
-            "eta_h",
-            "gamma_h",
-        ]
-    ].copy()
-    st.dataframe(rename_columns_for_display(reliability_view), use_container_width=True, hide_index=True)
-
-    with st.expander("Voir la décision sur le processus fiabiliste"):
-        process_dataframe = selected_tables.get("process_choice", pd.DataFrame())
-        if process_dataframe.empty:
-            st.info("Aucun tableau de processus disponible.")
-        else:
-            st.dataframe(rename_columns_for_display(process_dataframe), use_container_width=True, hide_index=True)
-
-    with st.expander("Voir la comparaison des lois candidates"):
-        fit_dataframe = selected_tables.get("fit_candidates", pd.DataFrame())
-        if fit_dataframe.empty:
-            st.info("Aucun détail d’ajustement disponible.")
-        else:
-            st.dataframe(rename_columns_for_display(fit_dataframe), use_container_width=True, hide_index=True)
-
-    with st.expander("Voir la synthèse fiabiliste détaillée"):
-        reliability_summary_dataframe = selected_tables.get("reliability_summary", pd.DataFrame())
-        if reliability_summary_dataframe.empty:
-            st.info("Aucune synthèse fiabiliste disponible.")
-        else:
-            st.dataframe(rename_columns_for_display(reliability_summary_dataframe), use_container_width=True, hide_index=True)
-
-with page_tabs[4]:
-    st.subheader("Courbes fiabilistes")
-
-    if equipment_without_curves:
-        st.info(
-            "Certaines courbes n’ont pas pu être construites pour : "
-            + ", ".join(equipment_without_curves)
+for graph_tab, (curve_name, title, y_label) in zip(graph_tabs, curve_specs):
+    with graph_tab:
+        figure, axis = plt.subplots(figsize=(10, 4.8))
+        curve_values = compute_model_based_curve(
+            reliability_result=selected_reliability_result,
+            ttf_series=selected_ttf_series,
+            time_axis=time_axis,
+            curve_name=curve_name,
         )
-
-    compare_all_equipment = st.toggle(
-        "Comparer tous les équipements sur les courbes",
-        value=False,
-        help="Décoche pour lire plus clairement les courbes de l’équipement sélectionné.",
-    )
-
-    if compare_all_equipment:
-        equipment_codes_for_plots = list(results_by_equipment.keys())
-    else:
-        equipment_codes_for_plots = [selected_equipment_for_detail]
-
-    time_horizon = build_group_time_horizon(
-        results_by_equipment=results_by_equipment,
-        ttf_series_by_equipment=ttf_series_by_equipment,
-        equipment_codes=equipment_codes_for_plots,
-    )
-    time_axis = np.linspace(1e-6, time_horizon, 400)
-
-    selected_reliability_result = (results_by_equipment.get(selected_equipment_for_detail, {}) or {}).get("reliability", {}) or {}
-
-    curve_definitions = [
-        (
-            "survival",
-            "Fiabilité R(t) ou probabilité de non-événement",
-            "Probabilité",
-            "Pour un processus de renouvellement, cette courbe correspond à la fiabilité R(t). "
-            "Pour NHPP et BPP, elle est interprétée comme une probabilité de non-événement avant le temps t.",
-        ),
-        (
-            "cdf",
-            "Fonction de répartition F(t)",
-            "Probabilité cumulée",
-            "Cette courbe montre la probabilité cumulée d’avoir déjà observé au moins un événement avant le temps t.",
-        ),
-        (
-            "pdf",
-            "Densité f(t)",
-            "Densité",
-            "Cette courbe montre dans quelles zones de temps les événements sont les plus concentrés.",
-        ),
-        (
-            "hazard",
-            "Intensité h(t) ou λ(t)",
-            "Intensité",
-            "Pour RP, la courbe correspond au taux instantané de défaillance h(t). "
-            "Pour NHPP et BPP, elle correspond à l’intensité λ(t) du processus.",
-        ),
-        (
-            "cum_mean_events",
-            "Nombre cumulé moyen m(t)",
-            "Cumul moyen",
-            "Cette courbe montre le cumul moyen attendu des événements au cours du temps.",
-        ),
-    ]
-
-    def plot_multiple_model_curves(
-        axis,
-        curve_name: str,
-        title: str,
-        y_label: str,
-    ):
-        plotted_count = 0
-
-        for equipment_code in equipment_codes_for_plots:
-            result = results_by_equipment.get(equipment_code, {})
-            reliability_result = result.get("reliability", {}) or {}
-            equipment_ttf_series = ttf_series_by_equipment.get(equipment_code, [])
-
-            curve_values = compute_model_based_curve(
-                reliability_result=reliability_result,
-                ttf_series=equipment_ttf_series,
-                time_axis=time_axis,
-                curve_name=curve_name,
-            )
-            if curve_values is None:
-                continue
-
-            label = (
-                f"{equipment_code} | "
-                f"{reliability_result.get('model', '—')} | "
-                f"{reliability_result.get('distribution', '—')}"
-            )
-            axis.plot(time_axis, curve_values, label=label, linewidth=2)
-            plotted_count += 1
-
-        axis.set_title(title)
+        if curve_values is None:
+            axis.text(0.5, 0.5, "Courbe indisponible", ha="center", va="center", transform=axis.transAxes)
+        else:
+            axis.plot(time_axis, curve_values, linewidth=2)
+        axis.set_title(f"{title} — {selected_equipment_for_detail}")
         axis.set_xlabel("Temps (heures)")
         axis.set_ylabel(y_label)
         axis.grid(True, alpha=0.3)
+        st.pyplot(figure, clear_figure=True)
 
-        if plotted_count:
-            axis.legend(fontsize=8)
-        else:
-            axis.text(
-                0.5,
-                0.5,
-                "Aucune courbe disponible",
-                ha="center",
-                va="center",
-                transform=axis.transAxes,
+# -------------------------------------------------------------------
+# Downloads
+# -------------------------------------------------------------------
+st.divider()
+st.subheader("Téléchargement du rapport")
+
+if export_merged_report_pdf is None:
+    st.info("Le module PDF n’est pas disponible.")
+    if report_error_message:
+        st.caption(report_error_message)
+else:
+    selected_source_dataframe = source_dataframe[
+        source_dataframe["equipment_code"].astype(str).isin(selected_equipment_codes)
+    ].copy()
+
+    if st.button("Générer le rapport PDF", type="primary", use_container_width=True):
+        try:
+            output_path = export_merged_report_pdf(
+                df=selected_source_dataframe,
+                out_dir=str(Path(__file__).resolve().parents[1] / "reports"),
+                title="Rapport — Indicateurs fiabilistes",
+                analysis_results=results_by_equipment,
+                alpha=float(alpha_value),
             )
+            st.session_state["last_indicators_report_path"] = output_path
+            st.success(f"PDF généré : {output_path}")
+        except Exception as error:
+            st.error(f"PDF : {error}")
 
-    reliability_curve_tabs = st.tabs([
-        "Fiabilité R(t)",
-        "Fonction de répartition F(t)",
-        "Densité f(t)",
-        "Intensité h(t) ou λ(t)",
-        "Nombre cumulé moyen m(t)",
-    ])
-
-    for curve_tab, curve_definition in zip(reliability_curve_tabs, curve_definitions):
-        curve_name, title, y_label, generic_explanation = curve_definition
-        with curve_tab:
-            figure, axis = plt.subplots(figsize=(10, 5))
-            plot_multiple_model_curves(axis, curve_name, title, y_label)
-            st.pyplot(figure, clear_figure=True)
-
-            if str(selected_reliability_result.get("model") or "").upper() == "NHPP":
-                st.caption(
-                    "L’échelle de l’axe du temps a été volontairement réduite pour le NHPP afin de rester dans une zone de lecture utile."
-                )
-
-            st.caption(generic_explanation)
-            st.caption(
-                f"Lecture pour l’équipement sélectionné ({selected_equipment_for_detail}) : "
-                + build_curve_explanation(selected_reliability_result, curve_name)
-            )
-
-with page_tabs[5]:
-    st.subheader("Téléchargements")
-
-    excel_bytes = export_tables_to_excel(results_by_equipment)
-    st.download_button(
-        "Télécharger le fichier Excel des indicateurs",
-        data=excel_bytes,
-        file_name="indicateurs_tables.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-    )
-
-    if export_merged_report_pdf is None:
-        st.info("Le module PDF n’est pas disponible.")
-        if report_error_message:
-            st.caption(report_error_message)
-    else:
-        selected_source_dataframe = source_dataframe[
-            source_dataframe["equipment_code"].astype(str).isin(selected_equipment_codes)
-        ].copy()
-
-        if st.button("Générer le PDF", type="primary", use_container_width=True):
-            try:
-                try:
-                    output_path = export_merged_report_pdf(
-                        df=selected_source_dataframe,
-                        out_dir=str(Path(__file__).resolve().parents[1] / "reports"),
-                        title="Rapport — Indicateurs",
-                        analysis_results=results_by_equipment,
-                    )
-                except TypeError:
-                    output_path = export_merged_report_pdf(
-                        df=selected_source_dataframe,
-                        out_dir=str(Path(__file__).resolve().parents[1] / "reports"),
-                        title="Rapport — Indicateurs",
-                    )
-
-                st.session_state["last_report_path"] = output_path
-                st.success(f"PDF généré : {output_path}")
-            except Exception as error:
-                st.error(f"PDF : {error}")
-
-        pdf_path = st.session_state.get("last_report_path")
-        if pdf_path and Path(pdf_path).exists():
-            pdf_bytes = Path(pdf_path).read_bytes()
-            st.download_button(
-                "Télécharger le PDF",
-                data=pdf_bytes,
-                file_name=Path(pdf_path).name,
-                mime="application/pdf",
-                use_container_width=True,
-            )
+    pdf_path = st.session_state.get("last_indicators_report_path")
+    if pdf_path and Path(pdf_path).exists():
+        pdf_bytes = Path(pdf_path).read_bytes()
+        st.download_button(
+            "Télécharger le PDF",
+            data=pdf_bytes,
+            file_name=Path(pdf_path).name,
+            mime="application/pdf",
+            use_container_width=True,
+        )
