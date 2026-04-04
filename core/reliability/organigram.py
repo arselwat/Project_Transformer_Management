@@ -1272,6 +1272,7 @@ def analyze_reliability_only(
         "params": params,
         "tests": {
             "trend_graphical": trend_graphical,
+            "trend_mil_hdbk_189": trend_graphical,
             "trend_mk": mk,
             "trend_laplace": lap,
             "trend_combined": trend,
