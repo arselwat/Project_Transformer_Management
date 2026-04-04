@@ -801,6 +801,7 @@ with st.spinner("Analyse globale en cours..."):
             continue
         selected_row = row_df.iloc[0].to_dict()
         selected_result = results_by_equipment[equipment_code]
+        detail_tables_by_equipment[equipment_code] = build_detail_excel_tables(selected_result, selected_row, alpha_value, selected_result.get("reliability", {}).get("cleaned_series", None) or time_to_failure_series)
 
 
 # =========================================================
