@@ -1,9 +1,10 @@
+
 from __future__ import annotations
 
 from pathlib import Path
 import io
 import hashlib
-from typing import Any, Optional, Dict
+from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
@@ -18,19 +19,8 @@ from core.reliability.policy import suggested_actions
 from core.reliability.organigram import analyze_ttf_pipeline
 from core.reliability.optimize import propose_intervals_cost_and_reliability
 from core.security.auth import require_login
-from core.datahub import get_current_failures_df, get_failures_meta, get_project_meta
+from core.datahub import get_current_failures_df, get_failures_meta
 from core.ui import render_shell, render_page_header
-
-try:
-    from core.datahub import get_pipeline_inputs
-except Exception:
-    def get_pipeline_inputs(asset_id: Optional[str] = None) -> Dict[str, Any]:
-        return {
-            "asset_id": asset_id,
-            "thermal_df": None,
-            "thermal_config": None,
-            "alpha": 0.05,
-        }
 
 export_optimization_report_pdf = None
 pdf_import_error_message = None
@@ -48,7 +38,7 @@ require_login()
 render_shell("pages/3_Optimisation_verified.py")
 render_page_header(
     "Optimisation",
-    "Intervalles recommandés, coûts, fiabilité, contraintes thermiques et préparation du planning de maintenance.",
+    "Intervalles recommandés, coûts, fiabilité et préparation du planning de maintenance.",
     "🧠",
 )
 
@@ -92,87 +82,14 @@ def dataframe_hash(dataframe: pd.DataFrame) -> str:
     return hashlib.md5(dataframe.to_csv(index=False).encode("utf-8")).hexdigest()
 
 
-def sanitize_thermal_config(configuration: Any) -> Optional[Dict[str, Any]]:
-    if not isinstance(configuration, dict) or not configuration:
-        return None
-
-    allowed_keys = {
-        "sn_mva",
-        "R",
-        "delta_to_r",
-        "delta_h_r",
-        "tau_to_min",
-        "tau_w_min",
-        "n_exp",
-        "m_exp",
-        "forced_tau_to_factor",
-        "forced_delta_to_factor",
-        "forced_delta_h_factor",
-        "normal_insulation_life_h",
-        "dt_hours",
-    }
-
-    sanitized_configuration: Dict[str, Any] = {}
-    for key, value in configuration.items():
-        if key in allowed_keys and pd.notna(value):
-            sanitized_configuration[key] = value
-
-    return sanitized_configuration or None
-
-
-def sanitize_thermal_dataframe(dataframe: Any) -> Optional[pd.DataFrame]:
-    if not isinstance(dataframe, pd.DataFrame) or dataframe.empty:
-        return None
-
-    sanitized_dataframe = dataframe.copy()
-    sanitized_dataframe.columns = [str(column).strip() for column in sanitized_dataframe.columns]
-
-    for removable_column in ["asset_id", "equipment_code"]:
-        if removable_column in sanitized_dataframe.columns:
-            sanitized_dataframe = sanitized_dataframe.drop(columns=[removable_column])
-
-    return sanitized_dataframe if not sanitized_dataframe.empty else None
-
-
-def compute_thermal_status(
-    thermal_result: Optional[dict],
-    ageing_acceleration_factor_limit: Optional[float],
-    loss_of_life_limit_percent: Optional[float],
-) -> tuple[Optional[bool], str, Optional[float], Optional[float], Optional[float]]:
-    if not thermal_result:
-        return None, "Aucune donnée thermique disponible", None, None, None
-
-    summary = thermal_result.get("summary", {}) or {}
-    maximum_hotspot_temperature = safe_number(summary.get("theta_hs_max"))
-    maximum_ageing_acceleration_factor = safe_number(summary.get("faa_max"))
-    loss_of_life_percent = safe_number(summary.get("loss_of_life_pct"))
-
-    checks: list[bool] = []
-    if ageing_acceleration_factor_limit is not None and maximum_ageing_acceleration_factor is not None:
-        checks.append(maximum_ageing_acceleration_factor <= ageing_acceleration_factor_limit)
-
-    if loss_of_life_limit_percent is not None and loss_of_life_percent is not None:
-        checks.append(loss_of_life_percent <= loss_of_life_limit_percent)
-
-    if not checks:
-        return None, "Analyse thermique calculée", maximum_hotspot_temperature, maximum_ageing_acceleration_factor, loss_of_life_percent
-    if all(checks):
-        return True, "Thermique conforme", maximum_hotspot_temperature, maximum_ageing_acceleration_factor, loss_of_life_percent
-    return False, "Alerte thermique", maximum_hotspot_temperature, maximum_ageing_acceleration_factor, loss_of_life_percent
-
-
 def recommend_maintenance_type(
-    reliability_result: Dict[str, Any],
-    thermal_status: str,
+    reliability_result: dict[str, Any],
 ) -> str:
     process_name = str(reliability_result.get("model") or "").upper()
     process_variant = str(reliability_result.get("process_variant") or "").upper()
     decision = reliability_result.get("decision", {}) or {}
     trend_direction = str(decision.get("trend_direction") or "").lower()
     beta_value = safe_number((reliability_result.get("params") or {}).get("beta"))
-
-    if "ALERTE" in thermal_status.upper():
-        return "Inspection urgente et action préventive immédiate"
 
     if process_name == "NHPP":
         if trend_direction == "up":
@@ -273,11 +190,6 @@ DISPLAY_COLUMN_NAMES = {
     "beta_weibull_ref": "Bêta Weibull de référence",
     "eta_weibull_ref_h": "Êta Weibull de référence (heures)",
     "gamma_weibull_ref_h": "Gamma Weibull de référence (heures)",
-    "theta_HS_max": "Température maximale du point chaud (°C)",
-    "FAA_max": "Facteur maximal d’accélération du vieillissement",
-    "loss_of_life_pct": "Perte de vie (%)",
-    "thermal_status": "Statut thermique",
-    "thermal_ok": "Conformité thermique",
     "T_R_h": "Intervalle issu du critère de fiabilité (heures)",
     "T_cost_h": "Intervalle issu du critère économique (heures)",
     "R(T_cost)": "Fiabilité au niveau de l’intervalle économique",
@@ -290,7 +202,6 @@ DISPLAY_COLUMN_NAMES = {
     "trend_confidence": "Niveau de confiance sur la tendance",
     "reliability_adjustment_accepted": "Ajustement fiabiliste accepté",
     "reliability_ok": "Conformité fiabiliste",
-    "admissible_global": "Conformité globale",
 }
 
 
@@ -311,12 +222,6 @@ DETAIL_TABLE_LABELS = {
     "process_choice": "Décision sur le processus fiabiliste",
     "fit_candidates": "Comparaison des lois candidates",
     "reliability_summary": "Synthèse fiabiliste",
-    "thermal_summary": "Synthèse thermique",
-    "thermal_table_dataset": "Résumé de la série thermique utilisée",
-    "thermal_table_params": "Paramètres du modèle thermique",
-    "thermal_table_indicators": "Indicateurs thermiques calculés",
-    "thermal_daily": "Résumé journalier thermique",
-    "thermal_top5_days": "Jours les plus critiques",
 }
 
 
@@ -360,7 +265,6 @@ DATA_DIR.mkdir(exist_ok=True, parents=True)
 FALLBACK_OPTIMIZATION_FILE = DATA_DIR / "last_optimization.csv"
 
 failures_meta = get_failures_meta()
-project_meta = get_project_meta()
 source_dataframe = get_current_failures_df()
 
 if source_dataframe.empty:
@@ -380,16 +284,9 @@ else:
 source_dataframe = source_dataframe.dropna(subset=["ttf_h"])
 source_dataframe = source_dataframe[source_dataframe["ttf_h"] > 0].reset_index(drop=True)
 
-source_col_1, source_col_2 = st.columns(2)
-with source_col_1:
-    st.success(
-        f"Jeu de données actif | lignes={failures_meta.get('rows')} | empreinte={failures_meta.get('hash')}"
-    )
-with source_col_2:
-    if project_meta.get("ok"):
-        st.success(f"Projet thermique actif | empreinte={project_meta.get('hash', '')}")
-    else:
-        st.info("Aucun projet thermique actif")
+st.success(
+    f"Jeu de données actif | lignes={failures_meta.get('rows')} | empreinte={failures_meta.get('hash')}"
+)
 
 
 # -------------------------------------------------------------------
@@ -406,19 +303,11 @@ with control_col_1:
         default=default_selected_equipment_codes if default_selected_equipment_codes else all_equipment_codes,
     )
 with control_col_2:
-    default_alpha_value = 0.05
-    if selected_equipment_codes:
-        try:
-            bundle = get_pipeline_inputs(asset_id=str(selected_equipment_codes[0]))
-            default_alpha_value = float(bundle.get("alpha", 0.05) or 0.05)
-        except Exception:
-            default_alpha_value = 0.05
-
     alpha_value = st.number_input(
         "Seuil alpha",
         min_value=0.001,
         max_value=0.20,
-        value=float(default_alpha_value),
+        value=0.05,
         step=0.001,
         format="%.3f",
     )
@@ -441,21 +330,6 @@ with economic_col_4:
         0.99,
         0.70,
         0.01,
-    )
-
-thermal_project_available = bool(project_meta.get("ok"))
-thermal_col_1, thermal_col_2, thermal_col_3 = st.columns(3)
-with thermal_col_1:
-    use_thermal_constraint = st.toggle("Appliquer la contrainte thermique", value=thermal_project_available)
-with thermal_col_2:
-    maximum_allowed_ageing_acceleration_factor = (
-        st.number_input("Facteur maximal d’accélération du vieillissement", min_value=0.0, value=1.50, step=0.05)
-        if use_thermal_constraint else None
-    )
-with thermal_col_3:
-    maximum_allowed_loss_of_life_percent = (
-        st.number_input("Perte de vie maximale (%)", min_value=0.0, value=0.50, step=0.05)
-        if use_thermal_constraint else None
     )
 
 economic_optimization_enabled = (preventive_cost > 0) and (corrective_cost > 0)
@@ -483,22 +357,10 @@ for equipment_code in selected_equipment_codes:
         repair_time_series = extracted_repair_time_series if extracted_repair_time_series else None
 
     try:
-        pipeline_bundle = get_pipeline_inputs(asset_id=str(equipment_code))
-        if not isinstance(pipeline_bundle, dict):
-            pipeline_bundle = {}
-    except Exception:
-        pipeline_bundle = {}
-
-    thermal_dataframe = sanitize_thermal_dataframe(pipeline_bundle.get("thermal_df")) if use_thermal_constraint else None
-    thermal_configuration = sanitize_thermal_config(pipeline_bundle.get("thermal_config")) if use_thermal_constraint else None
-
-    try:
         pipeline_result = analyze_ttf_pipeline(
             ttf_series=time_to_failure_series,
             alpha=float(alpha_value),
             repair_series=repair_time_series,
-            thermal_df=thermal_dataframe,
-            thermal_config=thermal_configuration,
         )
     except Exception as error:
         pipeline_result = {
@@ -513,7 +375,6 @@ for equipment_code in selected_equipment_codes:
                 "decision": {},
                 "indicators": {},
             },
-            "thermal": None,
             "tables": {},
         }
 
@@ -545,7 +406,6 @@ if economic_optimization_enabled:
 for equipment_code, weibull_fit in weibull_reference_fits.items():
     pipeline_result = pipeline_results_by_equipment.get(equipment_code, {}) or {}
     reliability_result = pipeline_result.get("reliability", {}) or {}
-    thermal_result = pipeline_result.get("thermal")
     indicators = reliability_result.get("indicators", {}) or {}
     parameters = reliability_result.get("params", {}) or {}
     tests = reliability_result.get("tests", {}) or {}
@@ -565,19 +425,7 @@ for equipment_code, weibull_fit in weibull_reference_fits.items():
     reliability_at_economic_interval = (economic_results_by_equipment.get(equipment_code) or {}).get("R_at_T")
     minimum_hourly_cost = (economic_results_by_equipment.get(equipment_code) or {}).get("C_min")
 
-    (
-        thermal_is_ok,
-        thermal_status,
-        maximum_hotspot_temperature,
-        maximum_ageing_acceleration_factor,
-        loss_of_life_percent,
-    ) = compute_thermal_status(
-        thermal_result,
-        maximum_allowed_ageing_acceleration_factor if use_thermal_constraint else None,
-        maximum_allowed_loss_of_life_percent if use_thermal_constraint else None,
-    )
-
-    recommended_maintenance_type = recommend_maintenance_type(reliability_result, thermal_status)
+    recommended_maintenance_type = recommend_maintenance_type(reliability_result)
     recommended_interval_hours = recommend_interval(
         recommended_maintenance_type,
         reliability_interval_hours,
@@ -590,15 +438,6 @@ for equipment_code, weibull_fit in weibull_reference_fits.items():
 
     reliability_adjustment_accepted = goodness.get("accepted")
     reliability_is_ok = None if reliability_adjustment_accepted is None else bool(reliability_adjustment_accepted)
-
-    if reliability_is_ok is None and thermal_is_ok is None:
-        global_conformity = None
-    elif reliability_is_ok is None:
-        global_conformity = bool(thermal_is_ok)
-    elif thermal_is_ok is None:
-        global_conformity = bool(reliability_is_ok)
-    else:
-        global_conformity = bool(reliability_is_ok and thermal_is_ok)
 
     optimization_rows.append(
         {
@@ -624,14 +463,8 @@ for equipment_code, weibull_fit in weibull_reference_fits.items():
             "beta_weibull_ref": weibull_beta_reference,
             "eta_weibull_ref_h": weibull_eta_reference,
             "gamma_weibull_ref_h": weibull_gamma_reference,
-            "theta_HS_max": maximum_hotspot_temperature,
-            "FAA_max": maximum_ageing_acceleration_factor,
-            "loss_of_life_pct": loss_of_life_percent,
-            "thermal_status": thermal_status,
-            "thermal_ok": thermal_is_ok,
             "reliability_adjustment_accepted": reliability_adjustment_accepted,
             "reliability_ok": reliability_is_ok,
-            "admissible_global": global_conformity,
             "T_R_h": safe_number(reliability_interval_hours),
             "T_cost_h": safe_number(economic_interval_hours),
             "R(T_cost)": safe_number(reliability_at_economic_interval),
@@ -713,17 +546,6 @@ with page_tabs[0]:
         ]
     ].copy()
 
-    thermal_dataframe = optimization_dataframe[
-        [
-            "equipment_code",
-            "theta_HS_max",
-            "FAA_max",
-            "loss_of_life_pct",
-            "thermal_status",
-            "thermal_ok",
-        ]
-    ].copy()
-
     st.markdown("#### Tendance")
     st.dataframe(rename_columns_for_display(trend_dataframe), use_container_width=True, hide_index=True)
 
@@ -732,9 +554,6 @@ with page_tabs[0]:
 
     st.markdown("#### Fiabilité")
     st.dataframe(rename_columns_for_display(reliability_dataframe), use_container_width=True, hide_index=True)
-
-    st.markdown("#### Thermique")
-    st.dataframe(rename_columns_for_display(thermal_dataframe), use_container_width=True, hide_index=True)
 
 with page_tabs[1]:
     st.subheader("Résultat de l’optimisation")
@@ -757,9 +576,7 @@ with page_tabs[1]:
             "R(T_cost)",
             "C_min_per_h",
             "maintenance_type",
-            "thermal_status",
             "reliability_ok",
-            "admissible_global",
             "optimization_note",
         ]
     ].copy()
@@ -828,7 +645,6 @@ with page_tabs[3]:
     )
     selected_row = optimization_dataframe[optimization_dataframe["equipment_code"] == selected_equipment_for_detail].iloc[0].to_dict()
     selected_pipeline_result = pipeline_results_by_equipment.get(selected_equipment_for_detail, {}) or {}
-    selected_thermal_result = selected_pipeline_result.get("thermal")
     selected_detail_tables = selected_pipeline_result.get("tables", {}) or {}
 
     st.markdown(
@@ -842,8 +658,7 @@ with page_tabs[3]:
         f"- **Intervalle issu du critère économique** : **{format_number(selected_row.get('T_cost_h'), 1)} heures**\n"
         f"- **Intervalle issu du critère de fiabilité** : **{format_number(selected_row.get('T_R_h'), 1)} heures**\n"
         f"- **Intervalle recommandé** : **{format_number(selected_row.get('T_recommended_h'), 1)} heures**\n"
-        f"- **Type de maintenance recommandé** : **{selected_row.get('maintenance_type', '—')}**\n"
-        f"- **Statut thermique** : **{selected_row.get('thermal_status', '—')}**"
+        f"- **Type de maintenance recommandé** : **{selected_row.get('maintenance_type', '—')}**"
     )
 
     if selected_row.get("decision_reason"):
@@ -857,7 +672,7 @@ with page_tabs[3]:
     ):
         st.markdown(f"- {action}")
 
-    detail_tabs = st.tabs(["Fiabilité", "Thermique", "Tableaux exportables"])
+    detail_tabs = st.tabs(["Fiabilité", "Tableaux exportables"])
 
     with detail_tabs[0]:
         for table_key, section_title in [
@@ -873,47 +688,6 @@ with page_tabs[3]:
                 st.dataframe(rename_columns_for_display(table_dataframe), use_container_width=True, hide_index=True)
 
     with detail_tabs[1]:
-        if selected_thermal_result is None:
-            st.info("Aucune donnée thermique disponible pour cet équipement.")
-        else:
-            for table_key, section_title in [
-                ("thermal_summary", "Synthèse thermique"),
-                ("thermal_table_dataset", "Résumé de la série thermique utilisée"),
-                ("thermal_table_params", "Paramètres du modèle thermique"),
-                ("thermal_table_indicators", "Indicateurs thermiques"),
-                ("thermal_daily", "Résumé journalier thermique"),
-                ("thermal_top5_days", "Jours les plus critiques"),
-            ]:
-                table_dataframe = selected_detail_tables.get(table_key)
-                if isinstance(table_dataframe, pd.DataFrame) and not table_dataframe.empty:
-                    st.markdown(f"##### {section_title}")
-                    st.dataframe(rename_columns_for_display(table_dataframe), use_container_width=True, hide_index=True)
-
-            thermal_timeseries = selected_thermal_result.get("timeseries")
-            if isinstance(thermal_timeseries, pd.DataFrame) and not thermal_timeseries.empty:
-                thermal_timeseries = thermal_timeseries.copy()
-                thermal_timeseries["timestamp"] = pd.to_datetime(thermal_timeseries["timestamp"])
-
-                chart_col_1, chart_col_2 = st.columns(2)
-                with chart_col_1:
-                    figure_hotspot, axis_hotspot = plt.subplots()
-                    axis_hotspot.plot(thermal_timeseries["timestamp"], thermal_timeseries["theta_HS_est_C"])
-                    axis_hotspot.set_title("Température du point chaud estimée")
-                    axis_hotspot.set_xlabel("Temps")
-                    axis_hotspot.set_ylabel("Température (°C)")
-                    axis_hotspot.grid(True, alpha=0.3)
-                    st.pyplot(figure_hotspot, clear_figure=True)
-
-                with chart_col_2:
-                    figure_ageing, axis_ageing = plt.subplots()
-                    axis_ageing.plot(thermal_timeseries["timestamp"], thermal_timeseries["FAA"])
-                    axis_ageing.set_title("Facteur d’accélération du vieillissement")
-                    axis_ageing.set_xlabel("Temps")
-                    axis_ageing.set_ylabel("Facteur")
-                    axis_ageing.grid(True, alpha=0.3)
-                    st.pyplot(figure_ageing, clear_figure=True)
-
-    with detail_tabs[2]:
         for table_key, table_dataframe in selected_detail_tables.items():
             if isinstance(table_dataframe, pd.DataFrame) and not table_dataframe.empty:
                 st.markdown(f"##### {DETAIL_TABLE_LABELS.get(table_key, table_key)}")

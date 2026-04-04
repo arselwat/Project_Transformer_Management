@@ -3,34 +3,32 @@ from __future__ import annotations
 """
 core/reliability/organigram.py
 
-Pipeline fiabiliste + thermo-fiabiliste aligné sur l'organigramme métier.
+Pipeline fiabiliste pur (sans thermique), aligné sur l'organigramme métier.
 
-Logique respectée :
-1) Déterminer s'il existe une tendance
-   - Méthode graphique (proxy MIL-HDBK-189)
+Logique suivie :
+1) Test de tendance
+   - Méthode graphique (Crow-AMSAA / MIL-HDBK-189 sur log N(t) vs log t)
    - Test de Mann-Kendall
    - Test de Laplace
-   => si tendance : NHPP
+   => si tendance : NHPP (Power Law Process / Crow-AMSAA)
 
-2) Sinon, tester la dépendance
-   - Corrélation Pearson + Spearman
-   => si dépendance : BPP
+2) Si pas de tendance : test de dépendance
+   - Méthode graphique (lag plot TTF_i vs TTF_{i+1})
+   - Corrélation de Pearson
+   - Corrélation de Spearman
+   => si dépendance : BPP (approximation Hawkes exponentiel)
 
-3) Sinon, retenir un processus de renouvellement (RP)
-   - Données indépendantes et identiquement distribuées
-   - Choix d'une loi : expon, norm, lognorm, weibull_2p, weibull_3p
-   - Estimation des paramètres
+3) Si pas de dépendance : RP
+   - Données considérées iid
+   - Lois candidates : exponentielle, normale, lognormale, Weibull 2p, Weibull 3p
+   - Estimation par maximum de vraisemblance
+   - Estimation graphique / moindres carrés pour Weibull en complément
    - Tests d'ajustement : KS, Chi2, Cramér-von Mises
-   - Cas particulier : si la loi retenue est exponentielle, on signale aussi le variant HPP
+   - Si exponentielle retenue : signalement du cas particulier HPP
 
-4) En parallèle si fourni :
-   - bloc thermique dynamique
-   - top-oil, point chaud, FAA, perte de vie
-
-Sorties conservées compatibles avec les pages Streamlit existantes :
-- reliability
-- thermal
-- tables
+Sorties :
+- reliability : résultats complets
+- tables      : tableaux prêts pour Streamlit / PDF / Excel
 """
 
 from collections import Counter
@@ -56,8 +54,7 @@ def _clean_positive(series: List[float] | np.ndarray | None) -> np.ndarray:
 
 
 def _to_event_times(ttf_series: List[float] | np.ndarray) -> np.ndarray:
-    x = _clean_positive(ttf_series)
-    return np.cumsum(x)
+    return np.cumsum(_clean_positive(ttf_series))
 
 
 def _safe_float(x: Any, default: Optional[float] = None) -> Optional[float]:
@@ -177,8 +174,8 @@ def _cvm_gof(data: np.ndarray, cdf_func, params: Tuple[float, ...]) -> float:
 
 def _safe_logpdf_sum(dist, data: np.ndarray, params: Tuple[float, ...]) -> float:
     try:
-        lp = dist.logpdf(data, *params).sum()
-        return float(lp) if np.isfinite(lp) else -np.inf
+        val = float(dist.logpdf(data, *params).sum())
+        return val if np.isfinite(val) else -np.inf
     except Exception:
         return -np.inf
 
@@ -223,6 +220,56 @@ def _gof_acceptance_generic(ks_p: Any, cvm_p: Any, alpha: float) -> Optional[boo
 # ---------------------------------------------------------------------
 # 1) Tendance
 # ---------------------------------------------------------------------
+def graphical_trend_test(ttf_series: List[float]) -> Dict[str, Any]:
+    """
+    Méthode graphique inspirée de Crow-AMSAA / MIL-HDBK-189.
+    On ajuste log(N(t)) ~ a + b log(t).
+    - b > 1  : intensité croissante -> tendance up
+    - b < 1  : intensité décroissante -> tendance down
+    - b ~= 1 : pas de tendance claire
+    """
+    t = _to_event_times(ttf_series)
+    n = len(t)
+    if n < 3:
+        return {
+            "beta_graph": 1.0,
+            "slope_loglog": 1.0,
+            "intercept_loglog": 0.0,
+            "r2": None,
+            "has_trend": False,
+            "direction": "none",
+            "graphical_signal": "none",
+            "method": "crow_amsaa_loglog",
+        }
+
+    idx = np.arange(1, n + 1, dtype=float)
+    x = np.log(t)
+    y = np.log(idx)
+    slope, intercept = np.polyfit(x, y, 1)
+    y_hat = intercept + slope * x
+    ss_res = float(np.sum((y - y_hat) ** 2))
+    ss_tot = float(np.sum((y - np.mean(y)) ** 2))
+    r2 = None if ss_tot <= 0 else float(1.0 - ss_res / ss_tot)
+
+    if slope > 1.05:
+        direction = "up"
+    elif slope < 0.95:
+        direction = "down"
+    else:
+        direction = "none"
+
+    return {
+        "beta_graph": float(slope),
+        "slope_loglog": float(slope),
+        "intercept_loglog": float(intercept),
+        "r2": r2,
+        "has_trend": direction != "none",
+        "direction": direction,
+        "graphical_signal": direction,
+        "method": "crow_amsaa_loglog",
+    }
+
+
 def mann_kendall_test(series: List[float], alpha: float = 0.05) -> Dict[str, Any]:
     x = _clean_positive(series)
     n = len(x)
@@ -245,7 +292,7 @@ def mann_kendall_test(series: List[float], alpha: float = 0.05) -> Dict[str, Any
     else:
         z = 0.0
 
-    p = 2 * (1 - sst.norm.cdf(abs(z)))
+    p = 2.0 * (1.0 - sst.norm.cdf(abs(z)))
     has = bool(p < alpha)
     direction = "up" if (has and z > 0) else "down" if (has and z < 0) else "none"
     return {"z": float(z), "p": float(p), "has_trend": has, "direction": direction}
@@ -259,70 +306,40 @@ def laplace_trend_test(ttf_series: List[float], alpha: float = 0.05) -> Dict[str
 
     T = float(t[-1])
     mean_t = float(np.mean(t))
-    u = math.sqrt(12 * n) / T * (mean_t - T / 2.0)
-    p = 2 * (1 - sst.norm.cdf(abs(u)))
+    u = math.sqrt(12.0 * n) / T * (mean_t - T / 2.0)
+    p = 2.0 * (1.0 - sst.norm.cdf(abs(u)))
     has = bool(p < alpha)
     direction = "up" if (has and u > 0) else "down" if (has and u < 0) else "none"
     return {"u": float(u), "p": float(p), "has_trend": has, "direction": direction}
 
 
-def mil_hdbk_189_indicator(ttf_series: List[float]) -> Dict[str, Any]:
-    t = _to_event_times(ttf_series)
-    n = len(t)
-    if n < 3:
-        return {
-            "beta_graph": 1.0,
-            "slope_loglog": 1.0,
-            "intercept_loglog": 0.0,
-            "interpreted_trend": "none",
-        }
-
-    idx = np.arange(1, n + 1, dtype=float)
-    x = np.log(t)
-    y = np.log(idx)
-    slope, intercept = np.polyfit(x, y, 1)
-    beta = float(slope)
-
-    if beta > 1.05:
-        tr = "up"
-    elif beta < 0.95:
-        tr = "down"
-    else:
-        tr = "none"
-
-    return {
-        "beta_graph": beta,
-        "slope_loglog": beta,
-        "intercept_loglog": float(intercept),
-        "interpreted_trend": tr,
-    }
-
-
 def combine_trend_evidence(
+    graphical: Dict[str, Any],
     mk: Dict[str, Any],
     lap: Dict[str, Any],
-    mil: Dict[str, Any],
     alpha: float,
 ) -> Dict[str, Any]:
-    sig_votes = []
+    sig_votes: List[str] = []
     if mk.get("has_trend"):
         sig_votes.append(str(mk.get("direction", "none")))
     if lap.get("has_trend"):
         sig_votes.append(str(lap.get("direction", "none")))
 
     support_votes = sig_votes.copy()
-    mil_dir = str(mil.get("interpreted_trend", "none"))
-    if mil_dir in {"up", "down"}:
-        support_votes.append(mil_dir)
+    g_dir = str(graphical.get("direction", "none"))
+    if g_dir in {"up", "down"}:
+        support_votes.append(g_dir)
 
     has_trend = bool(mk.get("has_trend") or lap.get("has_trend"))
     direction = _dominant_direction(support_votes)
 
     if mk.get("has_trend") and lap.get("has_trend") and str(mk.get("direction")) == str(lap.get("direction")):
         confidence = "high"
+    elif has_trend and g_dir != "none" and direction == g_dir:
+        confidence = "medium"
     elif has_trend:
         confidence = "medium"
-    elif mil_dir != "none":
+    elif g_dir != "none":
         confidence = "weak"
     else:
         confidence = "none"
@@ -331,13 +348,13 @@ def combine_trend_evidence(
         "has_trend": has_trend,
         "direction": direction,
         "confidence": confidence,
+        "graphical_direction": g_dir,
         "mk_sig": bool(mk.get("has_trend")),
         "lap_sig": bool(lap.get("has_trend")),
-        "mil_direction": mil_dir,
         "reason": (
-            "Tendance confirmée par tests statistiques."
+            "Tendance confirmée par les tests de tendance; branche NHPP retenue."
             if has_trend
-            else "Pas de tendance statistiquement significative."
+            else "Pas de tendance statistiquement significative; passage au test de dépendance."
         ),
     }
 
@@ -345,7 +362,66 @@ def combine_trend_evidence(
 # ---------------------------------------------------------------------
 # 2) Dépendance
 # ---------------------------------------------------------------------
-def test_dependence(series: List[float], alpha: float = 0.05) -> Dict[str, Any]:
+def graphical_dependence_test(series: List[float]) -> Dict[str, Any]:
+    """
+    Méthode graphique sur lag plot (TTF_i, TTF_{i+1}).
+    Le signal graphique est qualitatif; la décision reste confirmée
+    par les tests de corrélation Pearson / Spearman.
+    """
+    x = _clean_positive(series)
+    if len(x) < 3:
+        return {
+            "lag1_r": 0.0,
+            "slope": 0.0,
+            "intercept": 0.0,
+            "r2": None,
+            "direction": "none",
+            "has_dependence": False,
+            "strength": "very_low",
+            "method": "lag_plot",
+        }
+
+    a = x[:-1]
+    b = x[1:]
+    if np.std(a) == 0 or np.std(b) == 0:
+        return {
+            "lag1_r": 0.0,
+            "slope": 0.0,
+            "intercept": 0.0,
+            "r2": None,
+            "direction": "none",
+            "has_dependence": False,
+            "strength": "very_low",
+            "method": "lag_plot",
+        }
+
+    r = float(np.corrcoef(a, b)[0, 1])
+    slope, intercept = np.polyfit(a, b, 1)
+    y_hat = intercept + slope * a
+    ss_res = float(np.sum((b - y_hat) ** 2))
+    ss_tot = float(np.sum((b - np.mean(b)) ** 2))
+    r2 = None if ss_tot <= 0 else float(1.0 - ss_res / ss_tot)
+
+    if r > 0.20:
+        direction = "positive"
+    elif r < -0.20:
+        direction = "negative"
+    else:
+        direction = "none"
+
+    return {
+        "lag1_r": r,
+        "slope": float(slope),
+        "intercept": float(intercept),
+        "r2": r2,
+        "direction": direction,
+        "has_dependence": abs(r) >= 0.20,
+        "strength": _strength_label(r),
+        "method": "lag_plot",
+    }
+
+
+def dependence_correlation_test(series: List[float], alpha: float = 0.05) -> Dict[str, Any]:
     x = _clean_positive(series)
     if len(x) < 3:
         return {
@@ -377,9 +453,9 @@ def test_dependence(series: List[float], alpha: float = 0.05) -> Dict[str, Any]:
     pr, pp = sst.pearsonr(a, b)
     sr, sp = sst.spearmanr(a, b)
 
-    method = "spearman"
-    r = float(sr)
-    p = float(sp)
+    method = "spearman" if abs(sr) >= abs(pr) else "pearson"
+    r = float(sr if method == "spearman" else pr)
+    p = float(sp if method == "spearman" else pp)
     has_dep = bool((sp < alpha) or (pp < alpha))
 
     return {
@@ -395,9 +471,83 @@ def test_dependence(series: List[float], alpha: float = 0.05) -> Dict[str, Any]:
     }
 
 
+def combine_dependence_evidence(
+    graphical: Dict[str, Any],
+    corr: Dict[str, Any],
+    alpha: float,
+) -> Dict[str, Any]:
+    has_dep = bool(corr.get("has_dep"))
+    return {
+        "has_dep": has_dep,
+        "method": corr.get("method"),
+        "r": corr.get("r"),
+        "p": corr.get("p"),
+        "pearson_r": corr.get("pearson_r"),
+        "pearson_p": corr.get("pearson_p"),
+        "spearman_r": corr.get("spearman_r"),
+        "spearman_p": corr.get("spearman_p"),
+        "graphical_direction": graphical.get("direction"),
+        "graphical_r": graphical.get("lag1_r"),
+        "strength": corr.get("strength"),
+        "reason": (
+            "Dépendance détectée; branche BPP retenue."
+            if has_dep
+            else "Pas de dépendance significative; passage à la branche RP."
+        ),
+    }
+
+
 # ---------------------------------------------------------------------
 # 3) Branche RP : lois iid
 # ---------------------------------------------------------------------
+def weibull_probability_plot_ls(data: np.ndarray) -> Dict[str, Any]:
+    """
+    Estimation graphique / moindres carrés pour Weibull 2 paramètres.
+    Utilisée comme estimation complémentaire, non comme règle principale de sélection.
+    """
+    x = np.sort(_clean_positive(data))
+    n = len(x)
+    if n < 3:
+        return {
+            "beta_ls": None,
+            "eta_ls": None,
+            "intercept": None,
+            "r2": None,
+            "method": "weibull_probability_plot_ls",
+        }
+
+    ranks = np.arange(1, n + 1, dtype=float)
+    F = (ranks - 0.3) / (n + 0.4)
+    F = np.clip(F, 1e-8, 1.0 - 1e-8)
+
+    X = np.log(x)
+    Y = np.log(-np.log(1.0 - F))
+    slope, intercept = np.polyfit(X, Y, 1)
+    if slope <= 0:
+        return {
+            "beta_ls": None,
+            "eta_ls": None,
+            "intercept": float(intercept),
+            "r2": None,
+            "method": "weibull_probability_plot_ls",
+        }
+
+    Y_hat = intercept + slope * X
+    ss_res = float(np.sum((Y - Y_hat) ** 2))
+    ss_tot = float(np.sum((Y - np.mean(Y)) ** 2))
+    r2 = None if ss_tot <= 0 else float(1.0 - ss_res / ss_tot)
+
+    beta_ls = float(slope)
+    eta_ls = float(np.exp(-intercept / slope))
+    return {
+        "beta_ls": beta_ls,
+        "eta_ls": eta_ls,
+        "intercept": float(intercept),
+        "r2": r2,
+        "method": "weibull_probability_plot_ls",
+    }
+
+
 def _fit_distribution(name: str, data: np.ndarray, alpha: float = 0.05) -> Dict[str, Any]:
     res = {
         "name": name,
@@ -409,6 +559,7 @@ def _fit_distribution(name: str, data: np.ndarray, alpha: float = 0.05) -> Dict[
         "cvm_p": None,
         "accepted": None,
         "estimation_method": "MLE",
+        "ls_params": None,
     }
 
     try:
@@ -450,6 +601,16 @@ def _fit_distribution(name: str, data: np.ndarray, alpha: float = 0.05) -> Dict[
         res["chi2_p"] = float(chi2_p)
         res["cvm_p"] = float(cvm_p)
         res["accepted"] = _gof_acceptance_for_rp(ks_p, chi2_p, alpha)
+
+        if name == "weibull_2p":
+            ls = weibull_probability_plot_ls(data)
+            if ls.get("beta_ls") is not None:
+                res["ls_params"] = {
+                    "beta_ls": ls.get("beta_ls"),
+                    "eta_ls": ls.get("eta_ls"),
+                    "r2": ls.get("r2"),
+                }
+
         return res
     except Exception:
         return res
@@ -458,8 +619,8 @@ def _fit_distribution(name: str, data: np.ndarray, alpha: float = 0.05) -> Dict[
 def _normalize_weibull_params(name: str, params: Tuple[float, ...]) -> Tuple[float, float, float]:
     c, loc, scale = params
     if name == "weibull_2p":
-        return float(c), 0.0, float(scale)
-    return float(c), float(loc), float(scale)
+        return float(c), float(scale), 0.0
+    return float(c), float(scale), float(loc)
 
 
 def fit_and_compare_distributions(data: np.ndarray, alpha: float = 0.05) -> Dict[str, Any]:
@@ -482,11 +643,13 @@ def fit_and_compare_distributions(data: np.ndarray, alpha: float = 0.05) -> Dict
 
     beta = eta = gamma = None
     lambda_h = None
+    weibull_ls = None
 
     if best_name.startswith("weibull") and best.get("params"):
-        beta, gamma, eta = _normalize_weibull_params(best_name, best["params"])
+        beta, eta, gamma = _normalize_weibull_params(best_name, best["params"])
+        weibull_ls = best.get("ls_params")
     elif best_name == "expon" and best.get("params"):
-        loc, scale = best["params"]
+        _loc, scale = best["params"]
         if scale and scale > 0:
             lambda_h = float(1.0 / scale)
 
@@ -496,6 +659,7 @@ def fit_and_compare_distributions(data: np.ndarray, alpha: float = 0.05) -> Dict
         "all": all_fits,
         "selected_by": selected_by,
         "weibull": {"beta": beta, "eta": eta, "gamma": gamma} if beta is not None else None,
+        "weibull_ls": weibull_ls,
         "hpp": {"lambda_h": lambda_h} if lambda_h is not None else None,
     }
 
@@ -528,8 +692,8 @@ def fit_power_law_nhpp(ttf_series: List[float], alpha: float = 0.05) -> Dict[str
     if denom <= 0:
         return res
 
-    beta = n / denom
-    eta = T / (n ** (1.0 / beta))
+    beta = float(n / denom)
+    eta = float(T / (n ** (1.0 / beta)))
 
     ll = (
         n * math.log(beta)
@@ -556,15 +720,15 @@ def fit_power_law_nhpp(ttf_series: List[float], alpha: float = 0.05) -> Dict[str
 
     res.update(
         {
-            "params": (float(beta), float(eta)),
+            "params": (beta, eta),
             "loglik": float(ll),
             "aic": _aic_from_loglik(ll, 2),
             "ks_p": float(ks_p),
             "chi2_p": float(chi2_p),
             "cvm_p": float(cvm_p),
             "accepted": _gof_acceptance_generic(ks_p, cvm_p, alpha),
-            "beta": float(beta),
-            "eta": float(eta),
+            "beta": beta,
+            "eta": eta,
             "T_end": float(T),
         }
     )
@@ -687,7 +851,76 @@ def fit_hawkes_bpp(ttf_series: List[float], alpha: float = 0.05) -> Dict[str, An
 
 
 # ---------------------------------------------------------------------
-# 6) Indicateurs fiabilistes
+# 6) Courbes fiabilistes
+# ---------------------------------------------------------------------
+def build_reliability_curves(
+    ttf_series: List[float] | np.ndarray,
+    model: str,
+    distribution: str,
+    params: Dict[str, Any],
+    points: int = 200,
+) -> pd.DataFrame:
+    ttf = _clean_positive(ttf_series)
+    if ttf.size == 0:
+        return pd.DataFrame(columns=["t", "R_t", "F_t", "f_t", "h_t"])
+
+    t_max = max(float(np.max(ttf)) * 1.5, float(np.mean(ttf)) * 2.0)
+    grid = np.linspace(1e-8, t_max, points)
+
+    if model == "RP":
+        raw = params.get("raw")
+        if not raw:
+            return pd.DataFrame(columns=["t", "R_t", "F_t", "f_t", "h_t"])
+
+        if distribution == "expon":
+            dist = sst.expon
+        elif distribution == "norm":
+            dist = sst.norm
+        elif distribution == "lognorm":
+            dist = sst.lognorm
+        elif distribution.startswith("weibull"):
+            dist = sst.weibull_min
+        else:
+            return pd.DataFrame(columns=["t", "R_t", "F_t", "f_t", "h_t"])
+
+        f_t = dist.pdf(grid, *raw)
+        F_t = dist.cdf(grid, *raw)
+        R_t = dist.sf(grid, *raw)
+        h_t = np.divide(f_t, R_t, out=np.full_like(f_t, np.nan), where=R_t > 1e-12)
+
+    elif model == "NHPP":
+        beta = _safe_float(params.get("beta"))
+        eta = _safe_float(params.get("eta"))
+        if beta is None or eta is None or beta <= 0 or eta <= 0:
+            return pd.DataFrame(columns=["t", "R_t", "F_t", "f_t", "h_t"])
+        F_t = 1.0 - np.exp(-((grid / eta) ** beta))
+        R_t = 1.0 - F_t
+        f_t = (beta / eta) * ((grid / eta) ** (beta - 1.0)) * np.exp(-((grid / eta) ** beta))
+        h_t = (beta / eta) * ((grid / eta) ** (beta - 1.0))
+
+    elif model == "BPP":
+        mu = _safe_float(params.get("mu"))
+        if mu is None or mu <= 0:
+            return pd.DataFrame(columns=["t", "R_t", "F_t", "f_t", "h_t"])
+        F_t = 1.0 - np.exp(-mu * grid)
+        R_t = np.exp(-mu * grid)
+        f_t = mu * np.exp(-mu * grid)
+        h_t = np.full_like(grid, mu)
+
+    else:
+        return pd.DataFrame(columns=["t", "R_t", "F_t", "f_t", "h_t"])
+
+    return _round_df(pd.DataFrame({
+        "t": grid,
+        "R_t": R_t,
+        "F_t": F_t,
+        "f_t": f_t,
+        "h_t": h_t,
+    }))
+
+
+# ---------------------------------------------------------------------
+# 7) Indicateurs fiabilistes
 # ---------------------------------------------------------------------
 def _distribution_mean(name: str, params: Optional[Tuple[float, ...]]) -> Optional[float]:
     if not params:
@@ -726,12 +959,63 @@ def _distribution_hazard_at_mean(name: str, params: Optional[Tuple[float, ...]])
         return None
 
 
+def _maintenance_recommendation(
+    model: str,
+    process_variant: str,
+    distribution: str,
+    params: Dict[str, Any],
+) -> Dict[str, Any]:
+    beta = _safe_float(params.get("beta"))
+
+    if model == "NHPP":
+        return {
+            "maintenance_type": "Préventif renforcé",
+            "priority": "Élevée",
+            "reason": "Tendance détectée sur le processus de défaillance; une action proactive est recommandée.",
+        }
+
+    if model == "BPP":
+        return {
+            "maintenance_type": "Surveillance active",
+            "priority": "Élevée",
+            "reason": "Dépendance entre événements détectée; le processus n'est pas iid.",
+        }
+
+    if process_variant == "HPP":
+        return {
+            "maintenance_type": "Maintenance systématique simple",
+            "priority": "Normale",
+            "reason": "La loi exponentielle suggère un taux de défaillance à peu près constant.",
+        }
+
+    if distribution.startswith("weibull") and beta is not None:
+        if beta > 1.2:
+            return {
+                "maintenance_type": "Préventif planifié",
+                "priority": "Élevée",
+                "reason": "Beta > 1 : phase d'usure probable, cohérente avec le vieillissement d'équipements de puissance.",
+            }
+        if beta < 0.8:
+            return {
+                "maintenance_type": "Correctif surveillé",
+                "priority": "Modérée",
+                "reason": "Beta < 1 : défaillances précoces ou aléatoires dominantes.",
+            }
+
+    return {
+        "maintenance_type": "Surveillance nominale",
+        "priority": "Normale",
+        "reason": "Aucun signal critique dominant n'est observé dans la branche retenue.",
+    }
+
+
 def compute_reliability_indicators(
     ttf_series: List[float] | np.ndarray,
     repair_series: Optional[List[float] | np.ndarray] = None,
     *,
     model: str,
     distribution: str,
+    process_variant: str,
     params: Dict[str, Any],
 ) -> Dict[str, Any]:
     ttf = _clean_positive(ttf_series)
@@ -746,8 +1030,8 @@ def compute_reliability_indicators(
         mean_hazard = _distribution_hazard_at_mean(distribution, params.get("raw"))
     elif model == "NHPP":
         theoretical_mttf = empirical_mttf
-        beta = params.get("beta")
-        eta = params.get("eta")
+        beta = _safe_float(params.get("beta"))
+        eta = _safe_float(params.get("eta"))
         if beta is not None and eta is not None:
             try:
                 t_ref = float(np.mean(_to_event_times(ttf.tolist())))
@@ -756,7 +1040,7 @@ def compute_reliability_indicators(
                 mean_hazard = None
     elif model == "BPP":
         theoretical_mttf = empirical_mttf
-        mu = params.get("mu")
+        mu = _safe_float(params.get("mu"))
         if mu is not None and mu > 0:
             mean_hazard = float(mu)
 
@@ -765,6 +1049,13 @@ def compute_reliability_indicators(
     availability = None
     if mtbf is not None and mttr is not None and (mtbf + mttr) > 0:
         availability = float(mtbf / (mtbf + mttr))
+
+    recommendation = _maintenance_recommendation(
+        model=model,
+        process_variant=process_variant,
+        distribution=distribution,
+        params=params,
+    )
 
     return {
         "cleaned_failures_n": int(ttf.size),
@@ -777,11 +1068,12 @@ def compute_reliability_indicators(
         "sample_std_ttf_h": float(np.std(ttf, ddof=1)) if ttf.size >= 2 else None,
         "mean_failure_rate_h": mean_hazard,
         "empirical_failure_rate_h": None if empirical_mttf in (None, 0) else float(1.0 / empirical_mttf),
+        **recommendation,
     }
 
 
 # ---------------------------------------------------------------------
-# 7) Moteur fiabiliste principal
+# 8) Moteur fiabiliste principal
 # ---------------------------------------------------------------------
 def analyze_reliability_only(
     ttf_series: List[float],
@@ -791,26 +1083,29 @@ def analyze_reliability_only(
     data = _clean_positive(ttf_series)
     n = int(data.size)
 
-    default_tests = {
-        "trend_mk": {"z": 0.0, "p": 1.0, "has_trend": False, "direction": "none"},
-        "trend_laplace": {"u": 0.0, "p": 1.0, "has_trend": False, "direction": "none"},
-        "trend_mil_hdbk_189": {"beta_graph": 1.0, "slope_loglog": 1.0, "intercept_loglog": 0.0, "interpreted_trend": "none"},
-        "trend_combined": {"has_trend": False, "direction": "none", "confidence": "none", "reason": "TTF insuffisants."},
-        "dependence": {
-            "r": 0.0,
-            "p": 1.0,
-            "has_dep": False,
-            "method": "spearman",
-            "pearson_r": 0.0,
-            "pearson_p": 1.0,
-            "spearman_r": 0.0,
-            "spearman_p": 1.0,
-            "strength": "very_low",
-        },
-    }
-
     if n < 3:
-        result = {
+        default_params = {
+            "raw": None,
+            "beta": None,
+            "eta": None,
+            "gamma": None,
+            "mu": None,
+            "alpha": None,
+            "beta_kernel": None,
+            "branch_ratio": None,
+            "lambda_hpp_h": None,
+            "beta_ls": None,
+            "eta_ls": None,
+        }
+        indicators = compute_reliability_indicators(
+            ttf_series=data,
+            repair_series=repair_series,
+            model="RP",
+            distribution="weibull_2p",
+            process_variant="RP",
+            params=default_params,
+        )
+        return {
             "error": "TTF insuffisants (<3 après nettoyage).",
             "cleaned_n": n,
             "model": "RP",
@@ -826,41 +1121,38 @@ def analyze_reliability_only(
                 "entity_assumption": "Données insuffisantes pour conclure",
                 "law_selected": "weibull_2p",
                 "law_accepted": None,
+                "selection_rule": None,
                 "reason": "Données insuffisantes pour statuer, hypothèse RP par défaut.",
             },
             "goodness": {"aic": None, "ks_p": None, "chi2_p": None, "cvm_p": None, "accepted": None},
-            "params": {
-                "raw": None,
-                "beta": None,
-                "eta": None,
-                "gamma": None,
-                "mu": None,
-                "alpha": None,
-                "beta_kernel": None,
-                "branch_ratio": None,
-                "lambda_hpp_h": None,
+            "params": default_params,
+            "tests": {
+                "trend_graphical": {"direction": "none", "has_trend": False},
+                "trend_mk": {"z": 0.0, "p": 1.0, "has_trend": False, "direction": "none"},
+                "trend_laplace": {"u": 0.0, "p": 1.0, "has_trend": False, "direction": "none"},
+                "trend_combined": {"has_trend": False, "direction": "none", "confidence": "none"},
+                "dependence_graphical": {"direction": "none", "has_dependence": False},
+                "dependence_correlation": {"has_dep": False, "r": 0.0, "p": 1.0},
+                "dependence": {"has_dep": False, "r": 0.0, "p": 1.0},
             },
-            "tests": default_tests,
             "candidates": {},
+            "curves": build_reliability_curves(data, "RP", "weibull_2p", default_params),
+            "indicators": indicators,
         }
-        result["indicators"] = compute_reliability_indicators(
-            ttf_series=data,
-            repair_series=repair_series,
-            model=result["model"],
-            distribution=result["distribution"],
-            params=result["params"],
-        )
-        return result
 
+    trend_graphical = graphical_trend_test(data.tolist())
     mk = mann_kendall_test(data.tolist(), alpha=alpha)
     lap = laplace_trend_test(data.tolist(), alpha=alpha)
-    mil = mil_hdbk_189_indicator(data.tolist())
-    trend = combine_trend_evidence(mk, lap, mil, alpha=alpha)
-    dep = test_dependence(data.tolist(), alpha=alpha)
+    trend = combine_trend_evidence(trend_graphical, mk, lap, alpha=alpha)
+
+    dep_graphical = graphical_dependence_test(data.tolist())
+    dep_corr = dependence_correlation_test(data.tolist(), alpha=alpha)
+    dep = combine_dependence_evidence(dep_graphical, dep_corr, alpha=alpha)
 
     beta = eta = gamma = None
     mu = alpha_bpp = beta_kernel = branch_ratio = None
     lambda_hpp_h = None
+    beta_ls = eta_ls = None
     candidates: Dict[str, Any] = {}
     selected_by = None
 
@@ -873,10 +1165,9 @@ def analyze_reliability_only(
         beta = fit_res.get("beta")
         eta = fit_res.get("eta")
         best = fit_res
-        reason = (
-            "Tendance détectée : l'organigramme oriente vers un processus de Poisson non homogène (NHPP)."
-        )
+        reason = "Tendance détectée : la logique de l'organigramme retient directement NHPP."
         entity_assumption = "Entité réparable / minimal repair"
+
     elif dep["has_dep"]:
         model = "BPP"
         process_variant = "BPP"
@@ -888,11 +1179,9 @@ def analyze_reliability_only(
         beta_kernel = fit_res.get("beta_kernel")
         branch_ratio = fit_res.get("branch_ratio")
         best = fit_res
-        reason = (
-            "Absence de tendance significative mais présence de dépendance : "
-            "l'organigramme oriente vers un BPP."
-        )
+        reason = "Pas de tendance significative, mais dépendance détectée : la logique de l'organigramme retient BPP."
         entity_assumption = "Entité réparable avec dépendance entre événements"
+
     else:
         model = "RP"
         fit_bundle = fit_and_compare_distributions(data, alpha=alpha)
@@ -907,21 +1196,22 @@ def analyze_reliability_only(
             eta = fit_bundle["weibull"]["eta"]
             gamma = fit_bundle["weibull"]["gamma"]
 
+        weibull_ls = fit_bundle.get("weibull_ls") or {}
+        beta_ls = weibull_ls.get("beta_ls")
+        eta_ls = weibull_ls.get("eta_ls")
+
         if fit_bundle["hpp"] is not None:
             lambda_hpp_h = fit_bundle["hpp"].get("lambda_h")
 
         if process_variant == "HPP":
             reason = (
-                "Ni tendance ni dépendance : hypothèse RP retenue. "
-                "La loi exponentielle étant retenue, le cas particulier HPP est signalé."
+                "Ni tendance ni dépendance : branche RP retenue. La loi exponentielle étant sélectionnée, "
+                "le cas particulier HPP est signalé."
             )
         else:
-            reason = (
-                "Ni tendance significative ni dépendance : "
-                "l'organigramme oriente vers un processus de renouvellement (RP) avec choix de loi."
-            )
+            reason = "Ni tendance ni dépendance : branche RP retenue avec choix de loi probabiliste."
 
-        entity_assumption = "Entité non réparable ou réparable comme neuve / hybride"
+        entity_assumption = "Entité non réparable ou réparable comme neuve"
 
     params = {
         "raw": best.get("params"),
@@ -933,9 +1223,27 @@ def analyze_reliability_only(
         "beta_kernel": beta_kernel,
         "branch_ratio": branch_ratio,
         "lambda_hpp_h": lambda_hpp_h,
+        "beta_ls": beta_ls,
+        "eta_ls": eta_ls,
     }
 
-    out = {
+    indicators = compute_reliability_indicators(
+        ttf_series=data,
+        repair_series=repair_series,
+        model=model,
+        distribution=distribution,
+        process_variant=process_variant,
+        params=params,
+    )
+
+    curves = build_reliability_curves(
+        ttf_series=data,
+        model=model,
+        distribution=distribution,
+        params=params,
+    )
+
+    return {
         "cleaned_n": n,
         "model": model,
         "process_variant": process_variant,
@@ -963,225 +1271,25 @@ def analyze_reliability_only(
         },
         "params": params,
         "tests": {
+            "trend_graphical": trend_graphical,
             "trend_mk": mk,
             "trend_laplace": lap,
-            "trend_mil_hdbk_189": mil,
             "trend_combined": trend,
+            "dependence_graphical": dep_graphical,
+            "dependence_correlation": dep_corr,
             "dependence": dep,
         },
         "candidates": candidates,
-    }
-
-    out["indicators"] = compute_reliability_indicators(
-        ttf_series=data,
-        repair_series=repair_series,
-        model=model,
-        distribution=distribution,
-        params=params,
-    )
-    return out
-
-
-# ---------------------------------------------------------------------
-# 8) Modélisation thermique dynamique
-# ---------------------------------------------------------------------
-def simulate_thermal_dynamic(
-    df: pd.DataFrame,
-    *,
-    sn_mva: float = 100.0,
-    R: float = 5.0,
-    delta_to_r: float = 55.0,
-    delta_h_r: float = 30.0,
-    tau_to_min: float = 180.0,
-    tau_w_min: float = 10.0,
-    n_exp: float = 0.8,
-    m_exp: float = 0.8,
-    forced_tau_to_factor: float = 0.75,
-    forced_delta_to_factor: float = 0.92,
-    forced_delta_h_factor: float = 0.92,
-    normal_insulation_life_h: float = 180000.0,
-) -> pd.DataFrame:
-    req = {"timestamp", "temp_amb_C"}
-    missing = req - set(df.columns)
-    if missing:
-        raise ValueError(f"Colonnes manquantes pour la thermique: {sorted(missing)}")
-
-    out = df.copy()
-    out["timestamp"] = pd.to_datetime(out["timestamp"], errors="coerce")
-    out = out.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
-
-    if "K" not in out.columns:
-        if "charge_pct" in out.columns:
-            out["K"] = pd.to_numeric(out["charge_pct"], errors="coerce") / 100.0
-        elif "load_factor" in out.columns:
-            out["K"] = pd.to_numeric(out["load_factor"], errors="coerce")
-        elif "load_mva" in out.columns:
-            out["K"] = pd.to_numeric(out["load_mva"], errors="coerce") / float(sn_mva)
-        else:
-            raise ValueError("Il faut fournir K, charge_pct, load_factor ou load_mva.")
-
-    if "etat_ventilateurs" not in out.columns:
-        out["etat_ventilateurs"] = 0
-
-    out["temp_amb_C"] = pd.to_numeric(out["temp_amb_C"], errors="coerce")
-    out["K"] = pd.to_numeric(out["K"], errors="coerce")
-    out["etat_ventilateurs"] = (
-        pd.to_numeric(out["etat_ventilateurs"], errors="coerce").fillna(0).astype(int)
-    )
-
-    out = out.dropna(subset=["temp_amb_C", "K"]).reset_index(drop=True)
-    if len(out) < 2:
-        raise ValueError("La série thermique doit contenir au moins 2 points.")
-
-    dt_h_series = out["timestamp"].diff().dt.total_seconds().div(3600.0)
-    dt_h_default = float(dt_h_series.iloc[1:].median())
-    if not np.isfinite(dt_h_default) or dt_h_default <= 0:
-        dt_h_default = 1.0
-
-    n = len(out)
-    dTO = np.zeros(n, dtype=float)
-    dH = np.zeros(n, dtype=float)
-
-    tau_to_onan_h = tau_to_min / 60.0
-    tau_w_h = tau_w_min / 60.0
-
-    K0 = float(out.loc[0, "K"])
-    fans0 = int(out.loc[0, "etat_ventilateurs"])
-
-    dTO_ult0 = delta_to_r * ((((K0 ** 2) * R) + 1.0) / (R + 1.0)) ** n_exp
-    dH_ult0 = delta_h_r * (K0 ** (2.0 * m_exp))
-
-    if fans0 == 1:
-        dTO_ult0 *= forced_delta_to_factor
-        dH_ult0 *= forced_delta_h_factor
-
-    dTO[0] = 0.6 * dTO_ult0
-    dH[0] = 0.6 * dH_ult0
-
-    for i in range(1, n):
-        K = float(out.loc[i, "K"])
-        fans = int(out.loc[i, "etat_ventilateurs"])
-
-        dt_h_i = _safe_float(dt_h_series.iloc[i], dt_h_default)
-        if dt_h_i is None or dt_h_i <= 0:
-            dt_h_i = dt_h_default
-
-        tau_to_h = tau_to_onan_h * (forced_tau_to_factor if fans == 1 else 1.0)
-        tau_to_h = max(tau_to_h, 1e-6)
-        tau_w_h_eff = max(tau_w_h, 1e-6)
-
-        dTO_ult = delta_to_r * ((((K ** 2) * R) + 1.0) / (R + 1.0)) ** n_exp
-        dH_ult = delta_h_r * (K ** (2.0 * m_exp))
-
-        if fans == 1:
-            dTO_ult *= forced_delta_to_factor
-            dH_ult *= forced_delta_h_factor
-
-        a_to = math.exp(-dt_h_i / tau_to_h)
-        a_w = math.exp(-dt_h_i / tau_w_h_eff)
-
-        dTO[i] = dTO_ult + (dTO[i - 1] - dTO_ult) * a_to
-        dH[i] = dH_ult + (dH[i - 1] - dH_ult) * a_w
-
-        dTO[i] = float(np.clip(dTO[i], 0.0, 120.0))
-        dH[i] = float(np.clip(dH[i], 0.0, 80.0))
-
-    out["Delta_theta_TO"] = dTO
-    out["Delta_theta_H"] = dH
-    out["theta_TO_est_C"] = out["temp_amb_C"] + out["Delta_theta_TO"]
-    out["theta_HS_est_C"] = out["temp_amb_C"] + out["Delta_theta_TO"] + out["Delta_theta_H"]
-
-    theta_hs = out["theta_HS_est_C"].to_numpy()
-    out["FAA"] = np.exp((15000.0 / 383.0) - (15000.0 / (theta_hs + 273.0)))
-
-    step_h = dt_h_series.fillna(dt_h_default).clip(lower=dt_h_default).to_numpy(dtype=float)
-    out["dt_h_step"] = step_h
-    out["aging_hours_step"] = out["FAA"] * out["dt_h_step"]
-    out["aging_hours_cum"] = out["aging_hours_step"].cumsum()
-    out["life_consumed_pct_cum"] = 100.0 * out["aging_hours_cum"] / float(normal_insulation_life_h)
-    out["remaining_life_pct"] = 100.0 - out["life_consumed_pct_cum"]
-
-    out.attrs["dt_h_default"] = float(dt_h_default)
-    out.attrs["normal_insulation_life_h"] = float(normal_insulation_life_h)
-    out.attrs["thermal_params"] = {
-        "sn_mva": float(sn_mva),
-        "R": float(R),
-        "delta_to_r": float(delta_to_r),
-        "delta_h_r": float(delta_h_r),
-        "tau_to_min": float(tau_to_min),
-        "tau_w_min": float(tau_w_min),
-        "n_exp": float(n_exp),
-        "m_exp": float(m_exp),
-        "forced_tau_to_factor": float(forced_tau_to_factor),
-        "forced_delta_to_factor": float(forced_delta_to_factor),
-        "forced_delta_h_factor": float(forced_delta_h_factor),
-        "normal_insulation_life_h": float(normal_insulation_life_h),
-    }
-    return out
-
-
-def summarize_thermal_results(df_sim: pd.DataFrame) -> Dict[str, Any]:
-    dt_h = float(df_sim.attrs.get("dt_h_default", 1.0))
-    normal_life = float(df_sim.attrs.get("normal_insulation_life_h", 180000.0))
-    thermal_params = dict(df_sim.attrs.get("thermal_params", {}))
-
-    total_aging_hours = float(df_sim["aging_hours_step"].sum())
-    life_consumed_pct = 100.0 * total_aging_hours / normal_life
-
-    daily = df_sim.copy()
-    daily["date"] = pd.to_datetime(daily["timestamp"]).dt.date
-    daily = (
-        daily.groupby("date")
-        .agg(
-            charge_mean_pct=("K", lambda s: float(np.mean(s) * 100.0)),
-            charge_max_pct=("K", lambda s: float(np.max(s) * 100.0)),
-            amb_mean=("temp_amb_C", "mean"),
-            theta_TO_mean=("theta_TO_est_C", "mean"),
-            theta_HS_max=("theta_HS_est_C", "max"),
-            theta_HS_p95=("theta_HS_est_C", lambda s: float(pd.Series(s).quantile(0.95))),
-            FAA_max=("FAA", "max"),
-            FAA_mean=("FAA", "mean"),
-            aging_hours=("aging_hours_step", "sum"),
-            fans_share=("etat_ventilateurs", "mean"),
-        )
-        .reset_index()
-    )
-
-    daily["fans_share_pct"] = 100.0 * daily["fans_share"]
-    daily["life_consumed_pct"] = 100.0 * daily["aging_hours"] / normal_life
-    daily["aging_hours_cum"] = daily["aging_hours"].cumsum()
-    daily["life_consumed_pct_cum"] = 100.0 * daily["aging_hours_cum"] / normal_life
-    daily["remaining_life_pct"] = 100.0 - daily["life_consumed_pct_cum"]
-
-    top5 = daily.sort_values("aging_hours", ascending=False).head(5).copy()
-
-    summary = {
-        "theta_hs_max": float(df_sim["theta_HS_est_C"].max()),
-        "theta_hs_p95": float(df_sim["theta_HS_est_C"].quantile(0.95)),
-        "theta_hs_mean": float(df_sim["theta_HS_est_C"].mean()),
-        "faa_max": float(df_sim["FAA"].max()),
-        "faa_mean": float(df_sim["FAA"].mean()),
-        "loss_of_life_hours": total_aging_hours,
-        "loss_of_life_pct": float(life_consumed_pct),
-        "dt_h_default": dt_h,
-    }
-
-    return {
-        "summary": summary,
-        "timeseries": df_sim,
-        "daily": daily,
-        "top5_critical_days": top5,
-        "params": thermal_params,
+        "curves": curves,
+        "indicators": indicators,
     }
 
 
 # ---------------------------------------------------------------------
-# 9) Tables fiabilité / thermique / globales
+# 9) Tables globales
 # ---------------------------------------------------------------------
 def build_reliability_tables(reliability_result: Dict[str, Any]) -> Dict[str, pd.DataFrame]:
     tests = reliability_result.get("tests", {})
-    dep = tests.get("dependence", {})
-    trend_combined = tests.get("trend_combined", {})
     decision = reliability_result.get("decision", {})
     params = reliability_result.get("params", {})
     goodness = reliability_result.get("goodness", {})
@@ -1190,11 +1298,20 @@ def build_reliability_tables(reliability_result: Dict[str, Any]) -> Dict[str, pd
     trend_df = pd.DataFrame(
         [
             {
+                "Test": "Méthode graphique",
+                "Statistique": tests.get("trend_graphical", {}).get("beta_graph"),
+                "p_value": None,
+                "Décision": "Oui" if tests.get("trend_graphical", {}).get("has_trend") else "Non",
+                "Direction": tests.get("trend_graphical", {}).get("direction"),
+                "R2": tests.get("trend_graphical", {}).get("r2"),
+            },
+            {
                 "Test": "Mann-Kendall",
                 "Statistique": tests.get("trend_mk", {}).get("z"),
                 "p_value": tests.get("trend_mk", {}).get("p"),
                 "Décision": "Oui" if tests.get("trend_mk", {}).get("has_trend") else "Non",
                 "Direction": tests.get("trend_mk", {}).get("direction"),
+                "R2": None,
             },
             {
                 "Test": "Laplace",
@@ -1202,20 +1319,15 @@ def build_reliability_tables(reliability_result: Dict[str, Any]) -> Dict[str, pd
                 "p_value": tests.get("trend_laplace", {}).get("p"),
                 "Décision": "Oui" if tests.get("trend_laplace", {}).get("has_trend") else "Non",
                 "Direction": tests.get("trend_laplace", {}).get("direction"),
-            },
-            {
-                "Test": "MIL-HDBK-189",
-                "Statistique": tests.get("trend_mil_hdbk_189", {}).get("beta_graph"),
-                "p_value": None,
-                "Décision": trend_combined.get("mil_direction"),
-                "Direction": tests.get("trend_mil_hdbk_189", {}).get("interpreted_trend"),
+                "R2": None,
             },
             {
                 "Test": "Décision finale tendance",
                 "Statistique": None,
                 "p_value": None,
-                "Décision": "Oui" if trend_combined.get("has_trend") else "Non",
-                "Direction": trend_combined.get("direction"),
+                "Décision": "Oui" if tests.get("trend_combined", {}).get("has_trend") else "Non",
+                "Direction": tests.get("trend_combined", {}).get("direction"),
+                "R2": None,
             },
         ]
     )
@@ -1223,22 +1335,32 @@ def build_reliability_tables(reliability_result: Dict[str, Any]) -> Dict[str, pd
     dependence_df = pd.DataFrame(
         [
             {
+                "Méthode": "Graphique (lag plot)",
+                "r": tests.get("dependence_graphical", {}).get("lag1_r"),
+                "p_value": None,
+                "Dépendance": "Oui" if tests.get("dependence_graphical", {}).get("has_dependence") else "Non",
+                "Direction": tests.get("dependence_graphical", {}).get("direction"),
+            },
+            {
                 "Méthode": "Pearson",
-                "r": dep.get("pearson_r"),
-                "p_value": dep.get("pearson_p"),
-                "Dépendance": "Oui" if (dep.get("pearson_p") is not None and dep.get("pearson_p") < 0.05) else "Non",
+                "r": tests.get("dependence_correlation", {}).get("pearson_r"),
+                "p_value": tests.get("dependence_correlation", {}).get("pearson_p"),
+                "Dépendance": "Oui" if (tests.get("dependence_correlation", {}).get("pearson_p") is not None and tests.get("dependence_correlation", {}).get("pearson_p") < 0.05) else "Non",
+                "Direction": None,
             },
             {
                 "Méthode": "Spearman",
-                "r": dep.get("spearman_r"),
-                "p_value": dep.get("spearman_p"),
-                "Dépendance": "Oui" if (dep.get("spearman_p") is not None and dep.get("spearman_p") < 0.05) else "Non",
+                "r": tests.get("dependence_correlation", {}).get("spearman_r"),
+                "p_value": tests.get("dependence_correlation", {}).get("spearman_p"),
+                "Dépendance": "Oui" if (tests.get("dependence_correlation", {}).get("spearman_p") is not None and tests.get("dependence_correlation", {}).get("spearman_p") < 0.05) else "Non",
+                "Direction": None,
             },
             {
-                "Méthode": "Décision finale",
-                "r": dep.get("r"),
-                "p_value": dep.get("p"),
-                "Dépendance": "Oui" if dep.get("has_dep") else "Non",
+                "Méthode": "Décision finale dépendance",
+                "r": tests.get("dependence", {}).get("r"),
+                "p_value": tests.get("dependence", {}).get("p"),
+                "Dépendance": "Oui" if tests.get("dependence", {}).get("has_dep") else "Non",
+                "Direction": tests.get("dependence", {}).get("graphical_direction"),
             },
         ]
     )
@@ -1259,10 +1381,12 @@ def build_reliability_tables(reliability_result: Dict[str, Any]) -> Dict[str, pd
 
     rows = []
     for name, fit in reliability_result.get("candidates", {}).items():
+        ls = fit.get("ls_params") or {}
         rows.append(
             {
                 "Modèle": name,
-                "Paramètres": str(fit.get("params")),
+                "Paramètres MLE": str(fit.get("params")),
+                "Paramètres LS": None if not ls else str(ls),
                 "Méthode estimation": fit.get("estimation_method"),
                 "LogLik": fit.get("loglik"),
                 "AIC": fit.get("aic"),
@@ -1284,6 +1408,8 @@ def build_reliability_tables(reliability_result: Dict[str, Any]) -> Dict[str, pd
                 "Beta": params.get("beta"),
                 "Eta": params.get("eta"),
                 "Gamma": params.get("gamma"),
+                "Beta_LS": params.get("beta_ls"),
+                "Eta_LS": params.get("eta_ls"),
                 "Lambda_HPP (1/h)": params.get("lambda_hpp_h"),
                 "Mu": params.get("mu"),
                 "Alpha": params.get("alpha"),
@@ -1299,9 +1425,25 @@ def build_reliability_tables(reliability_result: Dict[str, Any]) -> Dict[str, pd
                 "MTTR (h)": indicators.get("mttr_h"),
                 "Disponibilité": indicators.get("availability_intrinsic"),
                 "Taux de défaillance moyen (1/h)": indicators.get("mean_failure_rate_h"),
+                "Type maintenance": indicators.get("maintenance_type"),
+                "Priorité": indicators.get("priority"),
             }
         ]
     )
+
+    recommendation_df = pd.DataFrame(
+        [
+            {
+                "Type de maintenance": indicators.get("maintenance_type"),
+                "Priorité": indicators.get("priority"),
+                "Raison": indicators.get("reason"),
+            }
+        ]
+    )
+
+    curves_df = reliability_result.get("curves")
+    if not isinstance(curves_df, pd.DataFrame):
+        curves_df = pd.DataFrame(columns=["t", "R_t", "F_t", "f_t", "h_t"])
 
     return {
         "trend_results": _round_df(trend_df),
@@ -1309,80 +1451,16 @@ def build_reliability_tables(reliability_result: Dict[str, Any]) -> Dict[str, pd
         "process_choice": _round_df(process_df),
         "fit_candidates": _round_df(fits_df),
         "reliability_summary": _round_df(reliability_summary_df),
-    }
-
-
-def build_thermal_tables(thermal_result: Dict[str, Any]) -> Dict[str, pd.DataFrame]:
-    ts = thermal_result["timeseries"].copy()
-    daily = thermal_result["daily"].copy()
-    top5 = thermal_result["top5_critical_days"].copy()
-    summary = thermal_result["summary"]
-    params = thermal_result.get("params", {})
-
-    table_dataset = pd.DataFrame(
-        [
-            {
-                "Période début": str(ts["timestamp"].min()),
-                "Période fin": str(ts["timestamp"].max()),
-                "Nombre de points": int(len(ts)),
-                "Pas de temps par défaut (h)": summary.get("dt_h_default"),
-                "Charge min (%)": float(ts["K"].min() * 100.0),
-                "Charge max (%)": float(ts["K"].max() * 100.0),
-                "Temp ambiante min (°C)": float(ts["temp_amb_C"].min()),
-                "Temp ambiante max (°C)": float(ts["temp_amb_C"].max()),
-                "Ventilation forcée (% du temps)": float((ts["etat_ventilateurs"] == 1).mean() * 100.0),
-            }
-        ]
-    )
-
-    table_params = pd.DataFrame([{"Paramètre": k, "Valeur": v} for k, v in params.items()])
-
-    table_indicators = pd.DataFrame(
-        [
-            {
-                "θHS max (°C)": summary.get("theta_hs_max"),
-                "θHS P95 (°C)": summary.get("theta_hs_p95"),
-                "θHS mean (°C)": summary.get("theta_hs_mean"),
-                "FAA max": summary.get("faa_max"),
-                "FAA mean": summary.get("faa_mean"),
-                "Perte de vie (h)": summary.get("loss_of_life_hours"),
-                "Perte de vie (%)": summary.get("loss_of_life_pct"),
-            }
-        ]
-    )
-
-    thermal_summary = pd.DataFrame(
-        [
-            {
-                "θHS max": summary.get("theta_hs_max"),
-                "θHS P95": summary.get("theta_hs_p95"),
-                "θHS mean": summary.get("theta_hs_mean"),
-                "FAA max": summary.get("faa_max"),
-                "FAA mean": summary.get("faa_mean"),
-                "Loss of life (h)": summary.get("loss_of_life_hours"),
-                "Loss of life (%)": summary.get("loss_of_life_pct"),
-            }
-        ]
-    )
-
-    return {
-        "thermal_table_dataset": _round_df(table_dataset),
-        "thermal_table_params": _round_df(table_params),
-        "thermal_table_indicators": _round_df(table_indicators),
-        "thermal_summary": _round_df(thermal_summary),
-        "thermal_daily": _round_df(daily),
-        "thermal_top5_days": _round_df(top5),
+        "maintenance_recommendation": _round_df(recommendation_df),
+        "reliability_curves": _round_df(curves_df),
     }
 
 
 def build_global_result_tables(
     reliability_result: Dict[str, Any],
-    thermal_result: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, pd.DataFrame]:
-    tables = {}
+    tables: Dict[str, pd.DataFrame] = {}
     tables.update(build_reliability_tables(reliability_result))
-    if thermal_result is not None:
-        tables.update(build_thermal_tables(thermal_result))
     return tables
 
 
@@ -1393,20 +1471,15 @@ def analyze_ttf_pipeline(
     ttf_series: List[float],
     alpha: float = 0.05,
     repair_series: Optional[List[float]] = None,
-    thermal_df: Optional[pd.DataFrame] = None,
-    thermal_config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Entrées :
-    - ttf_series     : série des temps entre défaillances (heures)
-    - alpha          : seuil de significativité
-    - repair_series  : série des temps de réparation (heures), optionnelle
-    - thermal_df     : série temporelle thermique, optionnelle
-    - thermal_config : paramètres du modèle thermique dynamique
+    - ttf_series    : série des temps entre défaillances (heures)
+    - alpha         : seuil de significativité
+    - repair_series : série des temps de réparation (heures), optionnelle
 
     Sorties :
     - reliability : résultats fiabilistes complets
-    - thermal     : résultats thermiques complets si fournis
     - tables      : tableaux prêts pour Streamlit / PDF
     """
     reliability = analyze_reliability_only(
@@ -1415,20 +1488,12 @@ def analyze_ttf_pipeline(
         alpha=alpha,
     )
 
-    thermal = None
-    if thermal_df is not None and not thermal_df.empty:
-        cfg = dict(thermal_config or {})
-        df_sim = simulate_thermal_dynamic(thermal_df, **cfg)
-        thermal = summarize_thermal_results(df_sim)
-
     tables = build_global_result_tables(
         reliability_result=reliability,
-        thermal_result=thermal,
     )
 
     return {
         "reliability": reliability,
-        "thermal": thermal,
         "tables": tables,
     }
 

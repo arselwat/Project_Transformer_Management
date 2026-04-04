@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 from io import BytesIO
@@ -19,17 +20,6 @@ from core.reliability.organigram import analyze_ttf_pipeline
 from core.ui import render_shell, render_page_header
 
 try:
-    from core.datahub import get_pipeline_inputs
-except Exception:
-    def get_pipeline_inputs(asset_id: Optional[str] = None) -> Dict[str, Any]:
-        return {
-            "asset_id": asset_id,
-            "thermal_df": None,
-            "thermal_config": None,
-            "alpha": 0.05,
-        }
-
-try:
     from core.reliability.reporting_merged import export_merged_report_pdf
 except Exception as error:
     export_merged_report_pdf = None
@@ -44,7 +34,7 @@ require_login()
 render_shell("pages/2_Indicateurs_verified.py")
 render_page_header(
     "Indicateurs",
-    "Tests de tendance, dépendance, paramètres fiabilistes, résultats thermiques et courbes détaillées.",
+    "Tests de tendance, dépendance, paramètres fiabilistes et courbes détaillées.",
     "📊",
 )
 
@@ -84,63 +74,6 @@ def series_to_positive_list(series: pd.Series) -> Optional[list[float]]:
     return numeric_values.astype(float).tolist()
 
 
-def sanitize_thermal_config(configuration: Any) -> Optional[Dict[str, Any]]:
-    if not isinstance(configuration, dict) or not configuration:
-        return None
-
-    allowed_keys = {
-        "sn_mva",
-        "R",
-        "delta_to_r",
-        "delta_h_r",
-        "tau_to_min",
-        "tau_w_min",
-        "n_exp",
-        "m_exp",
-        "forced_tau_to_factor",
-        "forced_delta_to_factor",
-        "forced_delta_h_factor",
-        "normal_insulation_life_h",
-        "dt_hours",
-    }
-
-    sanitized_configuration: Dict[str, Any] = {}
-    for key, value in configuration.items():
-        if key in allowed_keys and pd.notna(value):
-            sanitized_configuration[key] = value
-
-    return sanitized_configuration or None
-
-
-def sanitize_thermal_dataframe(dataframe: Any) -> Optional[pd.DataFrame]:
-    if not isinstance(dataframe, pd.DataFrame) or dataframe.empty:
-        return None
-
-    sanitized_dataframe = dataframe.copy()
-    sanitized_dataframe.columns = [str(column).strip() for column in sanitized_dataframe.columns]
-
-    for removable_column in ["asset_id", "equipment_code"]:
-        if removable_column in sanitized_dataframe.columns:
-            sanitized_dataframe = sanitized_dataframe.drop(columns=[removable_column])
-
-    return sanitized_dataframe if not sanitized_dataframe.empty else None
-
-
-def get_pipeline_bundle(equipment_code: str) -> Dict[str, Any]:
-    try:
-        bundle = get_pipeline_inputs(asset_id=str(equipment_code))
-        if not isinstance(bundle, dict):
-            bundle = {}
-    except Exception:
-        bundle = {}
-
-    bundle["thermal_df"] = sanitize_thermal_dataframe(bundle.get("thermal_df"))
-    bundle["thermal_config"] = sanitize_thermal_config(bundle.get("thermal_config"))
-    bundle.setdefault("alpha", 0.05)
-    bundle.setdefault("asset_id", str(equipment_code))
-    return bundle
-
-
 DISPLAY_COLUMN_NAMES = {
     "equipment_code": "Code équipement",
     "model": "Processus retenu",
@@ -153,24 +86,6 @@ DISPLAY_COLUMN_NAMES = {
     "beta": "Paramètre bêta",
     "eta_h": "Paramètre êta (heures)",
     "gamma_h": "Paramètre gamma (heures)",
-    "theta_HS_max": "Température maximale du point chaud (°C)",
-    "FAA_max": "Facteur maximal d’accélération du vieillissement",
-    "loss_of_life_pct": "Perte de vie (%)",
-    "timestamp": "Date et heure",
-    "temp_amb_C": "Température ambiante (°C)",
-    "charge_pct": "Charge (%)",
-    "K": "Facteur de charge",
-    "etat_ventilateurs": "État des ventilateurs",
-    "Delta_theta_TO": "Élévation de température top-oil (°C)",
-    "Delta_theta_H": "Élévation de température du point chaud (°C)",
-    "theta_TO_est_C": "Température top-oil estimée (°C)",
-    "theta_HS_est_C": "Température du point chaud estimée (°C)",
-    "FAA": "Facteur d’accélération du vieillissement",
-    "dt_h_step": "Pas de temps (heures)",
-    "aging_hours_step": "Heures de vieillissement sur le pas",
-    "aging_hours_cum": "Heures de vieillissement cumulées",
-    "life_consumed_pct_cum": "Perte de vie cumulée (%)",
-    "remaining_life_pct": "Vie résiduelle estimée (%)",
     "mk_p": "Valeur p du test de Mann-Kendall",
     "mk_direction": "Sens du test de Mann-Kendall",
     "laplace_p": "Valeur p du test de Laplace",
@@ -216,40 +131,6 @@ DISPLAY_COLUMN_NAMES = {
     "MTTR (h)": "Temps moyen de réparation (heures)",
     "Disponibilité": "Disponibilité intrinsèque",
     "Taux de défaillance moyen (1/h)": "Taux moyen de défaillance (1/h)",
-    "Période début": "Début de la période",
-    "Période fin": "Fin de la période",
-    "Nombre de points": "Nombre de points",
-    "Pas de temps par défaut (h)": "Pas de temps par défaut (heures)",
-    "Charge min (%)": "Charge minimale (%)",
-    "Charge max (%)": "Charge maximale (%)",
-    "Temp ambiante min (°C)": "Température ambiante minimale (°C)",
-    "Temp ambiante max (°C)": "Température ambiante maximale (°C)",
-    "Ventilation forcée (% du temps)": "Ventilation forcée (% du temps)",
-    "Paramètre": "Paramètre",
-    "Valeur": "Valeur",
-    "θHS max (°C)": "Température maximale du point chaud (°C)",
-    "θHS P95 (°C)": "Température du point chaud au quantile 95 % (°C)",
-    "θHS mean (°C)": "Température moyenne du point chaud (°C)",
-    "FAA max": "Facteur maximal d’accélération du vieillissement",
-    "FAA mean": "Facteur moyen d’accélération du vieillissement",
-    "Perte de vie (h)": "Perte de vie (heures)",
-    "Perte de vie (%)": "Perte de vie (%)",
-    "θHS max": "Température maximale du point chaud",
-    "θHS P95": "Température du point chaud au quantile 95 %",
-    "θHS mean": "Température moyenne du point chaud",
-    "Loss of life (h)": "Perte de vie (heures)",
-    "Loss of life (%)": "Perte de vie (%)",
-    "date": "Date",
-    "charge_mean_pct": "Charge moyenne (%)",
-    "charge_max_pct": "Charge maximale (%)",
-    "amb_mean": "Température ambiante moyenne (°C)",
-    "theta_TO_mean": "Température top-oil moyenne (°C)",
-    "theta_HS_max": "Température maximale du point chaud (°C)",
-    "theta_HS_p95": "Température du point chaud au quantile 95 % (°C)",
-    "aging_hours": "Heures de vieillissement",
-    "fans_share": "Part du temps avec ventilateurs actifs",
-    "fans_share_pct": "Part du temps avec ventilateurs actifs (%)",
-    "life_consumed_pct": "Perte de vie (%)",
 }
 
 
@@ -270,12 +151,6 @@ DETAIL_TABLE_LABELS = {
     "process_choice": "Décision sur le processus fiabiliste",
     "fit_candidates": "Comparaison des lois candidates",
     "reliability_summary": "Synthèse fiabiliste",
-    "thermal_summary": "Synthèse thermique",
-    "thermal_table_dataset": "Résumé de la série thermique utilisée",
-    "thermal_table_params": "Paramètres du modèle thermique",
-    "thermal_table_indicators": "Indicateurs thermiques calculés",
-    "thermal_daily": "Résumé journalier thermique",
-    "thermal_top5_days": "Jours les plus critiques",
 }
 
 
@@ -572,19 +447,8 @@ def export_tables_to_excel(results_by_equipment: Dict[str, Dict[str, Any]]) -> b
                         index=False,
                     )
 
-            thermal_result = result.get("thermal")
-            thermal_timeseries = (thermal_result or {}).get("timeseries")
-            if isinstance(thermal_timeseries, pd.DataFrame) and not thermal_timeseries.empty:
-                sheet_name = f"{str(equipment_code)[:14]}_serie_thermique"[:31]
-                rename_columns_for_display(thermal_timeseries).to_excel(
-                    writer,
-                    sheet_name=sheet_name,
-                    index=False,
-                )
-
             reliability_result = result.get("reliability", {}) or {}
             indicators = reliability_result.get("indicators", {}) or {}
-            thermal_summary = ((thermal_result or {}).get("summary", {}) if thermal_result else {}) or {}
 
             summary_rows.append(
                 {
@@ -599,9 +463,6 @@ def export_tables_to_excel(results_by_equipment: Dict[str, Dict[str, Any]]) -> b
                     "beta": (reliability_result.get("params") or {}).get("beta"),
                     "eta_h": (reliability_result.get("params") or {}).get("eta"),
                     "gamma_h": (reliability_result.get("params") or {}).get("gamma"),
-                    "theta_HS_max": thermal_summary.get("theta_hs_max"),
-                    "FAA_max": thermal_summary.get("faa_max"),
-                    "loss_of_life_pct": thermal_summary.get("loss_of_life_pct"),
                 }
             )
 
@@ -614,31 +475,6 @@ def export_tables_to_excel(results_by_equipment: Dict[str, Dict[str, Any]]) -> b
 
     buffer.seek(0)
     return buffer.getvalue()
-
-
-def plot_single_series(
-    dataframe: pd.DataFrame,
-    x_column: str,
-    y_column: str,
-    title: str,
-    y_label: str,
-):
-    if y_column not in dataframe.columns:
-        st.info(f"La variable « {y_column} » n’est pas disponible.")
-        return
-
-    plot_dataframe = dataframe[[x_column, y_column]].dropna().copy()
-    if plot_dataframe.empty:
-        st.info("Aucune donnée disponible pour cette courbe.")
-        return
-
-    figure, axis = plt.subplots(figsize=(9, 4))
-    axis.plot(plot_dataframe[x_column], plot_dataframe[y_column], linewidth=2)
-    axis.set_title(title)
-    axis.set_xlabel("Temps")
-    axis.set_ylabel(y_label)
-    axis.grid(True, alpha=0.3)
-    st.pyplot(figure, clear_figure=True)
 
 
 # -------------------------------------------------------------------
@@ -678,12 +514,6 @@ with st.expander("Comprendre les principales variables affichées sur cette page
 **Paramètre êta** : durée de vie caractéristique estimée.
 
 **Paramètre gamma** : éventuel décalage temporel dans le modèle.
-
-**Température du point chaud** : température estimée dans la zone la plus chaude du transformateur.
-
-**Facteur d’accélération du vieillissement** : indicateur montrant à quel point la chaleur accélère le vieillissement de l’isolation.
-
-**Perte de vie** : part estimée de la durée de vie déjà consommée.
 
 **Processus retenu** :
 - RP : renouvellement avec durées supposées indépendantes
@@ -735,17 +565,11 @@ for equipment_code in selected_equipment_codes:
     if "duree_rep_h" in equipment_dataframe.columns:
         repair_time_list = series_to_positive_list(equipment_dataframe["duree_rep_h"])
 
-    bundle = get_pipeline_bundle(str(equipment_code))
-    thermal_dataframe = bundle.get("thermal_df")
-    thermal_configuration = bundle.get("thermal_config")
-
     try:
         result = analyze_ttf_pipeline(
             ttf_series=time_to_failure_list,
             alpha=float(alpha_value),
             repair_series=repair_time_list,
-            thermal_df=thermal_dataframe,
-            thermal_config=thermal_configuration,
         )
     except Exception as error:
         st.warning(f"{equipment_code} : {error}")
@@ -755,8 +579,6 @@ for equipment_code in selected_equipment_codes:
 
     reliability_result = result.get("reliability", {}) or {}
     indicators = reliability_result.get("indicators", {}) or {}
-    thermal_result = result.get("thermal")
-    thermal_summary = ((thermal_result or {}).get("summary", {}) if thermal_result else {}) or {}
 
     summary_rows.append(
         {
@@ -771,9 +593,6 @@ for equipment_code in selected_equipment_codes:
             "beta": (reliability_result.get("params") or {}).get("beta"),
             "eta_h": (reliability_result.get("params") or {}).get("eta"),
             "gamma_h": (reliability_result.get("params") or {}).get("gamma"),
-            "theta_HS_max": thermal_summary.get("theta_hs_max"),
-            "FAA_max": thermal_summary.get("faa_max"),
-            "loss_of_life_pct": thermal_summary.get("loss_of_life_pct"),
         }
     )
 
@@ -792,7 +611,6 @@ selected_equipment_for_detail = st.selectbox(
 )
 selected_result = results_by_equipment[selected_equipment_for_detail]
 selected_tables = selected_result.get("tables", {}) or {}
-selected_thermal_result = selected_result.get("thermal")
 
 
 # -------------------------------------------------------------------
@@ -813,10 +631,10 @@ with metric_col_3:
         format_number(availability_series.mean(), 2) if not availability_series.empty else "—",
     )
 with metric_col_4:
-    hotspot_series = summary_dataframe["theta_HS_max"].dropna()
+    beta_series = summary_dataframe["beta"].dropna()
     st.metric(
-        "Température maximale du point chaud",
-        format_number(hotspot_series.max(), 2) if not hotspot_series.empty else "—",
+        "Bêta maximal observé",
+        format_number(beta_series.max(), 2) if not beta_series.empty else "—",
     )
 
 
@@ -825,9 +643,7 @@ page_tabs = st.tabs([
     "Tendance",
     "Dépendance",
     "Fiabilité",
-    "Thermique",
     "Courbes fiabilistes",
-    "Courbes thermiques",
     "Téléchargements",
 ])
 
@@ -895,49 +711,6 @@ with page_tabs[3]:
             st.dataframe(rename_columns_for_display(reliability_summary_dataframe), use_container_width=True, hide_index=True)
 
 with page_tabs[4]:
-    st.subheader(f"Thermique — {selected_equipment_for_detail}")
-
-    thermal_view = summary_dataframe[
-        summary_dataframe["equipment_code"] == selected_equipment_for_detail
-    ][
-        [
-            "equipment_code",
-            "theta_HS_max",
-            "FAA_max",
-            "loss_of_life_pct",
-        ]
-    ].copy()
-
-    if thermal_view[["theta_HS_max", "FAA_max", "loss_of_life_pct"]].isna().all().all():
-        st.info("Aucune donnée thermique disponible pour cet équipement.")
-    else:
-        st.markdown("#### Vue synthétique")
-        st.dataframe(rename_columns_for_display(thermal_view), use_container_width=True, hide_index=True)
-
-        st.markdown("#### Tous les tableaux thermiques")
-        for table_key in [
-            "thermal_summary",
-            "thermal_table_dataset",
-            "thermal_table_params",
-            "thermal_table_indicators",
-            "thermal_daily",
-            "thermal_top5_days",
-        ]:
-            thermal_table = selected_tables.get(table_key, pd.DataFrame())
-            if isinstance(thermal_table, pd.DataFrame) and not thermal_table.empty:
-                st.markdown(f"##### {DETAIL_TABLE_LABELS.get(table_key, table_key)}")
-                st.dataframe(rename_columns_for_display(thermal_table), use_container_width=True, hide_index=True)
-
-        thermal_timeseries = (selected_thermal_result or {}).get("timeseries")
-        if isinstance(thermal_timeseries, pd.DataFrame) and not thermal_timeseries.empty:
-            st.markdown("#### Série temporelle thermique calculée")
-            st.dataframe(
-                rename_columns_for_display(thermal_timeseries),
-                use_container_width=True,
-                hide_index=True,
-            )
-
-with page_tabs[5]:
     st.subheader("Courbes fiabilistes")
 
     if equipment_without_curves:
@@ -1074,207 +847,7 @@ with page_tabs[5]:
                 + build_curve_explanation(selected_reliability_result, curve_name)
             )
 
-with page_tabs[6]:
-    st.subheader("Courbes thermiques")
-
-    thermal_timeseries = (selected_thermal_result or {}).get("timeseries")
-    if isinstance(thermal_timeseries, pd.DataFrame) and not thermal_timeseries.empty:
-        thermal_timeseries = thermal_timeseries.copy()
-        thermal_timeseries["timestamp"] = pd.to_datetime(thermal_timeseries["timestamp"])
-
-    thermal_curve_tabs = st.tabs([
-        "Température ambiante",
-        "Charge",
-        "État des ventilateurs",
-        "Élévation top-oil",
-        "Élévation du point chaud",
-        "Température top-oil estimée",
-        "Température du point chaud estimée",
-        "Facteur d’accélération du vieillissement",
-        "Vieillissement sur chaque pas",
-        "Vieillissement cumulé",
-        "Perte de vie cumulée et vie résiduelle",
-    ])
-
-    with thermal_curve_tabs[0]:
-        if thermal_timeseries is None or thermal_timeseries.empty:
-            st.info("Aucune courbe thermique disponible.")
-        else:
-            plot_single_series(
-                thermal_timeseries,
-                "timestamp",
-                "temp_amb_C",
-                "Température ambiante au cours du temps",
-                "Température (°C)",
-            )
-            st.caption("Cette courbe montre l’évolution de la température ambiante autour de l’équipement.")
-
-    with thermal_curve_tabs[1]:
-        if thermal_timeseries is None or thermal_timeseries.empty:
-            st.info("Aucune courbe thermique disponible.")
-        else:
-            if "charge_pct" in thermal_timeseries.columns:
-                plot_single_series(
-                    thermal_timeseries,
-                    "timestamp",
-                    "charge_pct",
-                    "Charge du transformateur au cours du temps",
-                    "Charge (%)",
-                )
-                st.caption("Cette courbe montre le pourcentage de charge supporté par l’équipement.")
-            else:
-                plot_single_series(
-                    thermal_timeseries,
-                    "timestamp",
-                    "K",
-                    "Facteur de charge au cours du temps",
-                    "Facteur de charge",
-                )
-                st.caption("Cette courbe montre le facteur de charge utilisé pour le calcul thermique.")
-
-    with thermal_curve_tabs[2]:
-        if thermal_timeseries is None or thermal_timeseries.empty:
-            st.info("Aucune courbe thermique disponible.")
-        else:
-            plot_single_series(
-                thermal_timeseries,
-                "timestamp",
-                "etat_ventilateurs",
-                "État des ventilateurs au cours du temps",
-                "État des ventilateurs",
-            )
-            st.caption("Cette courbe indique les périodes où les ventilateurs sont actifs ou inactifs.")
-
-    with thermal_curve_tabs[3]:
-        if thermal_timeseries is None or thermal_timeseries.empty:
-            st.info("Aucune courbe thermique disponible.")
-        else:
-            plot_single_series(
-                thermal_timeseries,
-                "timestamp",
-                "Delta_theta_TO",
-                "Élévation de température top-oil au cours du temps",
-                "Élévation de température (°C)",
-            )
-            st.caption("Cette courbe montre l’élévation de température de l’huile au-dessus de la température ambiante.")
-
-    with thermal_curve_tabs[4]:
-        if thermal_timeseries is None or thermal_timeseries.empty:
-            st.info("Aucune courbe thermique disponible.")
-        else:
-            plot_single_series(
-                thermal_timeseries,
-                "timestamp",
-                "Delta_theta_H",
-                "Élévation de température du point chaud au cours du temps",
-                "Élévation de température (°C)",
-            )
-            st.caption("Cette courbe montre l’élévation supplémentaire dans la zone la plus chaude du transformateur.")
-
-    with thermal_curve_tabs[5]:
-        if thermal_timeseries is None or thermal_timeseries.empty:
-            st.info("Aucune courbe thermique disponible.")
-        else:
-            plot_single_series(
-                thermal_timeseries,
-                "timestamp",
-                "theta_TO_est_C",
-                "Température top-oil estimée au cours du temps",
-                "Température (°C)",
-            )
-            st.caption("Cette courbe montre la température estimée de l’huile.")
-
-    with thermal_curve_tabs[6]:
-        if thermal_timeseries is None or thermal_timeseries.empty:
-            st.info("Aucune courbe thermique disponible.")
-        else:
-            plot_single_series(
-                thermal_timeseries,
-                "timestamp",
-                "theta_HS_est_C",
-                "Température du point chaud estimée au cours du temps",
-                "Température (°C)",
-            )
-            st.caption("Cette courbe montre la température estimée dans la zone la plus chaude du transformateur.")
-
-    with thermal_curve_tabs[7]:
-        if thermal_timeseries is None or thermal_timeseries.empty:
-            st.info("Aucune courbe thermique disponible.")
-        else:
-            plot_single_series(
-                thermal_timeseries,
-                "timestamp",
-                "FAA",
-                "Facteur d’accélération du vieillissement au cours du temps",
-                "Facteur",
-            )
-            st.caption("Plus cette courbe monte, plus la chaleur accélère le vieillissement de l’isolation.")
-
-    with thermal_curve_tabs[8]:
-        if thermal_timeseries is None or thermal_timeseries.empty:
-            st.info("Aucune courbe thermique disponible.")
-        else:
-            plot_single_series(
-                thermal_timeseries,
-                "timestamp",
-                "aging_hours_step",
-                "Heures de vieillissement sur chaque pas de temps",
-                "Heures de vieillissement",
-            )
-            st.caption("Cette courbe montre la contribution de chaque pas de temps au vieillissement total.")
-
-    with thermal_curve_tabs[9]:
-        if thermal_timeseries is None or thermal_timeseries.empty:
-            st.info("Aucune courbe thermique disponible.")
-        else:
-            plot_single_series(
-                thermal_timeseries,
-                "timestamp",
-                "aging_hours_cum",
-                "Heures de vieillissement cumulées",
-                "Heures de vieillissement cumulées",
-            )
-            st.caption("Cette courbe montre l’accumulation progressive du vieillissement au cours du temps.")
-
-    with thermal_curve_tabs[10]:
-        if thermal_timeseries is None or thermal_timeseries.empty:
-            st.info("Aucune courbe thermique disponible.")
-        else:
-            dual_figure, dual_axis = plt.subplots(figsize=(9, 4))
-
-            plot_dataframe = thermal_timeseries[
-                ["timestamp", "life_consumed_pct_cum", "remaining_life_pct"]
-            ].dropna(how="all").copy()
-
-            if plot_dataframe.empty:
-                st.info("Aucune donnée disponible pour cette courbe.")
-            else:
-                if "life_consumed_pct_cum" in plot_dataframe.columns:
-                    dual_axis.plot(
-                        plot_dataframe["timestamp"],
-                        plot_dataframe["life_consumed_pct_cum"],
-                        linewidth=2,
-                        label="Perte de vie cumulée (%)",
-                    )
-                if "remaining_life_pct" in plot_dataframe.columns:
-                    dual_axis.plot(
-                        plot_dataframe["timestamp"],
-                        plot_dataframe["remaining_life_pct"],
-                        linewidth=2,
-                        label="Vie résiduelle estimée (%)",
-                    )
-
-                dual_axis.set_title("Perte de vie cumulée et vie résiduelle estimée")
-                dual_axis.set_xlabel("Temps")
-                dual_axis.set_ylabel("Pourcentage (%)")
-                dual_axis.grid(True, alpha=0.3)
-                dual_axis.legend()
-                st.pyplot(dual_figure, clear_figure=True)
-                st.caption(
-                    "Cette courbe compare la part de vie déjà consommée et la part de vie restante estimée."
-                )
-
-with page_tabs[7]:
+with page_tabs[5]:
     st.subheader("Téléchargements")
 
     excel_bytes = export_tables_to_excel(results_by_equipment)

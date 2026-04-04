@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import hashlib
@@ -67,7 +68,7 @@ def maintenance_label(maintenance_type: str) -> str:
     if "correct" in normalized:
         return "Maintenance corrective"
     if "condition" in normalized or "inspection" in normalized:
-        return "Maintenance conditionnelle ou inspection"
+        return "Maintenance conditionnelle"
     if "predict" in normalized or "prédict" in normalized:
         return "Maintenance prédictive"
     if "prévent" in normalized or "prevent" in normalized:
@@ -88,10 +89,9 @@ def readable_interval_source(source_name: Optional[str]) -> str:
 
 def pick_interval_hours(row: dict) -> tuple[Optional[float], Optional[str]]:
     for column_name in ["T_recommended_h", "T_R_h", "T_cost_h", "interval_opt_h", "interval_h"]:
-        if column_name in row and row[column_name] is not None:
-            interval_value = safe_float(row[column_name], None)
-            if interval_value is not None and interval_value > 0:
-                return interval_value, column_name
+        interval_value = safe_float(row.get(column_name), None)
+        if interval_value is not None and interval_value > 0:
+            return interval_value, column_name
     return None, None
 
 
@@ -108,11 +108,11 @@ def beta_zone(beta_value: Optional[float]) -> str:
 def beta_explanation(beta_value: Optional[float]) -> str:
     zone = beta_zone(beta_value)
     if zone == "early":
-        return "Le paramètre bêta est inférieur à 1 : cela évoque surtout des défauts précoces ou des problèmes initiaux."
+        return "Le paramètre bêta est inférieur à 1 : cela évoque surtout des défauts précoces."
     if zone == "random":
         return "Le paramètre bêta est proche de 1 : les défaillances sont plutôt aléatoires."
     if zone == "wear":
-        return "Le paramètre bêta est supérieur à 1 : cela évoque une phase d’usure ou de vieillissement."
+        return "Le paramètre bêta est supérieur à 1 : cela évoque une phase d’usure."
     return "Le paramètre bêta n’est pas disponible."
 
 
@@ -150,17 +150,6 @@ def process_explanation(process_name: Optional[str], process_variant: Optional[s
     return "Le processus retenu correspond à un renouvellement avec défaillances considérées comme indépendantes."
 
 
-def thermal_status_explanation(thermal_status: Optional[str]) -> str:
-    normalized = str(thermal_status or "").lower()
-    if "alerte" in normalized or "critique" in normalized:
-        return "Les indicateurs thermiques montrent une situation défavorable qui peut accélérer le vieillissement."
-    if "conforme" in normalized or "normal" in normalized:
-        return "Les indicateurs thermiques restent dans une zone acceptable."
-    if "analyse thermique calculée" in normalized:
-        return "Une analyse thermique est disponible, mais aucun seuil de conformité strict n’a été imposé ici."
-    return "Aucune information thermique claire n’est disponible."
-
-
 def build_maintenance_comment(
     *,
     beta: Optional[float],
@@ -170,15 +159,10 @@ def build_maintenance_comment(
     maintenance_type_label: str,
     process_model: Optional[str] = None,
     process_variant: Optional[str] = None,
-    thermal_status: Optional[str] = None,
-    thermal_ageing_acceleration_factor_max: Optional[float] = None,
-    thermal_loss_of_life_percent: Optional[float] = None,
 ) -> str:
     beta_value = safe_float(beta, None)
     eta_value = safe_float(eta_h, None)
     interval_value = safe_float(interval_h, None)
-    ageing_acceleration_factor_value = safe_float(thermal_ageing_acceleration_factor_max, None)
-    loss_of_life_value = safe_float(thermal_loss_of_life_percent, None)
 
     source_text = readable_interval_source(interval_source)
     parts: list[str] = []
@@ -186,7 +170,6 @@ def build_maintenance_comment(
     parts.append(f"Type recommandé : {maintenance_type_label}.")
     parts.append(process_explanation(process_model, process_variant))
     parts.append(beta_explanation(beta_value))
-    parts.append(thermal_status_explanation(thermal_status))
 
     if interval_value is not None:
         parts.append(f"L’intervalle retenu est de {interval_value:.1f} heures et provient de la source suivante : {source_text}.")
@@ -205,16 +188,6 @@ def build_maintenance_comment(
             parts.append("L’intervalle choisi reste nettement inférieur à la durée de vie caractéristique : l’approche est prudente.")
     elif eta_value is not None:
         parts.append(f"Le paramètre êta, qui représente une durée de vie caractéristique, vaut environ {eta_value:.1f} heures.")
-
-    if ageing_acceleration_factor_value is not None:
-        parts.append(
-            f"Le facteur maximal d’accélération du vieillissement est d’environ {ageing_acceleration_factor_value:.3f}."
-        )
-
-    if loss_of_life_value is not None:
-        parts.append(
-            f"La perte de vie estimée est d’environ {loss_of_life_value:.3f} %."
-        )
 
     actions: list[str] = []
     zone = beta_zone(beta_value)
@@ -237,11 +210,6 @@ def build_maintenance_comment(
             "préparer le remplacement des éléments vieillissants",
         ])
 
-    if thermal_status and "alerte" in str(thermal_status).lower():
-        actions.insert(0, "contrôler immédiatement l’échauffement et le système de refroidissement")
-    elif thermal_status and ("conforme" in str(thermal_status).lower() or "normal" in str(thermal_status).lower()):
-        actions.insert(0, "conserver la surveillance thermique actuelle")
-
     if actions:
         parts.append("Actions conseillées : " + "; ".join(actions) + ".")
 
@@ -261,21 +229,23 @@ def load_optimization_fallback() -> pd.DataFrame:
     return pd.DataFrame()
 
 
+def process_score(process_name: str) -> int:
+    normalized = (process_name or "").upper()
+    if "NHPP" in normalized:
+        return 3
+    if "BPP" in normalized or "HAWKES" in normalized:
+        return 2
+    return 1
+
+
 def compute_priority_decision(row: Dict[str, Any]) -> tuple[int, str, str, str]:
     score = 0
-
-    process_name = str(row.get("model", "RP")).upper()
-    thermal_status = str(row.get("thermal_status", "Aucune donnée thermique disponible"))
+    process_name = str(row.get("model", "RP"))
     beta_value = safe_float(row.get("beta"), None)
     days_left = safe_float(row.get("days_left"), None)
-    global_conformity = row.get("admissible_global")
+    maintenance_type = str(row.get("maintenance_type", ""))
 
-    if process_name == "NHPP":
-        score += 3
-    elif process_name == "BPP":
-        score += 2
-    else:
-        score += 1
+    score += process_score(process_name)
 
     if beta_value is not None:
         if beta_value > 1.2:
@@ -285,12 +255,6 @@ def compute_priority_decision(row: Dict[str, Any]) -> tuple[int, str, str, str]:
         elif beta_value < 0.8:
             score += 1
 
-    normalized_thermal_status = thermal_status.lower()
-    if "alerte" in normalized_thermal_status or "critique" in normalized_thermal_status:
-        score += 4
-    elif "conforme" in normalized_thermal_status or "normal" in normalized_thermal_status:
-        score += 1
-
     if days_left is not None:
         if days_left <= 7:
             score += 3
@@ -299,25 +263,25 @@ def compute_priority_decision(row: Dict[str, Any]) -> tuple[int, str, str, str]:
         elif days_left <= 90:
             score += 1
 
-    if global_conformity is False:
-        score += 2
-
-    if score >= 10:
+    if score >= 8:
         priority_level = "Critique"
         final_decision = "Intervention prioritaire"
-        reason = "Les signaux fiabilistes, thermiques et calendaires imposent une action rapide."
-    elif score >= 7:
+        reason = (
+            f"Le comportement fiabiliste et l’échéance imposent une action rapide. "
+            f"Type d’action retenu : {maintenance_type or 'maintenance ciblée'}."
+        )
+    elif score >= 5:
         priority_level = "Élevée"
         final_decision = "Préventif renforcé"
-        reason = "Le niveau de risque reste significatif : il faut maintenir une action planifiée rapide."
-    elif score >= 4:
+        reason = "Le risque reste important. Une intervention planifiée rapide est recommandée."
+    elif score >= 3:
         priority_level = "Modérée"
         final_decision = "Surveillance active"
-        reason = "La situation demande une surveillance structurée et le respect du plan calculé."
+        reason = "La situation est intermédiaire. Il faut suivre le plan calculé et surveiller les dérives."
     else:
         priority_level = "Faible"
         final_decision = "Suivi nominal"
-        reason = "Aucun signal critique immédiat n’est dominant : le plan standard peut être suivi."
+        reason = "Aucun signal critique immédiat n’est dominant. Le plan standard peut être appliqué."
 
     return score, priority_level, final_decision, reason
 
@@ -344,12 +308,6 @@ DISPLAY_COLUMN_NAMES = {
     "T_cost_h": "Intervalle issu du critère économique (heures)",
     "R_at_T": "Fiabilité au niveau de l’intervalle économique",
     "C_min_per_h": "Coût minimal par heure",
-    "FAA_max": "Facteur maximal d’accélération du vieillissement",
-    "loss_of_life_pct": "Perte de vie (%)",
-    "thermal_status": "Statut thermique",
-    "thermal_ok": "Conformité thermique",
-    "reliability_ok": "Conformité fiabiliste",
-    "admissible_global": "Conformité globale",
     "status": "Statut du plan",
     "priority_score": "Score de priorité",
     "priority_level": "Niveau de priorité",
@@ -362,11 +320,10 @@ def rename_columns_for_display(dataframe: pd.DataFrame) -> pd.DataFrame:
     if dataframe is None or dataframe.empty:
         return dataframe
     renamed_dataframe = dataframe.copy()
-    renamed_dataframe = renamed_dataframe.rename(columns={
+    return renamed_dataframe.rename(columns={
         column: DISPLAY_COLUMN_NAMES.get(column, column)
         for column in renamed_dataframe.columns
     })
-    return renamed_dataframe
 
 
 def build_virtual_maintenance_plan_from_optimization(
@@ -375,7 +332,6 @@ def build_virtual_maintenance_plan_from_optimization(
     due_window_days: int,
     show_all: bool = True,
     only_preventive: bool = False,
-    only_globally_conformant: bool = False,
     minimum_days: int = 1,
 ) -> Dict[str, Any]:
     if optimization_dataframe is None or optimization_dataframe.empty:
@@ -401,10 +357,6 @@ def build_virtual_maintenance_plan_from_optimization(
         row = record.to_dict()
         equipment_code = str(row.get("equipment_code") or "").strip()
         if not equipment_code:
-            continue
-
-        globally_conformant = row.get("admissible_global")
-        if only_globally_conformant and globally_conformant is not None and not bool(globally_conformant):
             continue
 
         maintenance_type_readable = maintenance_label(str(row.get("maintenance_type") or "").strip())
@@ -434,9 +386,6 @@ def build_virtual_maintenance_plan_from_optimization(
             maintenance_type_label=maintenance_type_readable,
             process_model=str(row.get("model") or ""),
             process_variant=str(row.get("process_variant") or ""),
-            thermal_status=str(row.get("thermal_status") or ""),
-            thermal_ageing_acceleration_factor_max=safe_float(row.get("FAA_max"), None),
-            thermal_loss_of_life_percent=safe_float(row.get("loss_of_life_pct"), None),
         )
 
         task = {
@@ -461,12 +410,6 @@ def build_virtual_maintenance_plan_from_optimization(
             "T_cost_h": row.get("T_cost_h"),
             "R_at_T": row.get("R(T_cost)"),
             "C_min_per_h": row.get("C_min_per_h"),
-            "FAA_max": row.get("FAA_max"),
-            "loss_of_life_pct": row.get("loss_of_life_pct"),
-            "thermal_status": row.get("thermal_status"),
-            "thermal_ok": row.get("thermal_ok"),
-            "reliability_ok": row.get("reliability_ok"),
-            "admissible_global": row.get("admissible_global"),
             "status": "Plan virtuel",
         }
 
@@ -481,10 +424,10 @@ def build_virtual_maintenance_plan_from_optimization(
 
     rows = sorted(
         rows,
-        key=lambda row: (
-            -int(row.get("priority_score", 0)),
-            int(row.get("days_left", 999999)),
-            str(row.get("equipment_code", "")),
+        key=lambda current_row: (
+            -int(current_row.get("priority_score", 0)),
+            int(current_row.get("days_left", 999999)),
+            str(current_row.get("equipment_code", "")),
         ),
     )
     due_rows = [row for row in rows if int(row.get("days_left", 999999)) <= due_window_days]
@@ -537,16 +480,6 @@ with st.expander("Comprendre clairement les variables utilisées sur cette page"
 
 **Intervalle issu du critère économique** : temps qui cherche à minimiser le coût moyen.
 
-**Facteur maximal d’accélération du vieillissement** : indicateur thermique montrant à quel point la chaleur accélère le vieillissement de l’isolation.
-
-**Perte de vie (%)** : part estimée de la durée de vie déjà consommée.
-
-**Statut thermique** : indique si la situation thermique est normale, conforme, en alerte ou non disponible.
-
-**Conformité fiabiliste** : indique si le modèle de fiabilité retenu est jugé acceptable.
-
-**Conformité globale** : synthèse de la cohérence fiabilité + thermique.
-
 **Score de priorité** : score interne utilisé pour classer les équipements à traiter en premier.
 
 **Décision finale** : conclusion pratique retenue pour orienter l’action.
@@ -557,7 +490,7 @@ with st.expander("Comprendre clairement les variables utilisées sur cette page"
 # -------------------------------------------------------------------
 # Contrôles
 # -------------------------------------------------------------------
-control_col_1, control_col_2, control_col_3, control_col_4, control_col_5 = st.columns(5)
+control_col_1, control_col_2, control_col_3, control_col_4 = st.columns(4)
 with control_col_1:
     due_window_days = st.slider("Fenêtre des tâches dues (jours)", 7, 365, 14, 1)
 with control_col_2:
@@ -565,8 +498,6 @@ with control_col_2:
 with control_col_3:
     only_preventive_rows = st.toggle("Montrer seulement la maintenance préventive", value=False)
 with control_col_4:
-    only_globally_conformant_rows = st.toggle("Montrer seulement les cas globalement conformes", value=False)
-with control_col_5:
     start_reference_date = st.date_input("Date de départ du planning", value=date.today())
 
 maintenance_plan = build_virtual_maintenance_plan_from_optimization(
@@ -575,7 +506,6 @@ maintenance_plan = build_virtual_maintenance_plan_from_optimization(
     due_window_days=int(due_window_days),
     show_all=bool(show_all_rows),
     only_preventive=bool(only_preventive_rows),
-    only_globally_conformant=bool(only_globally_conformant_rows),
     minimum_days=1,
 )
 
@@ -595,13 +525,11 @@ with metric_col_1:
 with metric_col_2:
     st.metric("Tâches dues dans la fenêtre", len(due_rows))
 with metric_col_3:
-    globally_conformant_count = int(
-        pd.Series([row.get("admissible_global") for row in all_planned_rows]).fillna(False).astype(bool).sum()
-    ) if all_planned_rows else 0
-    st.metric("Plans globalement conformes", globally_conformant_count)
-with metric_col_4:
     preventive_count = int(sum(1 for row in all_planned_rows if "préventive" in str(row.get("maintenance_type", "")).lower()))
     st.metric("Actions préventives", preventive_count)
+with metric_col_4:
+    critical_count = int(sum(1 for row in all_planned_rows if str(row.get("priority_level", "")) == "Critique"))
+    st.metric("Priorité critique", critical_count)
 
 
 # -------------------------------------------------------------------
@@ -628,7 +556,6 @@ with page_tabs[0]:
                     "interval_h",
                     "beta",
                     "eta_h",
-                    "thermal_status",
                     "priority_level",
                     "maintenance_comment",
                 ] if column in all_rows_dataframe.columns
@@ -659,10 +586,6 @@ with page_tabs[1]:
             "model",
             "process_variant",
             "distribution",
-            "FAA_max",
-            "loss_of_life_pct",
-            "thermal_status",
-            "admissible_global",
             "priority_score",
             "priority_level",
             "final_decision",
@@ -693,10 +616,6 @@ with page_tabs[2]:
             "model",
             "process_variant",
             "distribution",
-            "FAA_max",
-            "loss_of_life_pct",
-            "thermal_status",
-            "admissible_global",
             "priority_score",
             "priority_level",
             "final_decision",
@@ -740,7 +659,6 @@ with page_tabs[3]:
                 "distribution": best_row.get("distribution"),
                 "interval_h": best_row.get("interval_h"),
                 "days_left": best_row.get("days_left"),
-                "thermal_status": best_row.get("thermal_status"),
                 "priority_score": best_row.get("priority_score"),
                 "priority_level": best_row.get("priority_level"),
                 "final_decision": best_row.get("final_decision"),
