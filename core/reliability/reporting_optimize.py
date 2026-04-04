@@ -8,7 +8,6 @@ from typing import Any, Dict, List, Optional
 
 import math
 import numpy as np
-import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -23,8 +22,6 @@ try:
     HAVE_REPORTLAB = True
 except Exception:
     HAVE_REPORTLAB = False
-
-from scipy import stats as sst
 
 
 def _san(value: Any) -> str:
@@ -54,7 +51,7 @@ def _fmt(value: Any, nd: int = 2, dash: str = "—") -> str:
     return dash if numeric is None else f"{numeric:.{nd}f}"
 
 
-def _compact(value: Any, max_len: int = 180) -> str:
+def _compact(value: Any, max_len: int = 160) -> str:
     text = _san(value).replace("\n", " ").strip()
     return text if len(text) <= max_len else text[: max_len - 3] + "..."
 
@@ -176,259 +173,109 @@ def _pipe_line(pipe: dict) -> str:
     )
 
 
-def _distribution_object_and_params(reliability_result: Dict[str, Any]):
-    if str(reliability_result.get("model") or "").upper() != "RP":
-        return None, None
-    distribution_name = reliability_result.get("distribution")
-    raw_parameters = (reliability_result.get("params") or {}).get("raw")
-    if not raw_parameters:
-        return None, None
-    if distribution_name == "expon":
-        return sst.expon, raw_parameters
-    if distribution_name == "norm":
-        return sst.norm, raw_parameters
-    if distribution_name == "lognorm":
-        return sst.lognorm, raw_parameters
-    if distribution_name in {"weibull_2p", "weibull_3p"}:
-        return sst.weibull_min, raw_parameters
-    return None, None
-
-
-def _compute_rp_curve(reliability_result: Dict[str, Any], t: np.ndarray, kind: str) -> Optional[np.ndarray]:
-    dist_obj, params = _distribution_object_and_params(reliability_result)
-    if dist_obj is None:
+def _fig_R_curves(fits: Dict[str, Any], intervals: Dict[str, Any]):
+    if not fits:
         return None
-    try:
-        if kind == "R":
-            return np.asarray(dist_obj.sf(t, *params), dtype=float)
-        if kind == "F":
-            return np.asarray(dist_obj.cdf(t, *params), dtype=float)
-        if kind == "f":
-            return np.asarray(dist_obj.pdf(t, *params), dtype=float)
-        if kind == "h":
-            sf = dist_obj.sf(t, *params)
-            pdf = dist_obj.pdf(t, *params)
-            return np.divide(pdf, sf, out=np.full_like(pdf, np.nan, dtype=float), where=sf > 1e-12)
-    except Exception:
-        return None
-    return None
-
-
-def _compute_nhpp_curve(reliability_result: Dict[str, Any], t: np.ndarray, kind: str) -> Optional[np.ndarray]:
-    params = reliability_result.get("params", {}) or {}
-    beta = _safe_float(params.get("beta"))
-    eta = _safe_float(params.get("eta"))
-    if beta is None or eta is None or beta <= 0 or eta <= 0:
-        return None
-    safe_t = np.maximum(t, 1e-6)
-    cumulative = (safe_t / eta) ** beta
-    intensity = (beta / eta) * ((safe_t / eta) ** (beta - 1.0))
-    R = np.exp(-cumulative)
-    F = 1.0 - R
-    f = intensity * R
-    if kind == "R":
-        return R
-    if kind == "F":
-        return F
-    if kind == "f":
-        return f
-    if kind == "h":
-        return intensity
-    return None
-
-
-def _compute_bpp_curve(reliability_result: Dict[str, Any], ttf_series: List[float], t: np.ndarray, kind: str) -> Optional[np.ndarray]:
-    params = reliability_result.get("params", {}) or {}
-    mu = _safe_float(params.get("mu"))
-    alpha = _safe_float(params.get("alpha"))
-    beta_kernel = _safe_float(params.get("beta_kernel"))
-    if mu is None or alpha is None or beta_kernel is None:
-        return None
-    if mu < 0 or alpha < 0 or beta_kernel <= 0:
-        return None
-    event_times = np.cumsum(np.asarray(ttf_series, dtype=float))
-    if event_times.size == 0:
-        return None
-    safe_t = np.maximum(t, 1e-6)
-    intensity = np.full_like(safe_t, fill_value=mu, dtype=float)
-    for event_time in event_times:
-        mask = safe_t >= event_time
-        if np.any(mask):
-            intensity[mask] += alpha * np.exp(-beta_kernel * (safe_t[mask] - event_time))
-    cumulative = np.zeros_like(safe_t)
-    if len(safe_t) > 1:
-        dt = np.diff(safe_t)
-        cumulative[1:] = np.cumsum(0.5 * (intensity[1:] + intensity[:-1]) * dt)
-    R = np.exp(-cumulative)
-    F = 1.0 - R
-    f = intensity * R
-    if kind == "R":
-        return R
-    if kind == "F":
-        return F
-    if kind == "f":
-        return f
-    if kind == "h":
-        return intensity
-    return None
-
-
-def _compute_curve(reliability_result: Dict[str, Any], ttf_series: List[float], t: np.ndarray, kind: str) -> Optional[np.ndarray]:
-    model = str(reliability_result.get("model") or "").upper()
-    if model == "RP":
-        return _compute_rp_curve(reliability_result, t, kind)
-    if model == "NHPP":
-        return _compute_nhpp_curve(reliability_result, t, kind)
-    if model == "BPP":
-        return _compute_bpp_curve(reliability_result, ttf_series, t, kind)
-    return None
-
-
-def _time_horizon(reliability_result: Dict[str, Any], ttf_series: List[float], extra_values: Optional[List[float]] = None) -> float:
-    values = np.asarray(ttf_series, dtype=float)
-    values = values[np.isfinite(values)]
-    values = values[values > 0]
-    if values.size == 0:
-        return 100.0
-    params = reliability_result.get("params", {}) or {}
-    eta = _safe_float(params.get("eta"))
-    horizon = max(float(values.max()) * 2.0, float(values.mean()) * 6.0, 50.0)
-    if eta is not None and eta > 0:
-        horizon = max(horizon, eta * 1.5)
-    extra_values = extra_values or []
-    extras = [float(v) for v in extra_values if v is not None and v > 0]
-    if extras:
-        horizon = max(horizon, max(extras) * 1.25)
-    return horizon
-
-
-def _plot_optimization_curves(eq: str, reliability_result: Dict[str, Any], ttf_series: List[float], row: Dict[str, Any]):
-    tr = _safe_float(row.get("T_R_h"))
-    tc = _safe_float(row.get("T_cost_h"))
-    rec = _safe_float(row.get("T_recommended_h"))
-    horizon = _time_horizon(reliability_result, ttf_series, extra_values=[tr, tc, rec])
-    t = np.linspace(1e-6, horizon, 400)
-
-    fig, axes = plt.subplots(2, 2, figsize=(11, 7))
-    axes = axes.ravel()
-    definitions = [
-        ("R", "Fiabilité R(t)", "R(t)"),
-        ("F", "Répartition F(t)", "F(t)"),
-        ("f", "Densité f(t)", "f(t)"),
-        ("h", "Taux de défaillance λ(t)", "λ(t)"),
-    ]
-    for ax, (kind, title, ylabel) in zip(axes, definitions):
-        values = _compute_curve(reliability_result, ttf_series, t, kind)
-        if values is None:
-            ax.text(0.5, 0.5, "Courbe indisponible", ha="center", va="center", transform=ax.transAxes)
-        else:
-            ax.plot(t, values, linewidth=2, label=f"{eq} - {title}")
-
-        if rec is not None:
-            ax.axvline(rec, color="green", linestyle="-", linewidth=2.2, label=f"T_recommandé = {rec:.1f} h")
-        if tr is not None:
-            color_tr = "green" if rec is not None and abs(rec - tr) < 1e-9 else "red"
-            label_tr = f"T_R = {tr:.1f} h"
-            if rec is not None and abs(rec - tr) < 1e-9:
-                label_tr += " (retenu)"
-            ax.axvline(tr, color=color_tr, linestyle="--", linewidth=1.6, label=label_tr)
-        if tc is not None:
-            color_tc = "green" if rec is not None and abs(rec - tc) < 1e-9 else "red"
-            label_tc = f"T_cost = {tc:.1f} h"
-            if rec is not None and abs(rec - tc) < 1e-9:
-                label_tc += " (retenu)"
-            ax.axvline(tc, color=color_tc, linestyle=":", linewidth=1.8, label=label_tc)
-
-        ax.set_xlabel("Temps (heures)")
-        ax.set_ylabel(ylabel)
-        ax.set_title(title)
-        ax.grid(True, alpha=0.3)
-        handles, labels = ax.get_legend_handles_labels()
-        seen = set()
-        unique_handles = []
-        unique_labels = []
-        for handle, label in zip(handles, labels):
-            if label not in seen:
-                seen.add(label)
-                unique_handles.append(handle)
-                unique_labels.append(label)
-        if unique_labels:
-            ax.legend(unique_handles, unique_labels, fontsize=8)
-
-    fig.suptitle(f"Courbes fiabilistes et intervalles d’optimisation - {eq}", fontsize=12)
+    etas = [float(getattr(fit, "eta", 0.0) or 0.0) for fit in fits.values()]
+    tmax = max(etas) * 1.6 if etas and max(etas) > 0 else 1000.0
+    maybe = []
+    for value in (intervals or {}).values():
+        if isinstance(value, dict):
+            for key in ["T_R", "T_cost"]:
+                current = _safe_float(value.get(key))
+                if current is not None:
+                    maybe.append(current)
+    if maybe:
+        tmax = max(tmax, max(maybe) * 1.2)
+    t = np.linspace(0, max(tmax, 1.0), 350)
+    fig, ax = plt.subplots(figsize=(10, 5))
+    for eq, fit in fits.items():
+        beta = float(getattr(fit, "beta", 1.0) or 1.0)
+        eta = float(getattr(fit, "eta", 1.0) or 1.0)
+        gamma = float(getattr(fit, "gamma", 0.0) or 0.0)
+        R = np.ones_like(t)
+        mask = t > gamma
+        R[mask] = np.exp(-(((t[mask] - gamma) / max(eta, 1e-12)) ** max(beta, 1e-12)))
+        ax.plot(t, R, linewidth=2, label=f"{eq} (beta={beta:.2f}, eta={eta:.1f})")
+        current = intervals.get(eq, {})
+        if isinstance(current, dict):
+            tr = _safe_float(current.get("T_R"))
+            tc = _safe_float(current.get("T_cost"))
+            if tr is not None:
+                ax.axvline(tr, linestyle="--", linewidth=1)
+            if tc is not None:
+                ax.axvline(tc, linestyle=":", linewidth=1)
+    ax.set_xlabel("Temps (heures)")
+    ax.set_ylabel("R(t)")
+    ax.set_title("Courbes de fiabilité utilisées pour l'optimisation")
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8)
     fig.tight_layout()
     return _fig_to_rl_image(fig, width_mm=180)
 
 
-def _summary_table_data(df_out: pd.DataFrame) -> List[List[Any]]:
+def _row_from_df_out(df_out, eq: str) -> Dict[str, Any]:
+    if df_out is None or getattr(df_out, "empty", True):
+        return {}
+    if "equipment_code" not in df_out.columns:
+        return {}
+    matched = df_out[df_out["equipment_code"].astype(str) == str(eq)]
+    return {} if matched.empty else matched.iloc[0].to_dict()
+
+
+def _summary_table_data(fits: Dict[str, Any], intervals: Dict[str, Any], organigram_by_eq: Dict[str, Any], df_out=None) -> List[List[Any]]:
     data = [[
-        "Équipement", "Processus", "Loi", "beta", "eta (h)", "gamma (h)",
-        "MTTF (h)", "MTBF (h)", "MTTR (h)", "Disponibilité (%)",
-        "T_R (h)", "T_cost (h)", "R(T_cost)", "T_recommandé (h)",
-        "Jours retenus", "Source retenue", "Maintenance retenue"
+        "Équipement", "Modèle", "Loi", "beta", "eta (h)", "gamma (h)",
+        "T_R (h)", "T_cost (h)", "T_recommandé (h)", "R(T_cost)", "C_min / h", "Maintenance retenue"
     ]]
-    for _, row in df_out.iterrows():
+    eqs = sorted(set(list(fits.keys()) + list((organigram_by_eq or {}).keys())))
+    for eq in eqs:
+        row = _row_from_df_out(df_out, eq)
+        fit = fits.get(eq)
+        rel = (organigram_by_eq.get(eq) or {}).get("reliability", organigram_by_eq.get(eq, {}) or {})
+        beta = _safe_float(row.get("beta") if row else None)
+        eta = _safe_float(row.get("eta_h") if row else None)
+        gamma = _safe_float(row.get("gamma_h") if row else None)
+        if fit is not None:
+            beta = beta if beta is not None else _safe_float(getattr(fit, "beta", None))
+            eta = eta if eta is not None else _safe_float(getattr(fit, "eta", None))
+            gamma = gamma if gamma is not None else _safe_float(getattr(fit, "gamma", None))
+        current_itv = intervals.get(eq, {}) if isinstance(intervals.get(eq, {}), dict) else {}
         data.append([
-            _san(row.get("equipment_code")),
-            _san(row.get("model", "—")),
-            _san(row.get("distribution", "—")),
-            _fmt(row.get("beta"), 3),
-            _fmt(row.get("eta_h"), 1),
-            _fmt(row.get("gamma_h"), 1),
-            _fmt(row.get("MTTF_h"), 1),
-            _fmt(row.get("MTBF_h"), 1),
-            _fmt(row.get("MTTR_h"), 1),
-            _fmt(row.get("availability_pct"), 2),
-            _fmt(row.get("T_R_h"), 1),
-            _fmt(row.get("T_cost_h"), 1),
-            _fmt(row.get("R(T_cost)"), 3),
+            eq,
+            _san(row.get("model", rel.get("model", "—"))),
+            _san(row.get("distribution", rel.get("distribution", "—"))),
+            _fmt(beta, 3),
+            _fmt(eta, 1),
+            _fmt(gamma, 1),
+            _fmt(row.get("T_R_h") if row else current_itv.get("T_R"), 1),
+            _fmt(row.get("T_cost_h") if row else current_itv.get("T_cost"), 1),
             _fmt(row.get("T_recommended_h"), 1),
-            _fmt(row.get("days_recommended"), 1),
-            _san(row.get("recommended_source", "—")),
-            _maintenance_type(_safe_float(row.get("beta")), row.get("maintenance_type")),
+            _fmt(row.get("R(T_cost)") if row else current_itv.get("R_at_T"), 3),
+            _fmt(row.get("C_min_per_h") if row else current_itv.get("C_min"), 4),
+            _maintenance_type(beta, row.get("maintenance_type") if row else None),
         ])
     return data
 
 
-def _indicator_table(row: Dict[str, Any]) -> List[List[Any]]:
+def _parameter_influence_table(row: Dict[str, Any], pipe: Dict[str, Any]) -> List[List[Any]]:
+    beta = _safe_float(row.get("beta"))
+    model = _san(row.get("model", pipe.get("model", "—")))
+    distribution = _san(row.get("distribution", pipe.get("distribution", "—")))
+    maintenance = _maintenance_type(beta, row.get("maintenance_type"))
     return [
-        ["Indicateur", "Valeur", "Lecture"],
-        ["Processus retenu", _san(row.get("model", "—")), "Processus issu de l'analyse fiabiliste."],
-        ["Variant du processus", _san(row.get("process_variant", "—")), "Précision sur le comportement retenu."],
-        ["Loi choisie", _san(row.get("distribution", "—")), "Loi utilisée pour l'analyse ou la lecture principale."],
-        ["MTTF (h)", _fmt(row.get("MTTF_h"), 1), "Temps moyen avant défaillance."],
-        ["MTBF (h)", _fmt(row.get("MTBF_h"), 1), "Temps moyen entre défaillances."],
-        ["MTTR (h)", _fmt(row.get("MTTR_h"), 1), "Temps moyen de réparation."],
-        ["Disponibilité (%)", _fmt(row.get("availability_pct"), 2), "Part du temps disponible."],
-        ["beta", _fmt(row.get("beta"), 3), "Indique jeunesse, aléatoire ou usure."],
-        ["eta (h)", _fmt(row.get("eta_h"), 1), "Durée caractéristique."],
-        ["gamma (h)", _fmt(row.get("gamma_h"), 1), "Décalage éventuel du modèle."],
+        ["Paramètre", "Valeur", "Influence sur le choix"],
+        ["Type de maintenance retenu", maintenance, _maintenance_explanation(maintenance)],
+        ["Paramètre beta", _fmt(beta, 3), "Décrit la phase de vie : défauts précoces, aléatoire ou usure."],
+        ["Processus retenu", model, "Le type de processus influence le niveau de prudence."],
+        ["Loi retenue", distribution, "Cadre mathématique retenu pour l'ajustement."],
+        ["Intervalle de fiabilité T_R", _fmt(row.get("T_R_h"), 1), "Repère issu de l'objectif de fiabilité."],
+        ["Intervalle économique T_cost", _fmt(row.get("T_cost_h"), 1), "Repère minimisant le coût moyen."],
+        ["Intervalle recommandé", _fmt(row.get("T_recommended_h"), 1), "Compromis final appliqué."],
+        ["Fiabilité à T_cost", _fmt(row.get("R(T_cost)"), 3), "Niveau de fiabilité conservé à l'intervalle économique."],
+        ["Coût minimal par heure", _fmt(row.get("C_min_per_h"), 4), "Contribution économique dans le choix."],
+        ["Jours restants", _san(row.get("days_left", "—")), "Permet de hiérarchiser l'intervention dans le temps."],
     ]
-
-
-def _optimization_table(row: Dict[str, Any], reliability_floor: Optional[float]) -> List[List[Any]]:
-    floor_txt = f"{reliability_floor:.2f}" if reliability_floor is not None else "0.70"
-    return [
-        ["Étape / Formule", "Valeur", "Interprétation"],
-        ["T_R", _fmt(row.get("T_R_h"), 1), "Intervalle issu du critère de fiabilité."],
-        ["T_cost", _fmt(row.get("T_cost_h"), 1), "Intervalle issu du critère économique."],
-        ["R(T_cost)", _fmt(row.get("R(T_cost)"), 3), f"Doit rester >= {floor_txt} pour accepter T_cost."],
-        ["T_recommandé = max(T_cost, T_R)", _fmt(row.get("T_recommended_h"), 1), "Règle de décision appliquée après contrôle du seuil de fiabilité."],
-        ["Jours avant maintenance retenus", _fmt(row.get("days_recommended"), 1), "Durée lisible par l'exploitant."],
-        ["Source retenue", _san(row.get("recommended_source", "—")), "Indique si la décision finale vient de T_R ou T_cost."],
-        ["C_min / h", _fmt(row.get("C_min_per_h"), 4), "Coût minimal moyen par heure."],
-        ["Type de maintenance retenu", _maintenance_type(_safe_float(row.get("beta")), row.get("maintenance_type")), _maintenance_explanation(_maintenance_type(_safe_float(row.get("beta")), row.get("maintenance_type")))],
-    ]
-
-
-def _build_formula_text(reliability_floor: Optional[float]) -> str:
-    floor_txt = f"{reliability_floor:.2f}" if reliability_floor is not None else "0.70"
-    return (
-        "La phase d'optimisation reprend d'abord les indicateurs calculés précédemment, puis calcule les deux "
-        "intervalles candidats T_R et T_cost. La règle finale appliquée est la suivante : on choisit l'intervalle "
-        "qui maximise les jours avant maintenance tout en respectant le seuil minimal de fiabilité. En particulier, "
-        f"si R(T_cost) < {floor_txt}, alors T_R est retenu automatiquement. Sinon, on retient max(T_cost, T_R)."
-    )
 
 
 def export_optimization_report_pdf_bytes(
@@ -449,7 +296,6 @@ def export_optimization_report_pdf_bytes(
     organigram_by_eq = organigram_by_eq or {}
     detail_tables_by_eq = detail_tables_by_eq or {}
     meta = meta or {}
-    df_out = df_out if isinstance(df_out, pd.DataFrame) else pd.DataFrame()
 
     styles = getSampleStyleSheet()
     styles.add(
@@ -491,7 +337,7 @@ def export_optimization_report_pdf_bytes(
     story.append(Spacer(1, 8))
 
     nb_obs = int(getattr(df, "shape", [0])[0]) if df is not None else 0
-    nb_eq = int(getattr(df_out, "shape", [0])[0]) if df_out is not None and not df_out.empty else len(fits)
+    nb_eq = int(getattr(df_out, "shape", [0])[0]) if df_out is not None else len(fits)
 
     story.append(Paragraph("Résumé", styles["Heading2"]))
     story.append(Paragraph(_san(f"- Équipements analysés : {nb_eq}"), styles["Justify"]))
@@ -507,57 +353,53 @@ def export_optimization_report_pdf_bytes(
         story.append(_mk_table(rows, total_width=usable_width, font_size=8))
         story.append(Spacer(1, 8))
 
-    story.append(Paragraph("Logique d’optimisation", styles["Heading2"]))
-    story.append(Paragraph(_build_formula_text(_safe_float(meta.get("R_min_cost")) if meta else None), styles["Justify"]))
+    story.append(Paragraph(
+        "Ce rapport présente uniquement les éléments utiles à l'optimisation : paramètres fiabilistes, "
+        "intervalles calculés, coût minimal et type de maintenance retenu.",
+        styles["Justify"],
+    ))
     story.append(Spacer(1, 8))
 
-    if not df_out.empty:
-        story.append(Paragraph("Tableau 1. Synthèse globale de l’optimisation", styles["Caption"]))
-        story.append(_mk_table(_summary_table_data(df_out), total_width=usable_width, font_size=7))
-        story.append(Spacer(1, 10))
+    story.append(Paragraph("Tableau 1. Synthèse globale de l'optimisation", styles["Caption"]))
+    story.append(_mk_table(
+        _summary_table_data(fits=fits, intervals=intervals, organigram_by_eq=organigram_by_eq, df_out=df_out),
+        total_width=usable_width,
+        font_size=7,
+    ))
+    story.append(Spacer(1, 8))
 
-    eqs = df_out["equipment_code"].astype(str).tolist() if not df_out.empty else sorted(set(list(fits.keys()) + list(organigram_by_eq.keys())))
+    chart = _fig_R_curves(fits, intervals)
+    if chart is not None:
+        story.append(Paragraph("Figure. Courbes de fiabilité utilisées pour l'optimisation", styles["Caption"]))
+        story.append(chart)
+        story.append(Spacer(1, 8))
+
+    eqs = sorted(set(list(fits.keys()) + list((organigram_by_eq or {}).keys())))
+    if eqs:
+        story.append(PageBreak())
+
     for idx, eq in enumerate(eqs):
-        row_dict = {}
-        if not df_out.empty:
-            matched = df_out[df_out["equipment_code"].astype(str) == str(eq)]
-            if not matched.empty:
-                row_dict = matched.iloc[0].to_dict()
-
         pipe = organigram_by_eq.get(eq, {}) or {}
         rel = pipe.get("reliability", pipe)
-
-        ttf_series: List[float] = []
-        if isinstance(df, pd.DataFrame) and not df.empty and "equipment_code" in df.columns and "ttf_h" in df.columns:
-            eq_df = df[df["equipment_code"].astype(str) == str(eq)].copy()
-            values = pd.to_numeric(eq_df["ttf_h"], errors="coerce").dropna()
-            values = values[values > 0]
-            ttf_series = values.astype(float).tolist()
+        row = _row_from_df_out(df_out, eq)
 
         story.append(Paragraph(_san(f"Équipement {eq}"), styles["Heading2"]))
-        story.append(Paragraph(_compact(_pipe_line(pipe), 260), styles["Justify"]))
+        story.append(Paragraph(_compact(_pipe_line(pipe), 220), styles["Justify"]))
         story.append(Spacer(1, 4))
 
-        story.append(Paragraph("Tableau 2. Indicateurs repris", styles["Caption"]))
-        story.append(_mk_table(_indicator_table(row_dict), total_width=usable_width, font_size=8))
-        story.append(Spacer(1, 6))
-
-        story.append(Paragraph("Tableau 3. Phase d’optimisation", styles["Caption"]))
-        story.append(_mk_table(
-            _optimization_table(row_dict, _safe_float(meta.get("R_min_cost")) if meta else None),
-            total_width=usable_width,
-            font_size=8,
+        maintenance_type = _maintenance_type(_safe_float(row.get("beta")), row.get("maintenance_type"))
+        story.append(Paragraph(
+            _san(
+                f"Choix retenu dans le cas d'étude : {maintenance_type}. "
+                f"Ce choix résulte de la combinaison entre les paramètres fiabilistes, les intervalles calculés et la logique d'optimisation."
+            ),
+            styles["Justify"],
         ))
-        story.append(Spacer(1, 6))
+        story.append(Spacer(1, 4))
 
-        story.append(Paragraph("Décision finale", styles["Heading3"]))
-        story.append(Paragraph(_san(row_dict.get("optimization_note", "—")), styles["Justify"]))
+        story.append(Paragraph("Tableau 2. Paramètres qui ont influencé le choix", styles["Caption"]))
+        story.append(_mk_table(_parameter_influence_table(row, rel), total_width=usable_width, font_size=7))
         story.append(Spacer(1, 6))
-
-        if ttf_series:
-            story.append(Paragraph("Figure. Courbes fiabilistes avec intervalles retenus", styles["Caption"]))
-            story.append(_plot_optimization_curves(eq, rel, ttf_series, row_dict))
-            story.append(Spacer(1, 8))
 
         if idx < len(eqs) - 1:
             story.append(PageBreak())
