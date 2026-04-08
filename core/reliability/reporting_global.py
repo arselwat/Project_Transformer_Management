@@ -683,7 +683,7 @@ def export_global_analysis_report_pdf(
             story.append(Paragraph(_san(legend), styles["Justify"]))
             story.append(Spacer(1, 5))
         for key, label in [("trend_graphical", "Tableau 1.1 Méthode graphique"), ("trend_mk", "Tableau 1.2 Test de Mann-Kendall"), ("trend_laplace", "Tableau 1.3 Test de Laplace"), ("trend_mil", "Tableau 1.4 MIL-HDBK-189"), ("trend_decision", "Tableau 1.5 Décision de tendance"), ("tableau_tendance", "Tableau 1.x Synthèse tendance")]:
-            df = tables.get(key)
+            df = tables.get(key )
             if isinstance(df, pd.DataFrame) and not df.empty:
                 _render_table_block(story, label, df, styles, usable_width, max_rows=12, fixed_columns=None)
 
