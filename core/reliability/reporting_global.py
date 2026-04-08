@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from pathlib import Path
 from datetime import datetime
-from io import BytesIO
 from typing import Any, Dict, Optional, List, Tuple
 
 import numpy as np
@@ -11,6 +10,7 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from scipy import stats as sst
 
 try:
     from reportlab.lib.pagesizes import A4, landscape
@@ -25,7 +25,6 @@ try:
         Table,
         TableStyle,
         PageBreak,
-        Image,
     )
     HAVE_REPORTLAB = True
 except Exception:
@@ -212,17 +211,16 @@ def _mk_table(data: list[list[str]], total_width: float, font_size: int = 7) -> 
     return table
 
 
-def _fig_to_rl_image(fig, width_mm: float = 165):
-    bio = BytesIO()
-    fig.savefig(bio, format="png", dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    bio.seek(0)
-    img = Image(bio)
-    width = width_mm * mm
-    ratio = img.imageHeight / max(img.imageWidth, 1)
-    img.drawWidth = width
-    img.drawHeight = width * ratio
-    return img
+
+
+def _safe_float(value: Any) -> Optional[float]:
+    try:
+        numeric = float(value)
+        if np.isnan(numeric) or np.isinf(numeric):
+            return None
+        return numeric
+    except Exception:
+        return None
 
 
 def _set_plot_style(fig, ax):
@@ -233,80 +231,137 @@ def _set_plot_style(fig, ax):
         spine.set_linewidth(0.8)
 
 
-def _build_graphical_trend_plot(ttf_series: List[float], reliability_result: Dict[str, Any]):
+def _get_distribution_and_parameters(reliability_result: Dict[str, Any]):
+    if str(reliability_result.get("model") or "").upper() != "RP":
+        return None, None
+    distribution_name = reliability_result.get("distribution")
+    raw_parameters = (reliability_result.get("params") or {}).get("raw")
+    if not raw_parameters:
+        return None, None
+    if distribution_name == "expon":
+        return sst.expon, raw_parameters
+    if distribution_name == "norm":
+        return sst.norm, raw_parameters
+    if distribution_name == "lognorm":
+        return sst.lognorm, raw_parameters
+    if distribution_name in {"weibull_2p", "weibull_3p"}:
+        return sst.weibull_min, raw_parameters
+    return None, None
+
+
+def _compute_rp_curve(reliability_result: Dict[str, Any], time_axis: np.ndarray) -> Optional[np.ndarray]:
+    distribution_object, distribution_parameters = _get_distribution_and_parameters(reliability_result)
+    if distribution_object is None or distribution_parameters is None:
+        return None
+    try:
+        return np.asarray(distribution_object.sf(time_axis, *distribution_parameters), dtype=float)
+    except Exception:
+        return None
+
+
+def _compute_nhpp_curve(reliability_result: Dict[str, Any], time_axis: np.ndarray) -> Optional[np.ndarray]:
+    parameters = reliability_result.get("params", {}) or {}
+    beta_value = _safe_float(parameters.get("beta"))
+    eta_value = _safe_float(parameters.get("eta"))
+    if beta_value is None or eta_value is None or beta_value <= 0 or eta_value <= 0:
+        return None
+    safe_time_axis = np.maximum(time_axis, 1e-6)
+    cumulative_events = (safe_time_axis / eta_value) ** beta_value
+    return np.exp(-cumulative_events)
+
+
+def _compute_bpp_curve(reliability_result: Dict[str, Any], ttf_series: list[float], time_axis: np.ndarray) -> Optional[np.ndarray]:
+    parameters = reliability_result.get("params", {}) or {}
+    mu_value = _safe_float(parameters.get("mu"))
+    alpha_value = _safe_float(parameters.get("alpha"))
+    beta_kernel_value = _safe_float(parameters.get("beta_kernel"))
+    if mu_value is None or alpha_value is None or beta_kernel_value is None:
+        return None
+    if mu_value < 0 or alpha_value < 0 or beta_kernel_value <= 0:
+        return None
     event_times = np.cumsum(np.asarray(ttf_series, dtype=float))
-    index = np.arange(1, len(event_times) + 1, dtype=float)
-    graph = (reliability_result.get("tests", {}) or {}).get("trend_graphical", {}) or {}
-    slope = float(graph.get("slope_loglog", 1.0) or 1.0)
-    intercept = float(graph.get("intercept_loglog", 0.0) or 0.0)
-    r2 = graph.get("r2")
-    direction = str(graph.get("direction", "none"))
+    if event_times.size == 0:
+        return None
+    safe_time_axis = np.maximum(time_axis, 1e-6)
+    intensity = np.full_like(safe_time_axis, fill_value=mu_value, dtype=float)
+    for event_time in event_times:
+        mask = safe_time_axis >= event_time
+        if np.any(mask):
+            intensity[mask] += alpha_value * np.exp(-beta_kernel_value * (safe_time_axis[mask] - event_time))
+    cumulative_intensity = np.zeros_like(safe_time_axis, dtype=float)
+    if len(safe_time_axis) > 1:
+        delta = np.diff(safe_time_axis)
+        trapezoids = 0.5 * (intensity[1:] + intensity[:-1]) * delta
+        cumulative_intensity[1:] = np.cumsum(trapezoids)
+    return np.exp(-cumulative_intensity)
 
-    fig, ax = plt.subplots(figsize=(7.8, 4.8), dpi=140)
+
+def _compute_model_reliability_curve(reliability_result: Dict[str, Any], ttf_series: list[float], time_axis: np.ndarray) -> Optional[np.ndarray]:
+    model_name = str(reliability_result.get("model") or "").upper()
+    if model_name == "RP":
+        return _compute_rp_curve(reliability_result, time_axis)
+    if model_name == "NHPP":
+        return _compute_nhpp_curve(reliability_result, time_axis)
+    if model_name == "BPP":
+        return _compute_bpp_curve(reliability_result, ttf_series, time_axis)
+    return None
+
+
+def _build_time_horizon(reliability_result: Dict[str, Any], ttf_series: list[float], summary_row: Dict[str, Any]) -> float:
+    vals = np.asarray(ttf_series, dtype=float)
+    vals = vals[np.isfinite(vals)]
+    vals = vals[vals > 0]
+    if vals.size == 0:
+        base = 100.0
+    else:
+        base = max(50.0, float(np.max(vals)) * 2.0, float(np.mean(vals)) * 6.0, float(np.quantile(vals, 0.90)) * 4.0)
+    eta = _safe_float((reliability_result.get("params") or {}).get("eta"))
+    if eta is not None and eta > 0:
+        base = max(base, eta * 1.5)
+    for key in ["T_R_h", "T_cost_h", "T_recommended_h"]:
+        current = _safe_float(summary_row.get(key))
+        if current is not None and current > 0:
+            base = max(base, current * 1.25)
+    return base
+
+
+def _build_optimized_curve_plot(ttf_series: list[float], reliability_result: Dict[str, Any], summary_row: Dict[str, Any]):
+    if not ttf_series:
+        return None, "Aucune courbe d’optimisation disponible."
+    tmax = _build_time_horizon(reliability_result, ttf_series, summary_row)
+    t = np.linspace(1e-6, max(tmax, 1.0), 350)
+    y = _compute_model_reliability_curve(reliability_result, ttf_series, t)
+    if y is None:
+        return None, "Aucune courbe d’optimisation disponible."
+
+    fig, ax = plt.subplots(figsize=(8.6, 4.9), dpi=140)
     _set_plot_style(fig, ax)
-    ax.scatter(event_times, index, s=30, color="#1f77b4", edgecolor="#1f77b4", label="Défaillances cumulées", zorder=3)
-    if len(event_times) >= 2:
-        fitted = np.exp(intercept + slope * np.log(event_times))
-        ax.plot(event_times, fitted, color="#d62728", linewidth=2.4, label=f"Ajustement log-log | pente={_fmt(slope,2)} | R²={_fmt(r2,3)}", zorder=2)
-    ax.set_xscale("log")
-    ax.set_yscale("log")
-    ax.set_xlabel("Temps cumulé t (h)")
-    ax.set_ylabel("Nombre cumulé N(t)")
-    ax.set_title("Méthode graphique de tendance")
-    ax.grid(True, which="both", alpha=0.28)
-    ax.legend(fontsize=8)
-    fig.tight_layout()
-    legend = (
-        f"Pente log-log = {_fmt(slope,2)} ; direction = {direction}. Une pente > 1 traduit une tendance croissante ; "
-        f"une pente < 1 traduit une tendance décroissante ; proche de 1, il n’y a pas de tendance nette."
-    )
-    return fig, legend
+    beta = _fmt(summary_row.get("beta"), 2)
+    eta = _fmt(summary_row.get("eta_h"), 1)
+    gamma = _fmt(summary_row.get("gamma_h"), 1)
+    ax.plot(t, y, linewidth=2.2, color="#1f77b4", label=f"Courbe du modèle retenu | beta={beta}, eta={eta}, gamma={gamma}")
 
+    tr = _safe_float(summary_row.get("T_R_h"))
+    tc = _safe_float(summary_row.get("T_cost_h"))
+    trec = _safe_float(summary_row.get("T_recommended_h"))
+    if trec is not None:
+        ax.axvline(trec, color="green", linestyle="-", linewidth=2.0, label=f"T_recommandé = {_fmt(trec,1)} h")
+    if tr is not None:
+        ax.axvline(tr, color=("green" if trec is not None and abs(tr-trec) < 1e-9 else "red"), linestyle="--", linewidth=1.4, label=f"T_R = {_fmt(tr,1)} h")
+    if tc is not None:
+        ax.axvline(tc, color=("green" if trec is not None and abs(tc-trec) < 1e-9 else "red"), linestyle=":", linewidth=1.6, label=f"T_cost = {_fmt(tc,1)} h")
 
-def _build_graphical_dependence_plot(ttf_series: List[float], reliability_result: Dict[str, Any]):
-    x = np.asarray(ttf_series[:-1], dtype=float)
-    y = np.asarray(ttf_series[1:], dtype=float)
-    graph = (reliability_result.get("tests", {}) or {}).get("dependence_graphical", {}) or {}
-    slope = float(graph.get("slope", 0.0) or 0.0)
-    intercept = float(graph.get("intercept", 0.0) or 0.0)
-    r2 = graph.get("r2")
-    lag1_r = graph.get("lag1_r")
-    direction = str(graph.get("direction", "none"))
-
-    fig, ax = plt.subplots(figsize=(7.8, 4.8), dpi=140)
-    _set_plot_style(fig, ax)
-    ax.scatter(x, y, s=30, color="#1f77b4", edgecolor="#1f77b4", label="Lag plot TTFᵢ vs TTFᵢ₊₁", zorder=3)
-    if len(x) >= 2:
-        xs = np.linspace(float(np.min(x)), float(np.max(x)), 150)
-        ys = intercept + slope * xs
-        ax.plot(xs, ys, color="#d62728", linewidth=2.4, label=f"Droite ajustée | pente={_fmt(slope,2)} | R²={_fmt(r2,3)}", zorder=2)
-    ax.set_xlabel("TTFᵢ (h)")
-    ax.set_ylabel("TTFᵢ₊₁ (h)")
-    ax.set_title("Méthode graphique de dépendance")
+    ax.set_xlabel("Temps (heures)")
+    ax.set_ylabel("R(t)")
+    ax.set_title("Courbe optimisée")
     ax.grid(True, alpha=0.28)
     ax.legend(fontsize=8)
     fig.tight_layout()
     legend = (
-        f"Corrélation lag-1 = {_fmt(lag1_r,3)} ; direction = {direction}. Une corrélation positive forte suggère une dépendance entre événements successifs."
+        f"La courbe de fiabilité est tracée à partir du modèle retenu. La ligne verte correspond à l’intervalle recommandé, "
+        f"tandis que les repères rouges représentent les autres intervalles candidats (T_R et T_cost) lorsqu’ils ne sont pas retenus."
     )
     return fig, legend
-
-
-def _build_reliability_curves_plot(reliability_result: Dict[str, Any]):
-    curves = reliability_result.get("curves")
-    if not isinstance(curves, pd.DataFrame) or curves.empty:
-        return None, "Aucune courbe fiabiliste disponible."
-    fig, axes = plt.subplots(2, 2, figsize=(8.6, 6.2), dpi=140)
-    axes = axes.ravel()
-    defs = [("R_t", "Fiabilité R(t)"), ("F_t", "Défaillance F(t)"), ("f_t", "Densité f(t)"), ("h_t", "Taux λ(t) / h(t)")]
-    for ax, (col, title) in zip(axes, defs):
-        _set_plot_style(fig, ax)
-        ax.plot(curves["t"], curves[col], linewidth=2.0, color="#1f77b4")
-        ax.set_title(title)
-        ax.set_xlabel("Temps (h)")
-        ax.grid(True, alpha=0.28)
-    fig.tight_layout()
-    return fig, "Les quatre courbes résument la survie, la défaillance cumulée, la densité et le risque instantané du modèle retenu."
 
 
 def _build_executive_summary(summary_df: pd.DataFrame) -> list[str]:
@@ -664,74 +719,41 @@ def export_global_analysis_report_pdf(
     equipment_codes = list(detail_tables_by_eq.keys())
     for index, eq in enumerate(equipment_codes):
         tables = detail_tables_by_eq[eq]
-        payload = tables.get("__payload__", {}) or {}
-        reliability_result = payload.get("reliability", {}) or {}
-        ttf_series = payload.get("ttf_series", []) or []
         matching = summary_df[summary_df["equipment_code"].astype(str) == str(eq)]
         summary_row = matching.iloc[0].to_dict() if not matching.empty else {}
 
         story.append(Paragraph(_san(f"Équipement {eq}"), styles["Heading2"]))
-        story.append(Paragraph(_san(f"Décision finale : {summary_row.get('decision_finale', '—')} | Priorité : {summary_row.get('priorite', '—')} | Type de maintenance : {summary_row.get('maintenance_type', '—')}"), styles["Justify"]))
+        story.append(
+            Paragraph(
+                _san(
+                    f"Décision finale : {summary_row.get('decision_finale', '—')} | "
+                    f"Priorité : {summary_row.get('priorite', '—')} | "
+                    f"Type de maintenance : {summary_row.get('maintenance_type', '—')}"
+                ),
+                styles["Justify"],
+            )
+        )
         if summary_row.get("motif_decision"):
-            story.append(Paragraph(_san(f"Motif : {summary_row.get('motif_decision')}"), styles["Justify"]))
+            story.append(
+                Paragraph(
+                    _san(f"Motif : {summary_row.get('motif_decision')}"),
+                    styles["Justify"],
+                )
+            )
         story.append(Spacer(1, 6))
 
-        story.append(Paragraph("1. Tendance", styles["Heading3"]))
-        if len(ttf_series) >= 3:
-            fig, legend = _build_graphical_trend_plot(ttf_series, reliability_result)
-            story.append(_fig_to_rl_image(fig, width_mm=165))
-            story.append(Paragraph(_san(legend), styles["Justify"]))
-            story.append(Spacer(1, 5))
-        for key, label in [("trend_graphical", "Tableau 1.1 Méthode graphique"), ("trend_mk", "Tableau 1.2 Test de Mann-Kendall"), ("trend_laplace", "Tableau 1.3 Test de Laplace"), ("trend_mil", "Tableau 1.4 MIL-HDBK-189"), ("trend_decision", "Tableau 1.5 Décision de tendance"), ("tableau_tendance", "Tableau 1.x Synthèse tendance")]:
-            df = tables.get(key )
-            if isinstance(df, pd.DataFrame) and not df.empty:
-                _render_table_block(story, label, df, styles, usable_width, max_rows=12, fixed_columns=None)
-
-        story.append(Paragraph("2. Dépendance", styles["Heading3"]))
-        if len(ttf_series) >= 3:
-            fig, legend = _build_graphical_dependence_plot(ttf_series, reliability_result)
-            story.append(_fig_to_rl_image(fig, width_mm=165))
-            story.append(Paragraph(_san(legend), styles["Justify"]))
-            story.append(Spacer(1, 5))
-        for key, label in [("dep_graphical", "Tableau 2.1 Méthode graphique"), ("dep_pearson", "Tableau 2.2 Test de Pearson"), ("dep_spearman", "Tableau 2.3 Test de Spearman"), ("dep_decision", "Tableau 2.4 Décision de dépendance"), ("tableau_dependance", "Tableau 2.x Synthèse dépendance")]:
+        for key, label, fixed_columns in ordered_trace_tables:
             df = tables.get(key)
             if isinstance(df, pd.DataFrame) and not df.empty:
-                _render_table_block(story, label, df, styles, usable_width, max_rows=12, fixed_columns=None)
-
-        story.append(Paragraph("3. Choix du modèle", styles["Heading3"]))
-        for key, label in [("process_choice", "Tableau 3.1 Processus retenu")]:
-            df = tables.get(key)
-            if isinstance(df, pd.DataFrame) and not df.empty:
-                _render_table_block(story, label, df, styles, usable_width, max_rows=10, fixed_columns=None)
-
-        story.append(Paragraph("4. Ajustement", styles["Heading3"]))
-        for key, label in [("fit_candidates", "Tableau 4.1 Comparaison des lois candidates"), ("fit_selected", "Tableau 4.2 Ajustement retenu")]:
-            df = tables.get(key)
-            if isinstance(df, pd.DataFrame) and not df.empty:
-                _render_table_block(story, label, df, styles, usable_width, max_rows=14, fixed_columns=None)
-
-        story.append(Paragraph("5. Paramètres fiabilistes", styles["Heading3"]))
-        for key, label in [("parameter_table", "Tableau 5.1 Paramètres calculés"), ("tableau_parametres", "Tableau 5.2 Synthèse des paramètres")]:
-            df = tables.get(key)
-            if isinstance(df, pd.DataFrame) and not df.empty:
-                _render_table_block(story, label, df, styles, usable_width, max_rows=14, fixed_columns=None)
-        fig, legend = _build_reliability_curves_plot(reliability_result)
-        if fig is not None:
-            story.append(_fig_to_rl_image(fig, width_mm=165))
-            story.append(Paragraph(_san(legend), styles["Justify"]))
-            story.append(Spacer(1, 5))
-
-        story.append(Paragraph("6. Optimisation", styles["Heading3"]))
-        for key, label in [("optimization_table", "Tableau 6.1 Résultats d’optimisation"), ("tableau_optimisation", "Tableau 6.2 Intervalle retenu")]:
-            df = tables.get(key)
-            if isinstance(df, pd.DataFrame) and not df.empty:
-                _render_table_block(story, label, df, styles, usable_width, max_rows=12, fixed_columns=None)
-
-        story.append(Paragraph("7. Décision finale", styles["Heading3"]))
-        for key, label in [("final_decision_table", "Tableau 7.1 Décision finale"), ("tableau_decision_finale", "Tableau 7.2 Synthèse de la décision")]:
-            df = tables.get(key)
-            if isinstance(df, pd.DataFrame) and not df.empty:
-                _render_table_block(story, label, df, styles, usable_width, max_rows=10, fixed_columns=None)
+                _render_table_block(
+                    story=story,
+                    label=label,
+                    df=df,
+                    styles=styles,
+                    total_width=usable_width,
+                    max_rows=25 if key != "fit_candidates" else 12,
+                    fixed_columns=fixed_columns,
+                )
 
         if index < len(equipment_codes) - 1:
             story.append(PageBreak())
