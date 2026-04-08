@@ -27,7 +27,7 @@ require_login()
 render_shell("pages/1_Sources_fully_linked_fixed.py")
 render_page_header(
     "Sources de données",
-    "Importer un fichier simple à une seule feuille contenant les données essentielles de fiabilité et thermiques.",
+    "Importer un fichier simple contenant uniquement les données essentielles de fiabilité.",
     "📥",
 )
 
@@ -106,13 +106,10 @@ REQUIRED_INPUT = [
     "equipment_code",
     "timestamp",
     "is_failure",
-    "temp_amb_C",
-    "charge_pct",
 ]
 
 OPTIONAL_INPUT = [
     "repair_time_hours",
-    "etat_ventilateurs",
 ]
 
 
@@ -178,20 +175,8 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
         "mttr_h": "repair_time_hours",
         "duree_rep_h": "repair_time_hours",
         "duree_reparation_h": "repair_time_hours",
-        "ambient_temp_c": "temp_amb_C",
-        "temp_ambiante_c": "temp_amb_C",
-        "temperature_ambiante": "temp_amb_C",
-        "temperature_ambiante_c": "temp_amb_C",
-        "temp_ambiante": "temp_amb_C",
-        "load_pct": "charge_pct",
-        "load_percent": "charge_pct",
-        "charge": "charge_pct",
-        "charge_percent": "charge_pct",
-        "charge_pourcent": "charge_pct",
-        "fan_status": "etat_ventilateurs",
-        "fans_status": "etat_ventilateurs",
-        "ventilateurs": "etat_ventilateurs",
-        "etat_ventilateur": "etat_ventilateurs",
+        "time_repair": "repair_time_hours",
+        "repair_time": "repair_time_hours",
     }
 
     cols = {str(c).lower().strip(): c for c in df.columns}
@@ -250,9 +235,6 @@ def _prepare_single_sheet(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     work["timestamp"] = pd.to_datetime(work["timestamp"], errors="coerce")
     work["is_failure"] = _coerce_bool01(work["is_failure"])
     work["repair_time_hours"] = pd.to_numeric(work["repair_time_hours"], errors="coerce")
-    work["temp_amb_C"] = pd.to_numeric(work["temp_amb_C"], errors="coerce")
-    work["charge_pct"] = pd.to_numeric(work["charge_pct"], errors="coerce")
-    work["etat_ventilateurs"] = _coerce_bool01(work["etat_ventilateurs"])
 
     work = work[work["equipment_code"].notna()].copy()
     work = work[work["equipment_code"] != ""].copy()
@@ -264,12 +246,6 @@ def _prepare_single_sheet(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     if work["timestamp"].isna().all():
         errors.append("Toutes les dates de la colonne timestamp sont invalides.")
 
-    if work["temp_amb_C"].isna().all():
-        errors.append("La colonne temp_amb_C ne contient aucune valeur numérique valide.")
-
-    if work["charge_pct"].isna().all():
-        errors.append("La colonne charge_pct ne contient aucune valeur numérique valide.")
-
     if work["is_failure"].isin([0, 1]).sum() == 0:
         errors.append("La colonne is_failure ne contient aucune valeur exploitable.")
 
@@ -280,7 +256,6 @@ def _prepare_single_sheet(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
         "timestamp",
         "is_failure",
         "repair_time_hours",
-       
     ]
     work = work[ordered_cols]
 
@@ -361,18 +336,12 @@ def build_project_frames_from_single_sheet(df: pd.DataFrame) -> Dict[str, pd.Dat
         ]
     ]
 
-    thermal_timeseries = source_data[
-        ["equipment_code", "timestamp", "temp_amb_C", "charge_pct", "etat_ventilateurs"]
-    ].copy()
-    thermal_timeseries = thermal_timeseries.rename(columns={"equipment_code": "asset_id"})
-
     failures_ttf = build_ttf_from_single_sheet(source_data)
 
     frames: Dict[str, pd.DataFrame] = {
         "source_data": source_data,
         "asset_info": asset_info,
         "events_history": events_history,
-        "thermal_timeseries": thermal_timeseries,
         "failures_ttf": failures_ttf,
     }
     return frames
@@ -402,10 +371,9 @@ with tab_upload:
     st.subheader("Importer un fichier")
     st.caption(
         "Format attendu : une seule feuille avec les colonnes "
-        "`equipment_code`, `timestamp`, `is_failure`, `temp_amb_C`, `charge_pct` "
-        "et, si disponible, `repair_time_hours`, `etat_ventilateurs`."
+        "`equipment_code`, `timestamp`, `is_failure` "
+        "et, si disponible, `repair_time_hours`."
     )
-    st.info("La température du point chaud n'est pas demandée ici car elle est calculée par le logiciel.")
 
     up = st.file_uploader("Fichier CSV ou XLSX à une seule feuille", type=["csv", "xlsx"])
 
