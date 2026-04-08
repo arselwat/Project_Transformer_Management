@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from datetime import datetime
+from io import BytesIO
 from typing import Any, Dict, Optional, List, Tuple
 
 import numpy as np
@@ -25,6 +26,7 @@ try:
         Table,
         TableStyle,
         PageBreak,
+        Image,
     )
     HAVE_REPORTLAB = True
 except Exception:
@@ -229,6 +231,111 @@ def _set_plot_style(fig, ax):
     for spine in ax.spines.values():
         spine.set_color("#666666")
         spine.set_linewidth(0.8)
+
+
+def _fig_to_rl_image(fig, width_mm: float = 165):
+    bio = BytesIO()
+    fig.savefig(bio, format="png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    bio.seek(0)
+    img = Image(bio)
+    width = width_mm * mm
+    ratio = img.imageHeight / max(img.imageWidth, 1)
+    img.drawWidth = width
+    img.drawHeight = width * ratio
+    return img
+
+
+def _build_graphical_trend_plot(ttf_series: List[float], reliability_result: Dict[str, Any]):
+    event_times = np.cumsum(np.asarray(ttf_series, dtype=float))
+    index = np.arange(1, len(event_times) + 1, dtype=float)
+    graph = (reliability_result.get("tests", {}) or {}).get("trend_graphical", {}) or {}
+    slope = float(graph.get("slope_loglog", 1.0) or 1.0)
+    intercept = float(graph.get("intercept_loglog", 0.0) or 0.0)
+    r2 = graph.get("r2")
+    direction = str(graph.get("direction", "none"))
+
+    fig, ax = plt.subplots(figsize=(7.8, 4.8), dpi=140)
+    _set_plot_style(fig, ax)
+    ax.scatter(event_times, index, s=30, color="#1f77b4", edgecolor="#1f77b4", label="Défaillances cumulées", zorder=3)
+    if len(event_times) >= 2:
+        fitted = np.exp(intercept + slope * np.log(event_times))
+        ax.plot(
+            event_times,
+            fitted,
+            color="#d62728",
+            linewidth=2.4,
+            label=f"Ajustement log-log | pente={_fmt(slope,2)} | R²={_fmt(r2,3)}",
+            zorder=2,
+        )
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel("Temps cumulé t (h)")
+    ax.set_ylabel("Nombre cumulé N(t)")
+    ax.set_title("Méthode graphique de tendance")
+    ax.grid(True, which="both", alpha=0.28)
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    legend = (
+        f"Pente log-log = {_fmt(slope,2)} ; direction = {direction}. "
+        f"Une pente > 1 traduit une tendance croissante ; "
+        f"une pente < 1 traduit une tendance décroissante ; proche de 1, il n'y a pas de tendance nette."
+    )
+    return fig, legend
+
+
+def _build_graphical_dependence_plot(ttf_series: List[float], reliability_result: Dict[str, Any]):
+    x = np.asarray(ttf_series[:-1], dtype=float)
+    y = np.asarray(ttf_series[1:], dtype=float)
+    graph = (reliability_result.get("tests", {}) or {}).get("dependence_graphical", {}) or {}
+    slope = float(graph.get("slope", 0.0) or 0.0)
+    intercept = float(graph.get("intercept", 0.0) or 0.0)
+    r2 = graph.get("r2")
+    lag1_r = graph.get("lag1_r")
+    direction = str(graph.get("direction", "none"))
+
+    fig, ax = plt.subplots(figsize=(7.8, 4.8), dpi=140)
+    _set_plot_style(fig, ax)
+    ax.scatter(x, y, s=30, color="#1f77b4", edgecolor="#1f77b4", label="Lag plot TTFᵢ vs TTFᵢ₊₁", zorder=3)
+    if len(x) >= 2:
+        xs = np.linspace(float(np.min(x)), float(np.max(x)), 150)
+        ys = intercept + slope * xs
+        ax.plot(
+            xs,
+            ys,
+            color="#d62728",
+            linewidth=2.4,
+            label=f"Droite ajustée | pente={_fmt(slope,2)} | R²={_fmt(r2,3)}",
+            zorder=2,
+        )
+    ax.set_xlabel("TTFᵢ (h)")
+    ax.set_ylabel("TTFᵢ₊₁ (h)")
+    ax.set_title("Méthode graphique de dépendance")
+    ax.grid(True, alpha=0.28)
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    legend = (
+        f"Corrélation lag-1 = {_fmt(lag1_r,3)} ; direction = {direction}. "
+        f"Une corrélation positive forte suggère une dépendance entre événements successifs."
+    )
+    return fig, legend
+
+
+def _build_reliability_curves_plot(reliability_result: Dict[str, Any]):
+    curves = reliability_result.get("curves")
+    if not isinstance(curves, pd.DataFrame) or curves.empty:
+        return None, "Aucune courbe fiabiliste disponible."
+    fig, axes = plt.subplots(2, 2, figsize=(8.6, 6.2), dpi=140)
+    axes = axes.ravel()
+    defs = [("R_t", "Fiabilité R(t)"), ("F_t", "Défaillance F(t)"), ("f_t", "Densité f(t)"), ("h_t", "Taux λ(t) / h(t)")]
+    for ax, (col, title) in zip(axes, defs):
+        _set_plot_style(fig, ax)
+        ax.plot(curves["t"], curves[col], linewidth=2.0, color="#1f77b4")
+        ax.set_title(title)
+        ax.set_xlabel("Temps (h)")
+        ax.grid(True, alpha=0.28)
+    fig.tight_layout()
+    return fig, "Les quatre courbes résument la survie, la défaillance cumulée, la densité et le risque instantané du modèle retenu."
 
 
 def _get_distribution_and_parameters(reliability_result: Dict[str, Any]):
@@ -754,6 +861,17 @@ def export_global_analysis_report_pdf(
                     max_rows=25 if key != "fit_candidates" else 12,
                     fixed_columns=fixed_columns,
                 )
+
+        payload = tables.get("__payload__", {}) or {}
+        reliability_result = payload.get("reliability", {}) or {}
+        ttf_series = payload.get("ttf_series", []) or []
+        if reliability_result and ttf_series:
+            fig_opt, legend_opt = _build_optimized_curve_plot(ttf_series, reliability_result, summary_row)
+            if fig_opt is not None:
+                story.append(Paragraph("Courbe optimisée", styles["Heading2"]))
+                story.append(_fig_to_rl_image(fig_opt, width_mm=180))
+                story.append(Paragraph(_san(legend_opt), styles["Justify"]))
+                story.append(Spacer(1, 8))
 
         if index < len(equipment_codes) - 1:
             story.append(PageBreak())
