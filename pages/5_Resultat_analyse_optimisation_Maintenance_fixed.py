@@ -6,6 +6,7 @@ from datetime import date, timedelta
 from io import BytesIO
 from typing import Any, Dict, List, Optional
 
+from core.reliability.reporting_global import _build_graphical_dependence_plot, _build_graphical_trend_plot, _build_reliability_curves_plot
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -890,7 +891,7 @@ with page_tab_2:
 
     st.markdown("### 1. Tendance")
     if len(ttf_series) >= 3:
-        trend_fig, trend_legend = build_graphical_trend_plot(ttf_series, reliability_result)
+        trend_fig, trend_legend = _build_graphical_trend_plot(ttf_series, reliability_result)
         st.pyplot(trend_fig, clear_figure=True)
         st.caption(trend_legend)
     trend_table = selected_tables.get("tableau_tendance", pd.DataFrame())
@@ -898,7 +899,7 @@ with page_tab_2:
 
     st.markdown("### 2. Dépendance")
     if len(ttf_series) >= 3:
-        dep_fig, dep_legend = build_graphical_dependence_plot(ttf_series, reliability_result)
+        dep_fig, dep_legend = _build_graphical_dependence_plot(ttf_series, reliability_result)
         st.pyplot(dep_fig, clear_figure=True)
         st.caption(dep_legend)
     dependence_table = selected_tables.get("tableau_dependance", pd.DataFrame())
@@ -923,7 +924,7 @@ with page_tab_2:
     st.dataframe(param_table, use_container_width=True, hide_index=True)
 
     st.markdown("### 6. Courbes fiabilistes")
-    rel_fig, rel_legend = build_reliability_curves_plot(reliability_result)
+    rel_fig, rel_legend = _build_reliability_curves_plot(reliability_result)
     if rel_fig is not None:
         st.pyplot(rel_fig, clear_figure=True)
     st.caption(rel_legend)
