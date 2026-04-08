@@ -269,6 +269,94 @@ def _build_influence_table(row: Dict[str, Any]):
     ]
 
 
+
+def _add_cahier_maintenance(story, styles, available_width: float):
+    _title(story, styles, "Cahier de maintenance", level=1, space_after_pt=4)
+    story.append(Paragraph(
+        SAN(
+            "Ce cahier sert de document de référence général pour le suivi de la maintenance d’un transformateur "
+            "de puissance. Il regroupe des rappels sur les types de maintenance, les contrôles électriques, "
+            "les inspections visuelles, les fréquences recommandées, les tableaux de suivi et les matériels à prévoir."
+        ),
+        styles["Justify"],
+    ))
+    story.append(Spacer(1, 8))
+
+    _title(story, styles, "1. Types de maintenance", level=3, space_after_pt=3)
+    story.append(Paragraph(
+        SAN(
+            "La maintenance préventive regroupe les actions planifiées destinées à limiter la probabilité de panne. "
+            "La maintenance conditionnelle repose sur l’observation de l’état réel de l’équipement. La maintenance "
+            "corrective intervient après apparition d’un défaut ou lorsqu’un écart significatif est observé. "
+            "La maintenance prédictive vise à anticiper le bon moment d’intervention à partir des données disponibles."
+        ),
+        styles["Justify"],
+    ))
+    story.append(Spacer(1, 6))
+
+    _title(story, styles, "2. Tableau - Essais électriques de référence", level=3, space_after_pt=4)
+    tbl1 = [
+        ["Test", "Méthode / appareil", "Valeur de référence", "Alerte", "Référence"],
+        ["Résistance d’isolement", "Mégohmmètre 5 kV", "> 1000 MΩ", "< 600 MΩ", "IEC 60076-3"],
+        ["Rapport de transformation", "TTR", "± 0,5 %", "> 0,5 %", "IEC 60076-1"],
+        ["Résistance d’enroulements", "Micro-ohmmètre", "Écart < 2 %", "> 2 %", "IEC 60076-1"],
+        ["Impédance de court-circuit", "Essai dédié", "10 à 12 %", "Δ > 3 %", "IEC 60076-5"],
+        ["Courant d’excitation", "Essai à vide", "≤ 0,5 % In", "> 1 % In", "Constructeur"],
+        ["Pertes à vide", "Essai", "Selon plaque", "Écart significatif", "Constructeur"],
+        ["Pertes en charge", "Essai", "Selon plaque", "Écart significatif", "Constructeur"],
+    ]
+    story.append(_mk_table(tbl1, widths=[4.5*cm, 4.4*cm, 3.0*cm, 3.0*cm, 3.2*cm], font_size=7, available_width=available_width))
+    story.append(Spacer(1, 6))
+
+    _title(story, styles, "3. Tableau - Inspection mécanique et visuelle", level=3, space_after_pt=4)
+    tbl2 = [
+        ["Contrôle", "Critère normal", "Alerte", "Critique"],
+        ["Niveau d’huile", "Niveau nominal", "Baisse lente", "Baisse rapide / fuite"],
+        ["État des isolateurs", "Propres et intacts", "Dépôts / traces", "Fissure / casse"],
+        ["Joints et brides", "Étanches", "Suintement", "Fuite active"],
+        ["Relais Buchholz", "RAS", "Présence de gaz", "Déclenchement / défaut"],
+        ["Bruit", "Stable", "Augmentation notable", "Claquements anormaux"],
+    ]
+    story.append(_mk_table(tbl2, widths=[4.6*cm, 4.5*cm, 4.0*cm, 4.0*cm], font_size=7, available_width=available_width))
+    story.append(Spacer(1, 6))
+
+    _title(story, styles, "4. Tableau - Fréquences recommandées des contrôles", level=3, space_after_pt=4)
+    tbl3 = [
+        ["Type de contrôle", "Fréquence recommandée"],
+        ["Inspection visuelle complète", "Mensuelle"],
+        ["Analyse d’huile", "Semestrielle"],
+        ["Essais électriques complets", "Annuelle"],
+        ["Contrôle OLTC", "Annuelle"],
+        ["Filtration / traitement d’huile si besoin", "Selon constat"],
+        ["Révision majeure", "Selon historique et criticité"],
+    ]
+    story.append(_mk_table(tbl3, widths=[8.4*cm, 8.4*cm], font_size=7, available_width=available_width))
+    story.append(Spacer(1, 6))
+
+    _title(story, styles, "5. Tableau de suivi de maintenance", level=3, space_after_pt=4)
+    header = ["Date", "Agent", "Paramètre contrôlé", "Valeur de référence", "Résultat", "État", "Observations"]
+    rows = [
+        ["", "", "Résistance d’isolement", "> 1000 MΩ", "", "", ""],
+        ["", "", "Rapport de transformation", "± 0,5 %", "", "", ""],
+        ["", "", "Résistance d’enroulements", "< 2 % diff. phases", "", "", ""],
+        ["", "", "Impédance de court-circuit", "± 2 % nominal", "", "", ""],
+        ["", "", "Courant d’excitation", "≤ 0,5 % In", "", "", ""],
+        ["", "", "Pertes à vide", "Selon plaque", "", "", ""],
+        ["", "", "Pertes en charge", "Selon plaque", "", "", ""],
+        ["", "", "Niveau d’huile", "Niveau nominal", "", "", ""],
+        ["", "", "État des isolateurs", "Propres / intacts", "", "", ""],
+        ["", "", "Relais Buchholz", "RAS", "", "", ""],
+    ]
+    story.append(_mk_table([header] + rows, widths=[1.5*cm, 2.2*cm, 4.4*cm, 4.3*cm, 2.1*cm, 1.6*cm, 2.7*cm], font_size=6.5, available_width=available_width))
+    story.append(Spacer(1, 8))
+
+    _title(story, styles, "6. Tableau - Pièces de rechange", level=3, space_after_pt=4)
+    data_sp = [["Catégorie", "Pièce de rechange", "Quantité recommandée", "Criticité", "Remarques"]]
+    for sp in SPARE_PARTS:
+        data_sp.append([SAN(sp["categorie"]), SAN(sp["piece"]), SAN(sp["qte_reco"]), SAN(sp["criticite"]), SAN(sp["remarques"])])
+    story.append(_mk_table(data_sp, available_width=available_width, font_size=7))
+    story.append(Spacer(1, 10))
+
 def _apply_critical_style(table, data: List[List[Any]], priority_col: Optional[int] = None):
     if not HAVE_REPORTLAB or colors is None:
         return table
@@ -464,6 +552,8 @@ def export_pm_plan_with_kits_pdf(
     story.append(Paragraph(SAN(title), styles["Title"]))
     story.append(Paragraph(SAN(datetime.datetime.now().strftime("%d/%m/%Y %H:%M")), styles["BodyText"]))
     story.append(Spacer(1, 10))
+
+    _add_cahier_maintenance(story, styles, available_width)
 
     _title(story, styles, "Résumé du plan de maintenance", level=2, space_after_pt=4)
     story.append(Paragraph(
