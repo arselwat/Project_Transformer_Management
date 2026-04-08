@@ -637,7 +637,7 @@ def _fallback_fpdf(
         pdf.cell(0, 6, "Paramètres de calcul", ln=1)
         pdf.set_font("Arial", "", 9)
         for key, value in meta.items():
-            pdf.multi_cell(0, 5, _san(f"- {key}: {value}"))
+            pdf.multi_cell(0, 5, _san(f"- {key }: {value}"))
         pdf.ln(2)
 
     pdf.set_font("Arial", "B", 11)
