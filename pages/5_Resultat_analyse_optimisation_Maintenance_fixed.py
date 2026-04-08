@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 from pathlib import Path
@@ -292,6 +291,17 @@ def simple_df(rows: List[Dict[str, Any]]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+# -----------------------------------------------------------------------------
+# Plot helpers (blue points, red fitted line)
+# -----------------------------------------------------------------------------
+def _set_plot_style(fig, ax):
+    fig.patch.set_facecolor("white")
+    ax.set_facecolor("white")
+    for spine in ax.spines.values():
+        spine.set_color("#666666")
+        spine.set_linewidth(0.8)
+
+
 def build_graphical_trend_plot(ttf_series: List[float], reliability_result: Dict[str, Any]):
     event_times = np.cumsum(np.asarray(ttf_series, dtype=float))
     index = np.arange(1, len(event_times) + 1, dtype=float)
@@ -301,23 +311,27 @@ def build_graphical_trend_plot(ttf_series: List[float], reliability_result: Dict
     r2 = safe_float(graph.get("r2"), None)
     direction = str(graph.get("direction", "none"))
 
-    fig, ax = plt.subplots(figsize=(8.5, 5.0))
-    ax.scatter(event_times, index, s=32, label="Défaillances cumulées")
+    fig, ax = plt.subplots(figsize=(8.8, 5.2), dpi=140)
+    _set_plot_style(fig, ax)
+    ax.scatter(event_times, index, s=34, color="#1f77b4", edgecolor="#1f77b4", label="Défaillances cumulées", zorder=3)
     if len(event_times) >= 2:
         fitted = np.exp(intercept + slope * np.log(event_times))
-        ax.plot(event_times, fitted, linewidth=2.0, label=f"Ajustement log-log | pente={format_number(slope,2)} | R²={format_number(r2,3)}")
+        ax.plot(event_times, fitted, color="#d62728", linewidth=2.4, label=f"Ajustement log-log | pente={format_number(slope,2)} | R²={format_number(r2,3)}", zorder=2)
     ax.set_xscale("log")
     ax.set_yscale("log")
     ax.set_xlabel("Temps cumulé t (h)")
     ax.set_ylabel("Nombre cumulé N(t)")
-    ax.set_title("Méthode graphique de tendance (Crow-AMSAA / log N(t) vs log t)")
-    ax.grid(True, which="both", alpha=0.3)
-    ax.legend(fontsize=8)
+    ax.set_title("Méthode graphique de tendance", pad=10)
+    ax.grid(True, which="both", alpha=0.28)
+    legend = ax.legend(fontsize=9, frameon=True)
+    legend.get_frame().set_facecolor("white")
+    legend.get_frame().set_alpha(0.95)
     legend_text = (
         f"Pente log-log = {format_number(slope,2)} ; direction = {direction}. "
         f"Si la pente est supérieure à 1, la tendance est croissante ; si elle est inférieure à 1, "
         f"la tendance est décroissante ; proche de 1, il n’y a pas de tendance nette."
     )
+    fig.tight_layout()
     return fig, legend_text
 
 
@@ -331,21 +345,25 @@ def build_graphical_dependence_plot(ttf_series: List[float], reliability_result:
     lag1_r = safe_float(graph.get("lag1_r"), None)
     direction = str(graph.get("direction", "none"))
 
-    fig, ax = plt.subplots(figsize=(8.5, 5.0))
-    ax.scatter(x, y, s=32, label="Lag plot TTFᵢ vs TTFᵢ₊₁")
+    fig, ax = plt.subplots(figsize=(8.8, 5.2), dpi=140)
+    _set_plot_style(fig, ax)
+    ax.scatter(x, y, s=34, color="#1f77b4", edgecolor="#1f77b4", label="Lag plot TTFᵢ vs TTFᵢ₊₁", zorder=3)
     if len(x) >= 2:
         xs = np.linspace(float(np.min(x)), float(np.max(x)), 150)
         ys = intercept + slope * xs
-        ax.plot(xs, ys, linewidth=2.0, label=f"Droite ajustée | pente={format_number(slope,2)} | R²={format_number(r2,3)}")
+        ax.plot(xs, ys, color="#d62728", linewidth=2.4, label=f"Droite ajustée | pente={format_number(slope,2)} | R²={format_number(r2,3)}", zorder=2)
     ax.set_xlabel("TTFᵢ (h)")
     ax.set_ylabel("TTFᵢ₊₁ (h)")
-    ax.set_title("Méthode graphique de dépendance (lag plot)")
-    ax.grid(True, alpha=0.3)
-    ax.legend(fontsize=8)
+    ax.set_title("Méthode graphique de dépendance", pad=10)
+    ax.grid(True, alpha=0.28)
+    legend = ax.legend(fontsize=9, frameon=True)
+    legend.get_frame().set_facecolor("white")
+    legend.get_frame().set_alpha(0.95)
     legend_text = (
         f"Corrélation lag-1 = {format_number(lag1_r,3)} ; direction = {direction}. "
         f"Une corrélation positive forte suggère une dépendance entre événements successifs."
     )
+    fig.tight_layout()
     return fig, legend_text
 
 
@@ -354,14 +372,15 @@ def build_reliability_curves_plot(reliability_result: Dict[str, Any]):
     if not isinstance(curves, pd.DataFrame) or curves.empty:
         return None, "Aucune courbe fiabiliste disponible."
 
-    fig, axes = plt.subplots(2, 2, figsize=(9.5, 6.2))
+    fig, axes = plt.subplots(2, 2, figsize=(9.8, 6.4), dpi=140)
     axes = axes.ravel()
     defs = [("R_t", "Fiabilité R(t)"), ("F_t", "Défaillance F(t)"), ("f_t", "Densité f(t)"), ("h_t", "Taux λ(t) / h(t)")]
     for ax, (col, title) in zip(axes, defs):
-        ax.plot(curves["t"], curves[col], linewidth=2)
+        _set_plot_style(fig, ax)
+        ax.plot(curves["t"], curves[col], linewidth=2.0, color="#1f77b4")
         ax.set_title(title)
         ax.set_xlabel("Temps (h)")
-        ax.grid(True, alpha=0.3)
+        ax.grid(True, alpha=0.28)
     fig.tight_layout()
     legend_text = (
         "Les quatre courbes résument le comportement du modèle retenu : R(t) pour la survie, F(t) pour la défaillance cumulée, "
@@ -497,7 +516,6 @@ def build_fit_tables(reliability_result: Dict[str, Any]) -> Tuple[pd.DataFrame, 
         rows.append(
             {
                 "Modèle candidat": name,
-                "AIC": fit.get("aic"),
                 "KS p": fit.get("ks_p"),
                 "Chi2 p": fit.get("chi2_p"),
                 "CvM p": fit.get("cvm_p"),
@@ -509,7 +527,6 @@ def build_fit_tables(reliability_result: Dict[str, Any]) -> Tuple[pd.DataFrame, 
         rows.append(
             {
                 "Modèle candidat": reliability_result.get("distribution"),
-                "AIC": goodness.get("aic"),
                 "KS p": goodness.get("ks_p"),
                 "Chi2 p": goodness.get("chi2_p"),
                 "CvM p": goodness.get("cvm_p"),
@@ -519,7 +536,6 @@ def build_fit_tables(reliability_result: Dict[str, Any]) -> Tuple[pd.DataFrame, 
     selected = simple_df([
         {
             "Loi retenue": reliability_result.get("distribution"),
-            "AIC": (reliability_result.get("goodness", {}) or {}).get("aic"),
             "KS p": (reliability_result.get("goodness", {}) or {}).get("ks_p"),
             "Chi2 p": (reliability_result.get("goodness", {}) or {}).get("chi2_p"),
             "CvM p": (reliability_result.get("goodness", {}) or {}).get("cvm_p"),
@@ -578,7 +594,7 @@ def build_global_dependence_table(summary_dataframe: pd.DataFrame) -> pd.DataFra
 
 
 def build_global_fit_table(summary_dataframe: pd.DataFrame) -> pd.DataFrame:
-    cols = [c for c in ["equipment_code", "distribution", "aic", "ks_p", "chi2_p", "cvm_p", "goodness_accepted"] if c in summary_dataframe.columns]
+    cols = [c for c in ["equipment_code", "distribution", "ks_p", "chi2_p", "cvm_p", "goodness_accepted"] if c in summary_dataframe.columns]
     return summary_dataframe[cols].copy()
 
 
@@ -736,7 +752,6 @@ with st.spinner("Analyse globale en cours..."):
             "pearson_p": (tests.get("dependence_correlation", {}) or {}).get("pearson_p"),
             "spearman_r": (tests.get("dependence_correlation", {}) or {}).get("spearman_r"),
             "spearman_p": (tests.get("dependence_correlation", {}) or {}).get("spearman_p"),
-            "aic": goodness.get("aic"),
             "ks_p": goodness.get("ks_p"),
             "chi2_p": goodness.get("chi2_p"),
             "cvm_p": goodness.get("cvm_p"),
@@ -783,7 +798,6 @@ final_decisions = summary_dataframe.apply(lambda row: compute_final_decision_row
 summary_dataframe[["decision_finale", "motif_decision", "priority_score", "priorite"]] = pd.DataFrame(final_decisions.tolist(), index=summary_dataframe.index)
 summary_dataframe = summary_dataframe.sort_values(["priority_score", "equipment_code"], ascending=[False, True]).reset_index(drop=True)
 
-# enrich detail tables with optimization + final decision after summary exists
 for equipment_code, detail in detail_tables_by_equipment.items():
     selected_row = summary_dataframe[summary_dataframe["equipment_code"].astype(str) == str(equipment_code)]
     if selected_row.empty:
@@ -843,7 +857,6 @@ with tab2:
     selected_equipment_code = st.selectbox("Choisir un équipement", options=summary_dataframe["equipment_code"].tolist())
     selected_result = results_by_equipment[selected_equipment_code]
     selected_detail = detail_tables_by_equipment[selected_equipment_code]
-    selected_row = summary_dataframe[summary_dataframe["equipment_code"] == selected_equipment_code].iloc[0].to_dict()
     payload = selected_detail.get("__payload__", {}) or {}
     reliability_result = payload.get("reliability", {}) or {}
     ttf_series = payload.get("ttf_series", []) or []

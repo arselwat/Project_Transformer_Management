@@ -491,7 +491,6 @@ def _fit_table(reliability_result: Dict[str, Any]) -> List[List[Any]]:
     goodness = reliability_result.get("goodness", {}) or {}
     return [
         ["Indicateur", "Valeur", "Lecture"],
-        ["AIC", _fmt(goodness.get("aic"), 3), "Plus il est faible, plus le compromis ajustement/complexité est favorable."],
         ["KS p", _fmt(goodness.get("ks_p"), 4), "Valeur p du test de Kolmogorov-Smirnov."],
         ["Chi carré p", _fmt(goodness.get("chi2_p"), 4), "Valeur p du test du chi carré."],
         ["CvM p", _fmt(goodness.get("cvm_p"), 4), "Valeur p du test de Cramér-von Mises."],
@@ -586,8 +585,7 @@ def export_merged_report_pdf(
                 "Ce document regroupe exclusivement les indicateurs fiabilistes utilisés par la page Indicateurs. "
                 "Il présente la synthèse fiabiliste, les paramètres beta, eta et gamma, les grandeurs MTTF, MTBF et MTTR, "
                 "la disponibilité, le pipeline de décision, ainsi que les courbes R(t), F(t), f(t) et h(t). "
-                "Il est destiné à être partagé avec les équipes de maintenance pour faciliter la compréhension des résultats fiabilistes et la prise de décision."
-                
+                "Aucune section thermique n'est injectée dans ce rapport."
             ),
             styles["Justify"],
         )
