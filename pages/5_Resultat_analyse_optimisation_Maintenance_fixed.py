@@ -6,7 +6,7 @@ from datetime import date, timedelta
 from io import BytesIO
 from typing import Any, Dict, List, Optional
 
-from core.reliability.reporting_global import _build_graphical_dependence_plot, _build_graphical_trend_plot
+from core.reliability.reporting_global import _build_graphical_dependence_plot, _build_graphical_trend_plot, _build_reliability_curves_plot
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -924,7 +924,7 @@ with page_tab_2:
     st.dataframe(param_table, use_container_width=True, hide_index=True)
 
     st.markdown("### 6. Courbes fiabilistes")
-    rel_fig, rel_legend = build_reliability_curves_plot(reliability_result)
+    rel_fig, rel_legend = _build_reliability_curves_plot(reliability_result)
     if rel_fig is not None:
         st.pyplot(rel_fig, clear_figure=True)
     st.caption(rel_legend)
