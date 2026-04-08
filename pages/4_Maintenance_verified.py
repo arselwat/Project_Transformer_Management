@@ -31,8 +31,6 @@ render_page_header(
     "Choix moderne de maintenance, hiérarchisation des cas critiques et génération du rapport.",
     "🛠️",
 )
-
-
 st.markdown(
     """
     <style>
