@@ -849,6 +849,25 @@ def export_global_analysis_report_pdf(
             )
         story.append(Spacer(1, 6))
 
+        payload = tables.get("__payload__", {}) or {}
+        reliability_result = payload.get("reliability", {}) or {}
+        ttf_series = payload.get("ttf_series", []) or []
+
+        if reliability_result and ttf_series:
+            fig_trend, legend_trend = _build_graphical_trend_plot(ttf_series, reliability_result)
+            if fig_trend is not None:
+                story.append(Paragraph("Méthode graphique de tendance", styles["Heading2"]))
+                story.append(_fig_to_rl_image(fig_trend, width_mm=180))
+                story.append(Paragraph(_san(legend_trend), styles["Justify"]))
+                story.append(Spacer(1, 8))
+
+            fig_dep, legend_dep = _build_graphical_dependence_plot(ttf_series, reliability_result)
+            if fig_dep is not None:
+                story.append(Paragraph("Méthode graphique de dépendance", styles["Heading2"]))
+                story.append(_fig_to_rl_image(fig_dep, width_mm=180))
+                story.append(Paragraph(_san(legend_dep), styles["Justify"]))
+                story.append(Spacer(1, 8))
+
         for key, label, fixed_columns in ordered_trace_tables:
             df = tables.get(key)
             if isinstance(df, pd.DataFrame) and not df.empty:
@@ -862,9 +881,14 @@ def export_global_analysis_report_pdf(
                     fixed_columns=fixed_columns,
                 )
 
-        payload = tables.get("__payload__", {}) or {}
-        reliability_result = payload.get("reliability", {}) or {}
-        ttf_series = payload.get("ttf_series", []) or []
+        if reliability_result:
+            fig_rel, legend_rel = _build_reliability_curves_plot(reliability_result)
+            if fig_rel is not None:
+                story.append(Paragraph("Courbes fiabilistes", styles["Heading2"]))
+                story.append(_fig_to_rl_image(fig_rel, width_mm=180))
+                story.append(Paragraph(_san(legend_rel), styles["Justify"]))
+                story.append(Spacer(1, 8))
+
         if reliability_result and ttf_series:
             fig_opt, legend_opt = _build_optimized_curve_plot(ttf_series, reliability_result, summary_row)
             if fig_opt is not None:
