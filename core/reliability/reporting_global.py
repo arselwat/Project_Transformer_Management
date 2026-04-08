@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 from scipy import stats as sst
 
 try:
-    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.pagesizes import A4
     from reportlab.lib import colors
     from reportlab.lib.units import mm
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -557,6 +557,116 @@ def _split_dataframe_columns(
     return chunks
 
 
+def _guess_row_identifier(row: pd.Series, columns: List[str]) -> str:
+    preferred = [
+        "Test", "Méthode", "Variable", "Paramètre", "Modele candidat", "Loi retenue",
+        "Processus retenu", "Équipement", "equipment_code", "Modèle candidat", "Variable"
+    ]
+    for key in preferred:
+        if key in row.index:
+            value = str(row.get(key, "")).strip()
+            if value:
+                return value
+    if columns:
+        first_col = columns[0]
+        value = str(row.get(first_col, "")).strip()
+        if value:
+            return value
+    return "Élément"
+
+
+def _explain_parameter_name(parameter_name: str, table_label: str = "") -> str:
+    name = str(parameter_name).lower()
+    if "pente" in name or "beta_graph" in name:
+        return "Indique l’allure de la droite ou de la tendance observée."
+    if "r2" in name:
+        return "Mesure la qualité d’ajustement de la droite ou du modèle."
+    if "direction" in name:
+        return "Précise le sens global mis en évidence par le test ou le graphique."
+    if "p" in name and "valeur" in name:
+        return "Permet de juger si l’hypothèse nulle est rejetée au seuil choisi."
+    if "statistique" in name or name in {"z", "u", "r", "rho"}:
+        return "Statistique calculée par le test considéré."
+    if "decision" in name or "synthèse" in name:
+        return "Conclusion retenue pour cette étape du pipeline."
+    if "processus" in name or "modèle" in name or "loi" in name:
+        return "Choix retenu par le pipeline pour représenter le comportement des défaillances."
+    if "beta" in name:
+        return "Paramètre de forme décrivant la phase de vie ou la dynamique du processus."
+    if "eta" in name:
+        return "Paramètre d’échelle ou durée de vie caractéristique."
+    if "gamma" in name:
+        return "Paramètre de décalage temporel éventuel."
+    if "mttf" in name:
+        return "Temps moyen attendu avant défaillance."
+    if "mtbf" in name:
+        return "Temps moyen entre deux défaillances."
+    if "mttr" in name:
+        return "Temps moyen de réparation."
+    if "dispon" in name:
+        return "Part du temps pendant laquelle l’équipement reste disponible."
+    if "t_r" in name:
+        return "Intervalle issu du critère de fiabilité."
+    if "t_cost" in name:
+        return "Intervalle issu du critère économique."
+    if "t_recommand" in name or "recommand" in name:
+        return "Intervalle finalement retenu pour le planning."
+    if "coût" in name or "c_min" in name:
+        return "Contribution économique utilisée dans la décision."
+    if "fiabilité" in name or "r(t" in name:
+        return "Niveau de fiabilité associé à l’instant ou au scénario considéré."
+    if "tableau" in table_label.lower():
+        return "Valeur issue de cette étape du pipeline."
+    return "Valeur utile à l’interprétation de cette étape du pipeline."
+
+
+def _df_to_parameter_value_explanation(df: pd.DataFrame, table_label: str, max_rows: Optional[int] = None) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["Paramètre", "Valeur", "Explication"])
+
+    work = df.copy()
+    if max_rows is not None:
+        work = work.head(max_rows)
+
+    if len(work.columns) <= 3:
+        # Harmoniser les noms si possible
+        if len(work.columns) == 3:
+            out = work.copy()
+            out.columns = ["Paramètre", "Valeur", "Explication"]
+            return out
+        if len(work.columns) == 2:
+            out = work.copy()
+            out.columns = ["Paramètre", "Valeur"]
+            out["Explication"] = out["Paramètre"].apply(lambda x: _explain_parameter_name(str(x), table_label))
+            return out[["Paramètre", "Valeur", "Explication"]]
+
+    rows: List[Dict[str, Any]] = []
+    columns = list(work.columns)
+    for _, row in work.iterrows():
+        row_id = _guess_row_identifier(row, columns)
+        for col in columns:
+            value = row.get(col)
+            if pd.isna(value):
+                continue
+            value_str = str(value).strip()
+            if value_str == "":
+                continue
+            if str(col).strip() == row_id.strip():
+                # garder aussi l'identifiant si utile
+                parameter = str(col)
+            else:
+                parameter = f"{row_id} - {col}"
+            rows.append({
+                "Paramètre": parameter,
+                "Valeur": value,
+                "Explication": _explain_parameter_name(str(col), table_label),
+            })
+
+    if not rows:
+        return pd.DataFrame(columns=["Paramètre", "Valeur", "Explication"])
+    return pd.DataFrame(rows)
+
+
 def _render_table_block(
     story: list,
     label: str,
@@ -578,20 +688,12 @@ def _render_table_block(
     )
     story.append(Spacer(1, 5))
 
-    work = df.copy()
-    if max_rows is not None:
-        work = work.head(max_rows)
+    work = _df_to_parameter_value_explanation(df.copy(), label, max_rows=max_rows)
+    if work.empty:
+        return
 
-    if len(work.columns) > 8:
-        parts = _split_dataframe_columns(work, fixed_columns=fixed_columns, max_columns_per_part=5)
-        for part_label, part_df in parts:
-            story.append(Paragraph(_san(part_label), styles["Heading3"]))
-            story.append(_mk_table(_df_to_table_data(part_df), total_width=total_width, font_size=6))
-            story.append(Spacer(1, 4))
-    else:
-        font_size = 7 if len(work.columns) <= 5 else 6
-        story.append(_mk_table(_df_to_table_data(work), total_width=total_width, font_size=font_size))
-        story.append(Spacer(1, 6))
+    story.append(_mk_table(_df_to_table_data(work), total_width=total_width, font_size=7))
+    story.append(Spacer(1, 6))
 
 
 # ---------------------------------------------------------------------
@@ -612,7 +714,7 @@ def _fallback_fpdf(
     out_dir.mkdir(exist_ok=True, parents=True)
     out_path = out_dir / f"global_analysis_{datetime.now().strftime('%Y%m%d-%H%M')}.pdf"
 
-    pdf = FPDF(orientation="L", unit="mm", format="A4")
+    pdf = FPDF(orientation="P", unit="mm", format="A4")
     pdf.set_auto_page_break(auto=True, margin=12)
     pdf.add_page()
 
@@ -739,14 +841,14 @@ def export_global_analysis_report_pdf(
 
     doc = SimpleDocTemplate(
         str(out_path),
-        pagesize=landscape(A4),
+        pagesize=A4,
         topMargin=14 * mm,
         bottomMargin=12 * mm,
         leftMargin=10 * mm,
         rightMargin=10 * mm,
     )
 
-    usable_width = landscape(A4)[0] - (doc.leftMargin + doc.rightMargin)
+    usable_width = A4[0] - (doc.leftMargin + doc.rightMargin)
 
     story = []
 
@@ -857,14 +959,14 @@ def export_global_analysis_report_pdf(
             fig_trend, legend_trend = _build_graphical_trend_plot(ttf_series, reliability_result)
             if fig_trend is not None:
                 story.append(Paragraph("Méthode graphique de tendance", styles["Heading2"]))
-                story.append(_fig_to_rl_image(fig_trend, width_mm=180))
+                story.append(_fig_to_rl_image(fig_trend, width_mm=170))
                 story.append(Paragraph(_san(legend_trend), styles["Justify"]))
                 story.append(Spacer(1, 8))
 
             fig_dep, legend_dep = _build_graphical_dependence_plot(ttf_series, reliability_result)
             if fig_dep is not None:
                 story.append(Paragraph("Méthode graphique de dépendance", styles["Heading2"]))
-                story.append(_fig_to_rl_image(fig_dep, width_mm=180))
+                story.append(_fig_to_rl_image(fig_dep, width_mm=170))
                 story.append(Paragraph(_san(legend_dep), styles["Justify"]))
                 story.append(Spacer(1, 8))
 
@@ -885,7 +987,7 @@ def export_global_analysis_report_pdf(
             fig_rel, legend_rel = _build_reliability_curves_plot(reliability_result)
             if fig_rel is not None:
                 story.append(Paragraph("Courbes fiabilistes", styles["Heading2"]))
-                story.append(_fig_to_rl_image(fig_rel, width_mm=180))
+                story.append(_fig_to_rl_image(fig_rel, width_mm=170))
                 story.append(Paragraph(_san(legend_rel), styles["Justify"]))
                 story.append(Spacer(1, 8))
 
@@ -893,7 +995,7 @@ def export_global_analysis_report_pdf(
             fig_opt, legend_opt = _build_optimized_curve_plot(ttf_series, reliability_result, summary_row)
             if fig_opt is not None:
                 story.append(Paragraph("Courbe optimisée", styles["Heading2"]))
-                story.append(_fig_to_rl_image(fig_opt, width_mm=180))
+                story.append(_fig_to_rl_image(fig_opt, width_mm=170))
                 story.append(Paragraph(_san(legend_opt), styles["Justify"]))
                 story.append(Spacer(1, 8))
 
