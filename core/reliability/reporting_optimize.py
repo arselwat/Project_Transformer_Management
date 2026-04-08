@@ -11,6 +11,7 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from scipy import stats as sst
 
 try:
     from reportlab.lib.pagesizes import A4, landscape
@@ -220,49 +221,175 @@ def _pipe_line(pipe: dict) -> str:
     )
 
 
-def _plot_R_curves(fits: Dict[str, Any], intervals: Dict[str, Any]):
-    if not fits:
+def _get_distribution_and_parameters(reliability_result: Dict[str, Any]):
+    if str(reliability_result.get("model") or "").upper() != "RP":
+        return None, None
+    distribution_name = reliability_result.get("distribution")
+    raw_parameters = (reliability_result.get("params") or {}).get("raw")
+    if not raw_parameters:
+        return None, None
+    if distribution_name == "expon":
+        return sst.expon, raw_parameters
+    if distribution_name == "norm":
+        return sst.norm, raw_parameters
+    if distribution_name == "lognorm":
+        return sst.lognorm, raw_parameters
+    if distribution_name in {"weibull_2p", "weibull_3p"}:
+        return sst.weibull_min, raw_parameters
+    return None, None
+
+
+def _compute_rp_curve(reliability_result: Dict[str, Any], time_axis: np.ndarray) -> Optional[np.ndarray]:
+    distribution_object, distribution_parameters = _get_distribution_and_parameters(reliability_result)
+    if distribution_object is None or distribution_parameters is None:
+        return None
+    try:
+        return np.asarray(distribution_object.sf(time_axis, *distribution_parameters), dtype=float)
+    except Exception:
         return None
 
-    etas = [float(getattr(ft, "eta", 0.0) or 0.0) for ft in fits.values()]
-    tmax = max(etas) * 1.6 if etas and max(etas) > 0 else 1000.0
 
-    maybe = []
-    for _, item in (intervals or {}).items():
-        if isinstance(item, dict):
-            for key in ["T_R", "T_cost"]:
-                v = _safe_float(item.get(key))
-                if v is not None:
-                    maybe.append(v)
-    if maybe:
-        tmax = max(tmax, max(maybe) * 1.2)
+def _compute_nhpp_curve(reliability_result: Dict[str, Any], time_axis: np.ndarray) -> Optional[np.ndarray]:
+    parameters = reliability_result.get("params", {}) or {}
+    beta_value = _safe_float(parameters.get("beta"))
+    eta_value = _safe_float(parameters.get("eta"))
+    if beta_value is None or eta_value is None or beta_value <= 0 or eta_value <= 0:
+        return None
+    safe_time_axis = np.maximum(time_axis, 1e-6)
+    cumulative_events = (safe_time_axis / eta_value) ** beta_value
+    return np.exp(-cumulative_events)
 
-    t = np.linspace(0, max(tmax, 1.0), 350)
 
+def _compute_bpp_curve(reliability_result: Dict[str, Any], ttf_series: list[float], time_axis: np.ndarray) -> Optional[np.ndarray]:
+    parameters = reliability_result.get("params", {}) or {}
+    mu_value = _safe_float(parameters.get("mu"))
+    alpha_value = _safe_float(parameters.get("alpha"))
+    beta_kernel_value = _safe_float(parameters.get("beta_kernel"))
+    if mu_value is None or alpha_value is None or beta_kernel_value is None:
+        return None
+    if mu_value < 0 or alpha_value < 0 or beta_kernel_value <= 0:
+        return None
+    event_times = np.cumsum(np.asarray(ttf_series, dtype=float))
+    if event_times.size == 0:
+        return None
+    safe_time_axis = np.maximum(time_axis, 1e-6)
+    intensity = np.full_like(safe_time_axis, fill_value=mu_value, dtype=float)
+    for event_time in event_times:
+        mask = safe_time_axis >= event_time
+        if np.any(mask):
+            intensity[mask] += alpha_value * np.exp(-beta_kernel_value * (safe_time_axis[mask] - event_time))
+    cumulative_intensity = np.zeros_like(safe_time_axis, dtype=float)
+    if len(safe_time_axis) > 1:
+        delta = np.diff(safe_time_axis)
+        trapezoids = 0.5 * (intensity[1:] + intensity[:-1]) * delta
+        cumulative_intensity[1:] = np.cumsum(trapezoids)
+    return np.exp(-cumulative_intensity)
+
+
+def _compute_model_reliability_curve(reliability_result: Dict[str, Any], ttf_series: list[float], time_axis: np.ndarray) -> Optional[np.ndarray]:
+    model_name = str(reliability_result.get("model") or "").upper()
+    if model_name == "RP":
+        return _compute_rp_curve(reliability_result, time_axis)
+    if model_name == "NHPP":
+        return _compute_nhpp_curve(reliability_result, time_axis)
+    if model_name == "BPP":
+        return _compute_bpp_curve(reliability_result, ttf_series, time_axis)
+    return None
+
+
+def _build_time_horizon(reliability_result: Dict[str, Any], ttf_series: list[float], intervals: Dict[str, Any]) -> float:
+    vals = np.asarray(ttf_series, dtype=float)
+    vals = vals[np.isfinite(vals)]
+    vals = vals[vals > 0]
+    if vals.size == 0:
+        base = 100.0
+    else:
+        base = max(50.0, float(np.max(vals)) * 2.0, float(np.mean(vals)) * 6.0, float(np.quantile(vals, 0.90)) * 4.0)
+    eta = _safe_float((reliability_result.get("params") or {}).get("eta"))
+    if eta is not None and eta > 0:
+        base = max(base, eta * 1.5)
+    extras = []
+    if isinstance(intervals, dict):
+        for k in ["T_R", "T_cost", "T_recommended"]:
+            v = _safe_float(intervals.get(k))
+            if v is not None and v > 0:
+                extras.append(v)
+    if extras:
+        base = max(base, max(extras) * 1.25)
+    return base
+
+
+def _extract_ttf_series(df, eq: str) -> list[float]:
+    if df is None or getattr(df, 'empty', True):
+        return []
+    if 'equipment_code' not in df.columns or 'ttf_h' not in df.columns:
+        return []
+    eq_df = df[df['equipment_code'].astype(str) == str(eq)].copy()
+    vals = eq_df['ttf_h']
+    try:
+        vals = np.asarray(vals, dtype=float)
+        vals = vals[np.isfinite(vals)]
+        vals = vals[vals > 0]
+        return vals.tolist()
+    except Exception:
+        return []
+
+
+def _plot_R_curves(df, df_out, organigram_by_eq: Dict[str, Any], intervals: Dict[str, Any]):
+    if not organigram_by_eq and (df_out is None or getattr(df_out, "empty", True)):
+        return None
+
+    eqs = []
+    if organigram_by_eq:
+        eqs.extend(list(organigram_by_eq.keys()))
+    if df_out is not None and not getattr(df_out, "empty", True) and "equipment_code" in df_out.columns:
+        eqs.extend(df_out["equipment_code"].astype(str).tolist())
+    eqs = sorted(set(eqs))
+    if not eqs:
+        return None
+
+    tmax = 1000.0
+    per_eq_payload = {}
+    for eq in eqs:
+        rel = organigram_by_eq.get(eq, {}) or {}
+        if "reliability" in rel:
+            rel = rel.get("reliability", {}) or {}
+        ttf_series = _extract_ttf_series(df, eq)
+        row = _row_from_df_out(df_out, eq)
+        current_intervals = intervals.get(eq, {}) if isinstance(intervals.get(eq, {}), dict) else {}
+        current_intervals = {
+            **current_intervals,
+            "T_recommended": row.get("T_recommended_h"),
+        }
+        horizon = _build_time_horizon(rel, ttf_series, current_intervals)
+        tmax = max(tmax, horizon)
+        per_eq_payload[eq] = (rel, ttf_series, row, current_intervals)
+
+    t = np.linspace(1e-6, max(tmax, 1.0), 350)
     fig, ax = plt.subplots(figsize=(10, 5))
-    for eq, ft in fits.items():
-        beta = float(getattr(ft, "beta", 1.0) or 1.0)
-        eta = float(getattr(ft, "eta", 1.0) or 1.0)
-        gamma = float(getattr(ft, "gamma", 0.0) or 0.0)
-
-        y = np.ones_like(t, dtype=float)
-        mask = t > gamma
-        y[mask] = np.exp(-(((t[mask] - gamma) / max(eta, 1e-12)) ** max(beta, 1e-12)))
-        ax.plot(t, y, linewidth=2, label=f"{eq} (beta={beta:.2f}, eta={eta:.1f})")
-
-        current = intervals.get(eq, {})
-        if isinstance(current, dict):
-            tr = _safe_float(current.get("T_R"))
-            tc = _safe_float(current.get("T_cost"))
-            if tr is not None:
-                ax.axvline(tr, linestyle="--", linewidth=1)
-            if tc is not None:
-                ax.axvline(tc, linestyle=":", linewidth=1)
+    for eq in eqs:
+        rel, ttf_series, row, current = per_eq_payload[eq]
+        y = _compute_model_reliability_curve(rel, ttf_series, t)
+        beta = _fmt(row.get("beta"), 2)
+        eta = _fmt(row.get("eta_h"), 1)
+        gamma = _fmt(row.get("gamma_h"), 1)
+        label = f"{eq} | {rel.get('model', '?')} / {rel.get('distribution', '?')} | beta={beta}, eta={eta}, gamma={gamma}"
+        if y is not None:
+            ax.plot(t, y, linewidth=2, label=label)
+        tr = _safe_float(row.get("T_R_h") if row else current.get("T_R"))
+        tc = _safe_float(row.get("T_cost_h") if row else current.get("T_cost"))
+        trec = _safe_float(row.get("T_recommended_h") if row else current.get("T_recommended"))
+        if trec is not None:
+            ax.axvline(trec, color="green", linestyle="-", linewidth=1.8)
+        if tr is not None:
+            ax.axvline(tr, color=("green" if trec is not None and abs(tr-trec) < 1e-9 else "red"), linestyle="--", linewidth=1.1)
+        if tc is not None:
+            ax.axvline(tc, color=("green" if trec is not None and abs(tc-trec) < 1e-9 else "red"), linestyle=":", linewidth=1.1)
 
     ax.grid(True, alpha=0.3)
     ax.set_xlabel("Temps (heures)")
     ax.set_ylabel("R(t)")
-    ax.set_title("Courbes de fiabilité utilisées pour l’optimisation")
+    ax.set_title("Courbes de fiabilité du modèle retenu")
     ax.legend(fontsize=8)
     fig.tight_layout()
     return _fig_to_rl_image(fig, width_mm=180)
@@ -302,16 +429,10 @@ def _summary_table_data(
     eqs = sorted(set(list(fits.keys()) + list((organigram_by_eq or {}).keys())))
     for eq in eqs:
         row = _row_from_df_out(df_out, eq)
-        fit = fits.get(eq)
         itv = intervals.get(eq, {}) if isinstance(intervals.get(eq, {}), dict) else {}
         beta = _safe_float(row.get("beta") if row else None)
         eta = _safe_float(row.get("eta_h") if row else None)
         gamma = _safe_float(row.get("gamma_h") if row else None)
-
-        if fit is not None:
-            beta = beta if beta is not None else _safe_float(getattr(fit, "beta", None))
-            eta = eta if eta is not None else _safe_float(getattr(fit, "eta", None))
-            gamma = gamma if gamma is not None else _safe_float(getattr(fit, "gamma", None))
 
         data.append([
             _san(eq),
@@ -345,8 +466,6 @@ def _parameter_influence_table(row: Dict[str, Any], pipe: Dict[str, Any]) -> Lis
         ["Intervalle recommandé", _fmt(row.get("T_recommended_h"), 1), "Compromis final appliqué au planning."],
         ["Fiabilité à T_cost", _fmt(row.get("R(T_cost)"), 3), "Niveau de fiabilité conservé à l’intervalle économique."],
         ["Coût minimal par heure", _fmt(row.get("C_min_per_h"), 4), "Contribution économique dans le choix."],
-        ["Jours avant maintenance", _fmt(row.get("days_recommended"), 1), "Échéance de planification issue de l’intervalle recommandé."],
-        ["MTBF (h)", _fmt(row.get("MTBF_h"), 1), "Moyenne entre défaillances, différente de l’échéance planifiée."],
     ]
 
 
@@ -413,7 +532,7 @@ def export_optimization_report_pdf_bytes(
         Paragraph(
             _san(
                 "Le rapport d’optimisation présente uniquement les éléments utiles à la décision "
-                "économique et à la planification de maintenance : paramètres Weibull, intervalles "
+                "économique et à la planification de maintenance : paramètres du modèle retenu, intervalles "
                 "calculés, coût minimal et type de maintenance retenu. Aucune donnée thermique "
                 "dynamique n’est injectée dans cette version."
             ),
@@ -446,7 +565,7 @@ def export_optimization_report_pdf_bytes(
     )
     story.append(Spacer(1, 8))
 
-    chart = _plot_R_curves(fits, intervals)
+    chart = _plot_R_curves(df, df_out, organigram_by_eq, intervals)
     if chart is not None:
         story.append(Paragraph("Courbes de fiabilité utilisées", styles["Heading2"]))
         story.append(chart)

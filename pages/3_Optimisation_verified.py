@@ -13,6 +13,7 @@ import streamlit as st
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from scipy import stats as sst
 
 from core.reliability.weibull import fit_weibull
 from core.reliability.policy import suggested_actions
@@ -169,6 +170,167 @@ def build_optimization_note(
     return " ".join(parts)
 
 
+
+
+def hours_to_days(hours: Any) -> Optional[float]:
+    value = safe_number(hours)
+    if value is None:
+        return None
+    return value / 24.0
+
+
+def get_distribution_and_parameters(reliability_result: dict[str, Any]):
+    if str(reliability_result.get("model") or "").upper() != "RP":
+        return None, None
+
+    distribution_name = reliability_result.get("distribution")
+    raw_parameters = (reliability_result.get("params") or {}).get("raw")
+    if not raw_parameters:
+        return None, None
+
+    if distribution_name == "expon":
+        return sst.expon, raw_parameters
+    if distribution_name == "norm":
+        return sst.norm, raw_parameters
+    if distribution_name == "lognorm":
+        return sst.lognorm, raw_parameters
+    if distribution_name in {"weibull_2p", "weibull_3p"}:
+        return sst.weibull_min, raw_parameters
+    return None, None
+
+
+def compute_rp_curve(reliability_result: dict[str, Any], time_axis: np.ndarray) -> Optional[np.ndarray]:
+    distribution_object, distribution_parameters = get_distribution_and_parameters(reliability_result)
+    if distribution_object is None or distribution_parameters is None:
+        return None
+    try:
+        return np.asarray(distribution_object.sf(time_axis, *distribution_parameters), dtype=float)
+    except Exception:
+        return None
+
+
+def compute_nhpp_curve(reliability_result: dict[str, Any], time_axis: np.ndarray) -> Optional[np.ndarray]:
+    parameters = reliability_result.get("params", {}) or {}
+    beta_value = safe_number(parameters.get("beta"))
+    eta_value = safe_number(parameters.get("eta"))
+    if beta_value is None or eta_value is None or beta_value <= 0 or eta_value <= 0:
+        return None
+    safe_time_axis = np.maximum(time_axis, 1e-6)
+    cumulative_events = (safe_time_axis / eta_value) ** beta_value
+    return np.exp(-cumulative_events)
+
+
+def compute_bpp_curve(reliability_result: dict[str, Any], ttf_series: list[float], time_axis: np.ndarray) -> Optional[np.ndarray]:
+    parameters = reliability_result.get("params", {}) or {}
+    mu_value = safe_number(parameters.get("mu"))
+    alpha_value = safe_number(parameters.get("alpha"))
+    beta_kernel_value = safe_number(parameters.get("beta_kernel"))
+    if mu_value is None or alpha_value is None or beta_kernel_value is None:
+        return None
+    if mu_value < 0 or alpha_value < 0 or beta_kernel_value <= 0:
+        return None
+    event_times = np.cumsum(np.asarray(ttf_series, dtype=float))
+    if event_times.size == 0:
+        return None
+    safe_time_axis = np.maximum(time_axis, 1e-6)
+    intensity = np.full_like(safe_time_axis, fill_value=mu_value, dtype=float)
+    for event_time in event_times:
+        mask = safe_time_axis >= event_time
+        if np.any(mask):
+            intensity[mask] += alpha_value * np.exp(-beta_kernel_value * (safe_time_axis[mask] - event_time))
+    cumulative_intensity = np.zeros_like(safe_time_axis, dtype=float)
+    if len(safe_time_axis) > 1:
+        delta = np.diff(safe_time_axis)
+        trapezoids = 0.5 * (intensity[1:] + intensity[:-1]) * delta
+        cumulative_intensity[1:] = np.cumsum(trapezoids)
+    return np.exp(-cumulative_intensity)
+
+
+def compute_model_reliability_curve(reliability_result: dict[str, Any], ttf_series: list[float], time_axis: np.ndarray) -> Optional[np.ndarray]:
+    model_name = str(reliability_result.get("model") or "").upper()
+    if model_name == "RP":
+        return compute_rp_curve(reliability_result, time_axis)
+    if model_name == "NHPP":
+        return compute_nhpp_curve(reliability_result, time_axis)
+    if model_name == "BPP":
+        return compute_bpp_curve(reliability_result, ttf_series, time_axis)
+    return None
+
+
+def build_time_horizon_for_equipment(reliability_result: dict[str, Any], ttf_series: list[float], extra_values: Optional[list[float]] = None) -> float:
+    values = np.asarray(ttf_series, dtype=float)
+    values = values[np.isfinite(values)]
+    values = values[values > 0]
+    if values.size == 0:
+        return 100.0
+    parameters = reliability_result.get("params", {}) or {}
+    eta_value = safe_number(parameters.get("eta"))
+    base_horizon = max(
+        50.0,
+        float(np.max(values)) * 2.0,
+        float(np.mean(values)) * 6.0,
+        float(np.quantile(values, 0.90)) * 4.0,
+    )
+    if eta_value is not None and eta_value > 0:
+        base_horizon = max(base_horizon, eta_value * 1.5)
+    extra_values = extra_values or []
+    positive_extras = [float(value) for value in extra_values if is_positive_number(value)]
+    if positive_extras:
+        base_horizon = max(base_horizon, max(positive_extras) * 1.25)
+    return base_horizon
+
+
+def build_curve_figure(equipment_code: str, reliability_result: dict[str, Any], ttf_series: list[float], interval_tr: Any, interval_tc: Any, interval_rec: Any) -> plt.Figure:
+    interval_tr_value = safe_number(interval_tr)
+    interval_tc_value = safe_number(interval_tc)
+    interval_rec_value = safe_number(interval_rec)
+    time_horizon = build_time_horizon_for_equipment(reliability_result, ttf_series, [interval_tr_value, interval_tc_value, interval_rec_value])
+    time_axis = np.linspace(1e-6, time_horizon, 400)
+    reliability_curve = compute_model_reliability_curve(reliability_result, ttf_series, time_axis)
+
+    figure, axis = plt.subplots(figsize=(10, 5.4))
+    if reliability_curve is None:
+        axis.text(0.5, 0.5, "Courbe indisponible", ha="center", va="center", transform=axis.transAxes)
+    else:
+        axis.plot(
+            time_axis,
+            reliability_curve,
+            linewidth=2.2,
+            label=(
+                f"{equipment_code} | {reliability_result.get('model', '?')} / {reliability_result.get('distribution', '?')} "
+                f"| beta={format_number((reliability_result.get('params', {}) or {}).get('beta'), 2)}, "
+                f"eta={format_number((reliability_result.get('params', {}) or {}).get('eta'), 1)}"
+            ),
+        )
+
+    if interval_rec_value is not None:
+        axis.axvline(interval_rec_value, color="green", linestyle="-", linewidth=2.2, label=f"T_recommandé = {interval_rec_value:.1f} h")
+    if interval_tr_value is not None:
+        color_tr = "green" if interval_rec_value is not None and abs(interval_rec_value - interval_tr_value) < 1e-9 else "red"
+        suffix = " (retenu)" if interval_rec_value is not None and abs(interval_rec_value - interval_tr_value) < 1e-9 else ""
+        axis.axvline(interval_tr_value, color=color_tr, linestyle="--", linewidth=1.7, label=f"T_R = {interval_tr_value:.1f} h{suffix}")
+    if interval_tc_value is not None:
+        color_tc = "green" if interval_rec_value is not None and abs(interval_rec_value - interval_tc_value) < 1e-9 else "red"
+        suffix = " (retenu)" if interval_rec_value is not None and abs(interval_rec_value - interval_tc_value) < 1e-9 else ""
+        axis.axvline(interval_tc_value, color=color_tc, linestyle=":", linewidth=1.9, label=f"T_cost = {interval_tc_value:.1f} h{suffix}")
+
+    axis.grid(True, alpha=0.3)
+    axis.set_xlabel("Temps (heures)")
+    axis.set_ylabel("Fiabilité R(t)")
+    axis.set_title("Courbe de fiabilité du modèle retenu")
+    handles, labels = axis.get_legend_handles_labels()
+    seen = set()
+    uniq_h, uniq_l = [], []
+    for h, l in zip(handles, labels):
+        if l not in seen:
+            seen.add(l)
+            uniq_h.append(h)
+            uniq_l.append(l)
+    if uniq_l:
+        axis.legend(uniq_h, uniq_l, fontsize=8)
+    figure.tight_layout()
+    return figure
+
 DISPLAY_COLUMN_NAMES = {
     "equipment_code": "Code équipement",
     "model": "Processus retenu",
@@ -195,6 +357,7 @@ DISPLAY_COLUMN_NAMES = {
     "R(T_cost)": "Fiabilité au niveau de l’intervalle économique",
     "C_min_per_h": "Coût minimal par heure",
     "T_recommended_h": "Intervalle recommandé (heures)",
+    "days_recommended": "Jours avant maintenance retenus",
     "maintenance_type": "Type de maintenance recommandé",
     "decision_reason": "Justification de la décision fiabiliste",
     "optimization_note": "Note d’optimisation",
@@ -337,31 +500,6 @@ if not economic_optimization_enabled:
     st.warning("Le coût préventif et le coût correctif doivent être strictement positifs pour lancer l’optimisation économique.")
 
 
-with st.expander("Comprendre les paramètres d’optimisation", expanded=False):
-    st.markdown(
-        """
-**Paramètres principaux affichés**
-- **bêta** : paramètre de forme du modèle retenu par le pipeline final ; il décrit la phase de vie de l’équipement.
-- **êta** : paramètre d’échelle ou durée de vie caractéristique du modèle retenu.
-- **gamma** : décalage temporel éventuel du modèle.
-
-**Pourquoi il existait aussi une valeur de référence Weibull ?**
-Le logiciel calcule en interne un ajustement Weibull de référence pour disposer d’un point d’appui économique, même lorsque le modèle final retenu n’est pas exactement Weibull.
-Dans cette page, l’affichage met désormais l’accent sur les **paramètres principaux du modèle retenu** pour éviter la confusion.
-
-**Jours avant maintenance**
-Les jours avant maintenance sont simplement obtenus à partir de l’intervalle retenu : **jours = T_recommandé / 24**.
-Ce n’est pas la même chose que le **MTBF** :
-- le **MTBF** est une moyenne historique ou théorique entre défaillances ;
-- les **jours avant maintenance** correspondent à une **échéance de planification** calculée pour la décision actuelle.
-
-**Choix de l’intervalle recommandé**
-- on compare **T_R** et **T_cost** ;
-- si **R(T_cost) < seuil minimal**, alors **T_R** est retenu automatiquement ;
-- sinon, on garde l’intervalle qui laisse le plus de temps avant intervention tout en restant acceptable sur le plan fiabiliste.
-        """
-    )
-
 # -------------------------------------------------------------------
 # Analyse + optimisation
 # -------------------------------------------------------------------
@@ -495,6 +633,7 @@ for equipment_code, weibull_fit in weibull_reference_fits.items():
             "R(T_cost)": safe_number(reliability_at_economic_interval),
             "C_min_per_h": safe_number(minimum_hourly_cost),
             "T_recommended_h": safe_number(recommended_interval_hours),
+            "days_recommended": hours_to_days(recommended_interval_hours),
             "maintenance_type": recommended_maintenance_type,
             "decision_reason": decision.get("reason"),
             "optimization_note": build_optimization_note(
@@ -614,49 +753,37 @@ with page_tabs[1]:
         st.success(f"Fichier écrit : {FALLBACK_OPTIMIZATION_FILE}")
 
 with page_tabs[2]:
-    st.subheader("Courbes de fiabilité de référence économique")
+    st.subheader("Courbes de fiabilité du modèle retenu")
 
-    eta_values = [float(getattr(fit, "eta", 1.0) or 1.0) for fit in weibull_reference_fits.values()]
-    maximum_time = max(eta_values) * 1.6 if eta_values else 1000.0
+    selected_equipment_for_curves = st.selectbox(
+        "Équipement pour les courbes",
+        options=optimization_dataframe["equipment_code"].tolist(),
+        key="optimization_curve_equipment",
+    )
 
-    interval_candidates = []
-    for _, row in optimization_dataframe.iterrows():
-        if is_positive_number(row.get("T_R_h")):
-            interval_candidates.append(float(row["T_R_h"]))
-        if is_positive_number(row.get("T_cost_h")):
-            interval_candidates.append(float(row["T_cost_h"]))
+    selected_row_for_curves = optimization_dataframe[
+        optimization_dataframe["equipment_code"] == selected_equipment_for_curves
+    ].iloc[0].to_dict()
+    selected_reliability_for_curves = (pipeline_results_by_equipment.get(selected_equipment_for_curves, {}) or {}).get("reliability", {}) or {}
+    selected_ttf_series = series_to_positive_list(
+        source_dataframe[source_dataframe["equipment_code"] == selected_equipment_for_curves]["ttf_h"]
+    ) or []
 
-    if interval_candidates:
-        maximum_time = max(maximum_time, max(interval_candidates) * 1.2)
-
-    time_axis = np.linspace(0, max(maximum_time, 1.0), 350)
-    figure, axis = plt.subplots()
-
-    for equipment_code, fit in weibull_reference_fits.items():
-        beta_value = float(getattr(fit, "beta", 1.0))
-        eta_value = float(getattr(fit, "eta", 1.0))
-        gamma_value = float(getattr(fit, "gamma", 0.0) or 0.0)
-
-        reliability_curve = np.ones_like(time_axis, dtype=float)
-        mask = time_axis > gamma_value
-        reliability_curve[mask] = np.exp(-(((time_axis[mask] - gamma_value) / max(eta_value, 1e-9)) ** max(beta_value, 1e-9)))
-
-        process_name = ((pipeline_results_by_equipment.get(equipment_code, {}) or {}).get("reliability", {}) or {}).get("model", "?")
-        process_variant = ((pipeline_results_by_equipment.get(equipment_code, {}) or {}).get("reliability", {}) or {}).get("process_variant", "?")
-
-        axis.plot(
-            time_axis,
-            reliability_curve,
-            linewidth=2,
-            label=f"{equipment_code} | {process_name} / {process_variant} | bêta={beta_value:.2f}, êta={eta_value:.1f}",
-        )
-
-    axis.grid(True, alpha=0.3)
-    axis.set_xlabel("Temps (heures)")
-    axis.set_ylabel("Fiabilité")
-    axis.set_title("Courbe de fiabilité de référence")
-    axis.legend(fontsize=8)
+    figure = build_curve_figure(
+        equipment_code=selected_equipment_for_curves,
+        reliability_result=selected_reliability_for_curves,
+        ttf_series=selected_ttf_series,
+        interval_tr=selected_row_for_curves.get("T_R_h"),
+        interval_tc=selected_row_for_curves.get("T_cost_h"),
+        interval_rec=selected_row_for_curves.get("T_recommended_h"),
+    )
     st.pyplot(figure, clear_figure=True)
+    st.info(
+        f"La courbe utilise maintenant les paramètres du modèle retenu affichés dans le tableau : "
+        f"bêta={format_number(selected_row_for_curves.get('beta'), 2)}, "
+        f"êta={format_number(selected_row_for_curves.get('eta_h'), 1)} h, "
+        f"gamma={format_number(selected_row_for_curves.get('gamma_h'), 1)} h."
+    )
 
 with page_tabs[3]:
     st.subheader("Détail par équipement")
@@ -674,19 +801,13 @@ with page_tabs[3]:
         f"- **Processus retenu** : **{selected_row.get('model', '—')}**\n"
         f"- **Variant du processus** : **{selected_row.get('process_variant', '—')}**\n"
         f"- **Loi de probabilité retenue** : **{selected_row.get('distribution', '—')}**\n"
-        f"- **Paramètres principaux du modèle retenu** : **bêta = {format_number(selected_row.get('beta'), 2)}**, "
+        f"- **Paramètres principaux** : **bêta = {format_number(selected_row.get('beta'), 2)}**, "
         f"**êta = {format_number(selected_row.get('eta_h'), 1)} heures**, "
         f"**gamma = {format_number(selected_row.get('gamma_h'), 1)} heures**\n"
-        f"- **MTBF** : **{format_number(selected_row.get('MTBF_h'), 1)} heures** ; **MTTR** : **{format_number(selected_row.get('MTTR_h'), 1)} heures** ; **Disponibilité** : **{format_number(selected_row.get('availability_pct'), 2)} %**\n"
         f"- **Intervalle issu du critère économique** : **{format_number(selected_row.get('T_cost_h'), 1)} heures**\n"
         f"- **Intervalle issu du critère de fiabilité** : **{format_number(selected_row.get('T_R_h'), 1)} heures**\n"
         f"- **Intervalle recommandé** : **{format_number(selected_row.get('T_recommended_h'), 1)} heures** = **{format_number(selected_row.get('days_recommended'), 1)} jours**\n"
         f"- **Type de maintenance recommandé** : **{selected_row.get('maintenance_type', '—')}**"
-    )
-
-    st.caption(
-        "Lecture : le bêta affiché ici est le paramètre principal du modèle retenu par le pipeline. "
-        "Les jours avant maintenance proviennent de l’intervalle recommandé converti en jours et ne doivent pas être confondus avec le MTBF, qui reste une moyenne de comportement."
     )
 
     if selected_row.get("decision_reason"):
@@ -696,7 +817,7 @@ with page_tabs[3]:
 
     st.markdown("#### Actions suggérées")
     for action in suggested_actions(
-float(selected_row["beta"]) if is_positive_number(selected_row.get("beta")) else 1.0
+        float(selected_row["beta"]) if is_positive_number(selected_row.get("beta")) else 1.0
     ):
         st.markdown(f"- {action}")
 
