@@ -1,7 +1,7 @@
+
 from __future__ import annotations
 
 import hashlib
-import html
 import math
 from datetime import date, timedelta
 from pathlib import Path
@@ -28,72 +28,8 @@ require_login()
 render_shell("pages/4_Maintenance_verified.py")
 render_page_header(
     "Maintenance",
-    "Choix moderne de maintenance, hiérarchisation des cas critiques et génération du rapport.",
+    "Planning issu de l’optimisation, échéances, commentaires détaillés et recommandation finale.",
     "🛠️",
-)
-
-
-st.markdown(
-    """
-    <style>
-    .maint-card {
-        border: 1px solid #e5e7eb;
-        border-radius: 16px;
-        padding: 16px 18px;
-        background: linear-gradient(180deg, #ffffff 0%, #fafafa 100%);
-        margin-bottom: 12px;
-        box-shadow: 0 4px 14px rgba(15, 23, 42, 0.05);
-    }
-    .maint-card-critical {
-        border: 2px solid #dc2626;
-        background: linear-gradient(180deg, #fff5f5 0%, #fff1f2 100%);
-        box-shadow: 0 6px 18px rgba(220, 38, 38, 0.10);
-    }
-    .maint-title {
-        font-size: 1.05rem;
-        font-weight: 700;
-        margin-bottom: 8px;
-        color: #111827;
-    }
-    .maint-title-critical {
-        color: #b91c1c;
-    }
-    .maint-meta {
-        font-size: 0.90rem;
-        color: #374151;
-        line-height: 1.55;
-    }
-    .maint-badge {
-        display: inline-block;
-        padding: 4px 10px;
-        border-radius: 999px;
-        font-size: 0.78rem;
-        font-weight: 700;
-        margin-right: 8px;
-        margin-bottom: 8px;
-        border: 1px solid #d1d5db;
-        background: #f9fafb;
-        color: #111827;
-    }
-    .maint-badge-critical {
-        background: #dc2626;
-        border-color: #dc2626;
-        color: white;
-    }
-    .maint-badge-normal {
-        background: #e5e7eb;
-        border-color: #d1d5db;
-        color: #111827;
-    }
-    .maint-section-title {
-        font-size: 1rem;
-        font-weight: 700;
-        margin: 8px 0 10px 0;
-        color: #111827;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
 )
 
 
@@ -143,8 +79,8 @@ def maintenance_label(maintenance_type: str) -> str:
 def readable_interval_source(source_name: Optional[str]) -> str:
     mapping = {
         "T_recommended_h": "intervalle recommandé",
-        "T_R_h": "intervalle fiabiliste",
-        "T_cost_h": "intervalle économique",
+        "T_R_h": "intervalle issu du critère de fiabilité",
+        "T_cost_h": "intervalle issu du critère économique",
         "interval_opt_h": "intervalle optimisé",
         "interval_h": "intervalle générique",
     }
@@ -159,6 +95,140 @@ def pick_interval_hours(row: dict) -> tuple[Optional[float], Optional[str]]:
     return None, None
 
 
+def beta_zone(beta_value: Optional[float]) -> str:
+    if beta_value is None:
+        return "unknown"
+    if beta_value < 0.8:
+        return "early"
+    if beta_value <= 1.2:
+        return "random"
+    return "wear"
+
+
+def beta_explanation(beta_value: Optional[float]) -> str:
+    zone = beta_zone(beta_value)
+    if zone == "early":
+        return "Le paramètre bêta est inférieur à 1 : cela évoque surtout des défauts précoces."
+    if zone == "random":
+        return "Le paramètre bêta est proche de 1 : les défaillances sont plutôt aléatoires."
+    if zone == "wear":
+        return "Le paramètre bêta est supérieur à 1 : cela évoque une phase d’usure."
+    return "Le paramètre bêta n’est pas disponible."
+
+
+def interval_intensity(interval_hours: Optional[float]) -> str:
+    if interval_hours is None:
+        return "unknown"
+    if interval_hours <= 168:
+        return "high"
+    if interval_hours <= 720:
+        return "medium"
+    return "low"
+
+
+def interval_intensity_explanation(interval_hours: Optional[float]) -> str:
+    intensity = interval_intensity(interval_hours)
+    if intensity == "high":
+        return "L’intervalle est court : l’équipement demande des actions rapprochées."
+    if intensity == "medium":
+        return "L’intervalle est intermédiaire : il s’agit d’un compromis entre risque et coût."
+    if intensity == "low":
+        return "L’intervalle est long : la surveillance peut être plus espacée."
+    return "L’intensité de planification n’a pas pu être déterminée."
+
+
+def process_explanation(process_name: Optional[str], process_variant: Optional[str]) -> str:
+    process_upper = str(process_name or "").upper()
+    variant_upper = str(process_variant or "").upper()
+
+    if process_upper == "NHPP":
+        return "Le processus retenu est un processus de Poisson non homogène : le comportement évolue dans le temps."
+    if process_upper == "BPP":
+        return "Le processus retenu signale une dépendance entre événements : une panne peut influencer les suivantes."
+    if variant_upper == "HPP":
+        return "Le variant homogène du processus de Poisson est retenu : le taux de défaillance reste approximativement constant."
+    return "Le processus retenu correspond à un renouvellement avec défaillances considérées comme indépendantes."
+
+
+def build_maintenance_comment(
+    *,
+    beta: Optional[float],
+    eta_h: Optional[float],
+    interval_h: Optional[float],
+    interval_source: Optional[str],
+    maintenance_type_label: str,
+    process_model: Optional[str] = None,
+    process_variant: Optional[str] = None,
+) -> str:
+    beta_value = safe_float(beta, None)
+    eta_value = safe_float(eta_h, None)
+    interval_value = safe_float(interval_h, None)
+
+    source_text = readable_interval_source(interval_source)
+    parts: list[str] = []
+
+    parts.append(f"Type recommandé : {maintenance_type_label}.")
+    parts.append(process_explanation(process_model, process_variant))
+    parts.append(beta_explanation(beta_value))
+
+    if interval_value is not None:
+        parts.append(f"L’intervalle retenu est de {interval_value:.1f} heures et provient de la source suivante : {source_text}.")
+        parts.append(interval_intensity_explanation(interval_value))
+    else:
+        parts.append("Aucun intervalle exploitable n’a été retenu automatiquement.")
+
+    if eta_value is not None and interval_value is not None:
+        ratio = interval_value / max(eta_value, 1e-9)
+        parts.append(f"Le paramètre êta, qui représente une durée de vie caractéristique, vaut environ {eta_value:.1f} heures.")
+        if ratio > 1.0:
+            parts.append("L’intervalle choisi dépasse la durée de vie caractéristique estimée : une surveillance renforcée est recommandée.")
+        elif ratio > 0.5:
+            parts.append("L’intervalle choisi reste proche de la durée de vie caractéristique : il faut rester vigilant.")
+        else:
+            parts.append("L’intervalle choisi reste nettement inférieur à la durée de vie caractéristique : l’approche est prudente.")
+    elif eta_value is not None:
+        parts.append(f"Le paramètre êta, qui représente une durée de vie caractéristique, vaut environ {eta_value:.1f} heures.")
+
+    actions: list[str] = []
+    zone = beta_zone(beta_value)
+    if zone == "early":
+        actions.extend([
+            "vérifier la mise en service et la qualité des montages",
+            "rechercher les causes racines des incidents répétés",
+            "maintenir une surveillance rapprochée",
+        ])
+    elif zone == "random":
+        actions.extend([
+            "garder une surveillance régulière",
+            "préparer les consommables pour réduire le temps de réparation",
+            "contrôler les signes faibles avant toute dérive",
+        ])
+    elif zone == "wear":
+        actions.extend([
+            "planifier l’intervention avant la zone critique",
+            "renforcer les contrôles ciblés",
+            "préparer le remplacement des éléments vieillissants",
+        ])
+
+    if actions:
+        parts.append("Actions conseillées : " + "; ".join(actions) + ".")
+
+    return " ".join(parts)
+
+
+def load_optimization_fallback() -> pd.DataFrame:
+    base_dir = Path(__file__).resolve().parents[1]
+    fallback_file = base_dir / "data" / "last_optimization.csv"
+    if fallback_file.exists():
+        try:
+            dataframe = pd.read_csv(fallback_file)
+            dataframe.columns = [str(column).strip() for column in dataframe.columns]
+            return dataframe
+        except Exception:
+            return pd.DataFrame()
+    return pd.DataFrame()
+
+
 def process_score(process_name: str) -> int:
     normalized = (process_name or "").upper()
     if "NHPP" in normalized:
@@ -168,78 +238,12 @@ def process_score(process_name: str) -> int:
     return 1
 
 
-def choose_maintenance_strategy(row: Dict[str, Any]) -> tuple[str, str]:
-    raw_type = maintenance_label(str(row.get("maintenance_type", "")))
-    process_name = str(row.get("model", "RP")).upper()
-    process_variant = str(row.get("process_variant", "")).upper()
-    beta_value = safe_float(row.get("beta"), None)
-    days_left = safe_float(row.get("days_left"), None)
-    interval_hours = safe_float(row.get("interval_h"), None)
-    reliability_interval = safe_float(row.get("T_R_h"), None)
-    economic_interval = safe_float(row.get("T_cost_h"), None)
-
-    reasons: List[str] = []
-
-    if days_left is not None and days_left <= 7:
-        if beta_value is not None and beta_value > 1.0:
-            choice = "Maintenance préventive immédiate"
-        elif beta_value is not None and beta_value < 0.9:
-            choice = "Maintenance corrective et fiabilisation"
-        else:
-            choice = "Maintenance conditionnelle prioritaire"
-        reasons.append("échéance très proche")
-    elif process_name == "BPP":
-        choice = "Maintenance conditionnelle renforcée"
-        reasons.append("dépendance entre événements")
-    elif process_name == "NHPP":
-        if beta_value is not None and beta_value > 1.1:
-            choice = "Maintenance préventive planifiée"
-            reasons.append("usure et tendance évolutive")
-        elif beta_value is not None and beta_value < 0.9:
-            choice = "Maintenance corrective et fiabilisation"
-            reasons.append("défauts précoces dans un processus évolutif")
-        else:
-            choice = "Maintenance conditionnelle"
-            reasons.append("tendance évolutive à surveiller")
-    elif process_variant == "HPP":
-        choice = "Maintenance conditionnelle"
-        reasons.append("taux de défaillance proche du constant")
-    elif beta_value is not None and beta_value < 0.9:
-        choice = "Maintenance corrective et fiabilisation"
-        reasons.append("bêta inférieur à 1")
-    elif beta_value is not None and beta_value <= 1.1:
-        choice = "Maintenance conditionnelle"
-        reasons.append("bêta proche de 1")
-    elif beta_value is not None and beta_value > 1.1:
-        choice = "Maintenance préventive planifiée"
-        reasons.append("bêta supérieur à 1")
-    else:
-        choice = raw_type if raw_type != "Type non défini" else "Maintenance à confirmer"
-        reasons.append("peu d’éléments discriminants")
-
-    if interval_hours is not None:
-        if interval_hours <= 168:
-            reasons.append("intervalle très court")
-        elif interval_hours <= 720:
-            reasons.append("intervalle intermédiaire")
-        else:
-            reasons.append("intervalle long")
-
-    if reliability_interval is not None and economic_interval is not None:
-        reasons.append("arbitrage entre fiabilité et économie")
-
-    if raw_type != "Type non défini" and raw_type not in choice:
-        reasons.append(f"suggestion initiale : {raw_type.lower()}")
-
-    return choice, "; ".join(reasons)
-
-
 def compute_priority_decision(row: Dict[str, Any]) -> tuple[int, str, str, str]:
     score = 0
     process_name = str(row.get("model", "RP"))
     beta_value = safe_float(row.get("beta"), None)
     days_left = safe_float(row.get("days_left"), None)
-    maintenance_choice = str(row.get("maintenance_choice", ""))
+    maintenance_type = str(row.get("maintenance_type", ""))
 
     score += process_score(process_name)
 
@@ -259,15 +263,12 @@ def compute_priority_decision(row: Dict[str, Any]) -> tuple[int, str, str, str]:
         elif days_left <= 90:
             score += 1
 
-    if "immédiate" in maintenance_choice.lower() or "prioritaire" in maintenance_choice.lower():
-        score += 2
-
     if score >= 8:
         priority_level = "Critique"
         final_decision = "Intervention prioritaire"
         reason = (
-            f"Le comportement fiabiliste, l’échéance et le type d’action retenu imposent une action rapide. "
-            f"Action conseillée : {maintenance_choice or 'maintenance ciblée'}."
+            f"Le comportement fiabiliste et l’échéance imposent une action rapide. "
+            f"Type d’action retenu : {maintenance_type or 'maintenance ciblée'}."
         )
     elif score >= 5:
         priority_level = "Élevée"
@@ -276,9 +277,9 @@ def compute_priority_decision(row: Dict[str, Any]) -> tuple[int, str, str, str]:
     elif score >= 3:
         priority_level = "Modérée"
         final_decision = "Surveillance active"
-        reason = "La situation est intermédiaire. Il faut suivre le plan et surveiller les dérives."
+        reason = "La situation est intermédiaire. Il faut suivre le plan calculé et surveiller les dérives."
     else:
-        priority_level = "Normale"
+        priority_level = "Faible"
         final_decision = "Suivi nominal"
         reason = "Aucun signal critique immédiat n’est dominant. Le plan standard peut être appliqué."
 
@@ -287,24 +288,29 @@ def compute_priority_decision(row: Dict[str, Any]) -> tuple[int, str, str, str]:
 
 DISPLAY_COLUMN_NAMES = {
     "equipment_code": "Code équipement",
-    "maintenance_type": "Type initial",
-    "maintenance_choice": "Choix final de maintenance",
-    "maintenance_choice_reason": "Justification du choix",
+    "title": "Titre du plan",
+    "maintenance_type": "Type de maintenance recommandé",
     "maintenance_comment": "Commentaire détaillé",
-    "interval_source_readable": "Source de l’intervalle",
+    "interval_source": "Source brute de l’intervalle",
+    "interval_source_readable": "Source lisible de l’intervalle",
     "interval_h": "Intervalle retenu (heures)",
     "periodicity_days": "Périodicité (jours)",
-    "next_due_date": "Prochaine échéance",
-    "days_left": "Jours restants",
+    "next_due_date": "Prochaine date d’échéance",
+    "days_left": "Nombre de jours restants",
     "beta": "Paramètre bêta",
     "eta_h": "Paramètre êta (heures)",
     "gamma_h": "Paramètre gamma (heures)",
     "model": "Processus retenu",
     "process_variant": "Variant du processus",
-    "distribution": "Loi retenue",
+    "distribution": "Loi de probabilité retenue",
+    "T_recommended_h": "Intervalle recommandé (heures)",
+    "T_R_h": "Intervalle issu du critère de fiabilité (heures)",
+    "T_cost_h": "Intervalle issu du critère économique (heures)",
+    "R_at_T": "Fiabilité au niveau de l’intervalle économique",
+    "C_min_per_h": "Coût minimal par heure",
+    "status": "Statut du plan",
     "priority_score": "Score de priorité",
     "priority_level": "Niveau de priorité",
-    "critical_case": "Cas critique",
     "final_decision": "Décision finale",
     "final_reason": "Motif de la décision",
 }
@@ -318,66 +324,6 @@ def rename_columns_for_display(dataframe: pd.DataFrame) -> pd.DataFrame:
         column: DISPLAY_COLUMN_NAMES.get(column, column)
         for column in renamed_dataframe.columns
     })
-
-
-def build_maintenance_comment(
-    *,
-    beta: Optional[float],
-    eta_h: Optional[float],
-    interval_h: Optional[float],
-    interval_source: Optional[str],
-    maintenance_choice: str,
-    maintenance_choice_reason: str,
-    process_model: Optional[str] = None,
-    process_variant: Optional[str] = None,
-) -> str:
-    source_text = readable_interval_source(interval_source)
-    parts: List[str] = []
-
-    parts.append(f"Choix final : {maintenance_choice}.")
-    if maintenance_choice_reason:
-        parts.append(f"Base de choix : {maintenance_choice_reason}.")
-
-    if process_model:
-        process_upper = str(process_model).upper()
-        variant_upper = str(process_variant or "").upper()
-        if process_upper == "NHPP":
-            parts.append("Le processus est évolutif dans le temps.")
-        elif process_upper == "BPP":
-            parts.append("Le processus montre une dépendance entre événements.")
-        elif variant_upper == "HPP":
-            parts.append("Le taux de défaillance reste proche du constant.")
-        else:
-            parts.append("Le processus retenu reste compatible avec une logique de renouvellement.")
-
-    if beta is not None:
-        if beta < 0.8:
-            parts.append("Le paramètre bêta est inférieur à 1 : défauts précoces à traiter rapidement.")
-        elif beta <= 1.2:
-            parts.append("Le paramètre bêta est proche de 1 : surveillance régulière recommandée.")
-        else:
-            parts.append("Le paramètre bêta est supérieur à 1 : usure dominante et action planifiée souhaitable.")
-
-    if interval_h is not None:
-        parts.append(f"L’intervalle retenu est de {interval_h:.1f} heures ({source_text}).")
-
-    if eta_h is not None:
-        parts.append(f"La durée de vie caractéristique êta vaut environ {eta_h:.1f} heures.")
-
-    return " ".join(parts)
-
-
-def load_optimization_fallback() -> pd.DataFrame:
-    base_dir = Path(__file__).resolve().parents[1]
-    fallback_file = base_dir / "data" / "last_optimization.csv"
-    if fallback_file.exists():
-        try:
-            dataframe = pd.read_csv(fallback_file)
-            dataframe.columns = [str(column).strip() for column in dataframe.columns]
-            return dataframe
-        except Exception:
-            return pd.DataFrame()
-    return pd.DataFrame()
 
 
 def build_virtual_maintenance_plan_from_optimization(
@@ -413,6 +359,10 @@ def build_virtual_maintenance_plan_from_optimization(
         if not equipment_code:
             continue
 
+        maintenance_type_readable = maintenance_label(str(row.get("maintenance_type") or "").strip())
+        if only_preventive and "préventive" not in maintenance_type_readable.lower():
+            continue
+
         interval_hours, interval_source = pick_interval_hours(row)
         if not interval_hours:
             used_interval_columns["none"] += 1
@@ -425,31 +375,24 @@ def build_virtual_maintenance_plan_from_optimization(
         next_due_date = start_date + timedelta(days=periodicity_days)
         days_left = (next_due_date - start_date).days
 
-        base_maintenance_type = maintenance_label(str(row.get("maintenance_type") or "").strip())
         beta_value = safe_float(row.get("beta"), None)
         eta_value = safe_float(row.get("eta_h"), None)
 
-        preview_task = {
-            "equipment_code": equipment_code,
-            "maintenance_type": base_maintenance_type,
-            "model": row.get("model"),
-            "process_variant": row.get("process_variant"),
-            "beta": beta_value,
-            "days_left": int(days_left),
-            "interval_h": float(interval_hours),
-            "T_R_h": row.get("T_R_h"),
-            "T_cost_h": row.get("T_cost_h"),
-        }
-        maintenance_choice, maintenance_choice_reason = choose_maintenance_strategy(preview_task)
-
-        if only_preventive and "préventive" not in maintenance_choice.lower():
-            continue
+        maintenance_comment = build_maintenance_comment(
+            beta=beta_value,
+            eta_h=eta_value,
+            interval_h=safe_float(interval_hours, None),
+            interval_source=interval_source,
+            maintenance_type_label=maintenance_type_readable,
+            process_model=str(row.get("model") or ""),
+            process_variant=str(row.get("process_variant") or ""),
+        )
 
         task = {
             "equipment_code": equipment_code,
-            "maintenance_type": base_maintenance_type,
-            "maintenance_choice": maintenance_choice,
-            "maintenance_choice_reason": maintenance_choice_reason,
+            "title": "Plan issu de l’optimisation",
+            "maintenance_type": maintenance_type_readable,
+            "maintenance_comment": maintenance_comment,
             "interval_source": interval_source,
             "interval_source_readable": readable_interval_source(interval_source),
             "interval_h": float(interval_hours),
@@ -462,6 +405,10 @@ def build_virtual_maintenance_plan_from_optimization(
             "model": row.get("model"),
             "process_variant": row.get("process_variant"),
             "distribution": row.get("distribution"),
+            "MTTF_h": row.get("MTTF_h"),
+            "MTBF_h": row.get("MTBF_h"),
+            "MTTR_h": row.get("MTTR_h"),
+            "availability_pct": row.get("availability_pct"),
             "T_recommended_h": row.get("T_recommended_h"),
             "T_R_h": row.get("T_R_h"),
             "T_cost_h": row.get("T_cost_h"),
@@ -470,21 +417,9 @@ def build_virtual_maintenance_plan_from_optimization(
             "status": "Plan virtuel",
         }
 
-        task["maintenance_comment"] = build_maintenance_comment(
-            beta=beta_value,
-            eta_h=eta_value,
-            interval_h=safe_float(interval_hours, None),
-            interval_source=interval_source,
-            maintenance_choice=maintenance_choice,
-            maintenance_choice_reason=maintenance_choice_reason,
-            process_model=str(row.get("model") or ""),
-            process_variant=str(row.get("process_variant") or ""),
-        )
-
         priority_score, priority_level, final_decision, final_reason = compute_priority_decision(task)
         task["priority_score"] = priority_score
         task["priority_level"] = priority_level
-        task["critical_case"] = priority_level == "Critique"
         task["final_decision"] = final_decision
         task["final_reason"] = final_reason
 
@@ -510,50 +445,6 @@ def build_virtual_maintenance_plan_from_optimization(
     }
 
 
-def style_rows(dataframe: pd.DataFrame) -> pd.io.formats.style.Styler:
-    work = rename_columns_for_display(dataframe.copy())
-
-    def _row_style(row):
-        is_critical = str(row.get("Niveau de priorité", "")) == "Critique" or str(row.get("Cas critique", "")).lower() == "true"
-        if is_critical:
-            return ["background-color: #fff1f2; color: #b91c1c; font-weight: 700;"] * len(row)
-        return [""] * len(row)
-
-    return work.style.apply(_row_style, axis=1)
-
-
-def render_priority_cards(rows: List[Dict[str, Any]], max_cards: int = 8) -> None:
-    if not rows:
-        st.info("Aucune ligne disponible.")
-        return
-
-    st.markdown('<div class="maint-section-title">Vue rapide des priorités</div>', unsafe_allow_html=True)
-
-    for row in rows[:max_cards]:
-        is_critical = bool(row.get("critical_case"))
-        badge_class = "maint-badge-critical" if is_critical else "maint-badge-normal"
-        title_class = "maint-title maint-title-critical" if is_critical else "maint-title"
-        card_class = "maint-card maint-card-critical" if is_critical else "maint-card"
-
-        html_block = f"""
-        <div class="{card_class}">
-            <div class="{title_class}">{html.escape(str(row.get('equipment_code', '—')))}</div>
-            <div>
-                <span class="maint-badge {badge_class}">{html.escape(str(row.get('priority_level', 'Normale')))}</span>
-                <span class="maint-badge maint-badge-normal">{html.escape(str(row.get('maintenance_choice', '—')))}</span>
-                <span class="maint-badge maint-badge-normal">{html.escape(str(row.get('distribution', '—')))}</span>
-            </div>
-            <div class="maint-meta">
-                <strong>Décision :</strong> {html.escape(str(row.get('final_decision', '—')))}<br/>
-                <strong>Jours restants :</strong> {html.escape(str(row.get('days_left', '—')))}<br/>
-                <strong>Intervalle :</strong> {html.escape(format_number(row.get('interval_h'), 1))} h<br/>
-                <strong>Raison :</strong> {html.escape(str(row.get('maintenance_choice_reason', '—')))}
-            </div>
-        </div>
-        """
-        st.markdown(html_block, unsafe_allow_html=True)
-
-
 # -------------------------------------------------------------------
 # Chargement
 # -------------------------------------------------------------------
@@ -572,25 +463,37 @@ optimization_hash = hash_dataframe(optimization_dataframe)
 st.success(f"Optimisation synchronisée | lignes={len(optimization_dataframe)} | empreinte={optimization_hash}")
 
 
-with st.expander("Comprendre les variables utilisées sur cette page", expanded=False):
+# -------------------------------------------------------------------
+# Explications
+# -------------------------------------------------------------------
+with st.expander("Comprendre clairement les variables utilisées sur cette page", expanded=False):
     st.markdown(
         """
-**Choix final de maintenance** : type d’action retenu après combinaison du processus, du paramètre bêta, des intervalles calculés et des jours restants.
-
-**Cas critique** : équipement qui demande une action très rapide. Il apparaît en rouge dans l’interface et dans le rapport.
-
 **Paramètre bêta** : décrit la forme du vieillissement.  
-- inférieur à 1 : défauts précoces  
-- proche de 1 : comportement aléatoire  
-- supérieur à 1 : usure
+- inférieur à 1 : défauts précoces ou problèmes initiaux  
+- proche de 1 : comportement plutôt aléatoire  
+- supérieur à 1 : phase d’usure
 
-**Paramètre êta** : durée de vie caractéristique estimée.
+**Paramètre êta** : durée de vie caractéristique estimée. Plus il est grand, plus l’équipement peut tenir longtemps.
 
-**Décision finale** : conclusion opérationnelle issue de la synthèse de tous les facteurs.
+**Paramètre gamma** : éventuel décalage du modèle dans le temps.
+
+**Intervalle recommandé** : temps retenu pour préparer l’action de maintenance.
+
+**Intervalle issu du critère de fiabilité** : temps qui respecte le niveau de fiabilité visé.
+
+**Intervalle issu du critère économique** : temps qui cherche à minimiser le coût moyen.
+
+**Score de priorité** : score interne utilisé pour classer les équipements à traiter en premier.
+
+**Décision finale** : conclusion pratique retenue pour orienter l’action.
         """
     )
 
 
+# -------------------------------------------------------------------
+# Contrôles
+# -------------------------------------------------------------------
 control_col_1, control_col_2, control_col_3, control_col_4 = st.columns(4)
 with control_col_1:
     due_window_days = st.slider("Fenêtre des tâches dues (jours)", 7, 365, 14, 1)
@@ -617,48 +520,55 @@ if not maintenance_plan.get("ok"):
 all_planned_rows = maintenance_plan.get("rows", [])
 due_rows = maintenance_plan.get("due", [])
 
+st.caption(f"Ordre de priorité des colonnes d’intervalle : {', '.join(maintenance_plan.get('interval_priority', []))}")
+st.caption(f"Nombre d’utilisations de chaque colonne d’intervalle : {maintenance_plan.get('used_cols_stats')}")
+
 metric_col_1, metric_col_2, metric_col_3, metric_col_4 = st.columns(4)
 with metric_col_1:
     st.metric("Équipements planifiés", len(all_planned_rows))
 with metric_col_2:
-    st.metric("Tâches dues", len(due_rows))
+    st.metric("Tâches dues dans la fenêtre", len(due_rows))
 with metric_col_3:
-    st.metric("Cas critiques", int(sum(1 for row in all_planned_rows if bool(row.get("critical_case")))))
+    preventive_count = int(sum(1 for row in all_planned_rows if "préventive" in str(row.get("maintenance_type", "")).lower()))
+    st.metric("Actions préventives", preventive_count)
 with metric_col_4:
-    st.metric("Choix préventifs", int(sum(1 for row in all_planned_rows if "préventive" in str(row.get("maintenance_choice", "")).lower())))
+    critical_count = int(sum(1 for row in all_planned_rows if str(row.get("priority_level", "")) == "Critique"))
+    st.metric("Priorité critique", critical_count)
 
 
+# -------------------------------------------------------------------
+# Tabs
+# -------------------------------------------------------------------
 page_tabs = st.tabs([
-    "Vue prioritaire",
-    "Planning moderne",
-    "Commentaires",
+    "Commentaires et explications",
+    "Planning complet",
+    "Tâches dues",
+    "Recommandation finale",
     "Exports",
 ])
 
 with page_tabs[0]:
-    st.subheader("Choix de maintenance et priorités")
-    render_priority_cards(all_planned_rows, max_cards=10)
-
+    st.subheader("Commentaires de maintenance")
     if all_planned_rows:
-        ranking_dataframe = pd.DataFrame(all_planned_rows)
-        selected_columns = [
-            "equipment_code",
-            "maintenance_choice",
-            "maintenance_choice_reason",
-            "days_left",
-            "priority_level",
-            "critical_case",
-            "final_decision",
-        ]
-        selected_columns = [column for column in selected_columns if column in ranking_dataframe.columns]
-        st.markdown('<div class="maint-section-title">Synthèse hiérarchisée</div>', unsafe_allow_html=True)
-        st.dataframe(
-            style_rows(ranking_dataframe[selected_columns]),
-            use_container_width=True,
-            hide_index=True,
-        )
+        all_rows_dataframe = pd.DataFrame(all_planned_rows)
+        comment_dataframe = all_rows_dataframe[
+            [
+                column for column in [
+                    "equipment_code",
+                    "maintenance_type",
+                    "interval_source_readable",
+                    "interval_h",
+                    "beta",
+                    "eta_h",
+                    "priority_level",
+                    "maintenance_comment",
+                ] if column in all_rows_dataframe.columns
+            ]
+        ].copy()
+        comment_dataframe = comment_dataframe.drop_duplicates(subset=["equipment_code"]).sort_values("equipment_code")
+        st.dataframe(rename_columns_for_display(comment_dataframe), use_container_width=True, hide_index=True)
     else:
-        st.info("Aucune recommandation disponible.")
+        st.info("Aucun commentaire disponible.")
 
 with page_tabs[1]:
     st.subheader("Planning complet")
@@ -668,7 +578,7 @@ with page_tabs[1]:
         full_planning_dataframe = pd.DataFrame(all_planned_rows)
         selected_columns = [
             "equipment_code",
-            "maintenance_choice",
+            "maintenance_type",
             "interval_source_readable",
             "interval_h",
             "periodicity_days",
@@ -676,43 +586,100 @@ with page_tabs[1]:
             "days_left",
             "beta",
             "eta_h",
+            "gamma_h",
             "model",
             "process_variant",
             "distribution",
             "priority_score",
             "priority_level",
-            "critical_case",
             "final_decision",
+            "maintenance_comment",
         ]
         selected_columns = [column for column in selected_columns if column in full_planning_dataframe.columns]
         st.dataframe(
-            style_rows(full_planning_dataframe[selected_columns]),
+            rename_columns_for_display(full_planning_dataframe[selected_columns]),
             use_container_width=True,
             hide_index=True,
         )
 
 with page_tabs[2]:
-    st.subheader("Commentaires et justification détaillée")
-    if all_planned_rows:
-        comments_dataframe = pd.DataFrame(all_planned_rows)
+    st.subheader("Tâches dues dans la fenêtre choisie")
+    if not due_rows:
+        st.info("Aucune tâche n’arrive à échéance dans la fenêtre choisie.")
+    else:
+        due_rows_dataframe = pd.DataFrame(due_rows)
         selected_columns = [
             "equipment_code",
-            "maintenance_choice",
-            "maintenance_choice_reason",
-            "maintenance_comment",
+            "maintenance_type",
+            "interval_source_readable",
+            "interval_h",
+            "next_due_date",
+            "days_left",
+            "beta",
+            "eta_h",
+            "MTTF_h",
+            "MTBF_h",
+            "MTTR_h",
+            "availability_pct",
+            "model",
+            "process_variant",
+            "distribution",
+            "priority_score",
             "priority_level",
-            "critical_case",
+            "final_decision",
+            "maintenance_comment",
         ]
-        selected_columns = [column for column in selected_columns if column in comments_dataframe.columns]
+        selected_columns = [column for column in selected_columns if column in due_rows_dataframe.columns]
         st.dataframe(
-            style_rows(comments_dataframe[selected_columns]),
+            rename_columns_for_display(due_rows_dataframe[selected_columns]),
             use_container_width=True,
             hide_index=True,
         )
-    else:
-        st.info("Aucun commentaire disponible.")
 
 with page_tabs[3]:
+    st.subheader("Recommandation finale")
+    if all_planned_rows:
+        ranking_dataframe = pd.DataFrame(all_planned_rows).copy()
+        if "priority_score" in ranking_dataframe.columns:
+            ranking_dataframe["priority_score"] = pd.to_numeric(ranking_dataframe["priority_score"], errors="coerce").fillna(0)
+        if "days_left" in ranking_dataframe.columns:
+            ranking_dataframe["days_left"] = pd.to_numeric(ranking_dataframe["days_left"], errors="coerce").fillna(999999)
+
+        ranking_dataframe = ranking_dataframe.sort_values(
+            ["priority_score", "days_left"],
+            ascending=[False, True],
+        )
+
+        best_row = ranking_dataframe.iloc[0].to_dict()
+
+        st.success(
+            f"Équipement prioritaire : {best_row.get('equipment_code', '—')} | "
+            f"{best_row.get('maintenance_type', '—')} | "
+            f"échéance prévue : {best_row.get('next_due_date', '—')}"
+        )
+
+        summary_rows = pd.DataFrame([
+            {
+                "equipment_code": best_row.get("equipment_code"),
+                "maintenance_type": best_row.get("maintenance_type"),
+                "model": best_row.get("model"),
+                "process_variant": best_row.get("process_variant"),
+                "distribution": best_row.get("distribution"),
+                "interval_h": best_row.get("interval_h"),
+                "days_left": best_row.get("days_left"),
+                "priority_score": best_row.get("priority_score"),
+                "priority_level": best_row.get("priority_level"),
+                "final_decision": best_row.get("final_decision"),
+                "final_reason": best_row.get("final_reason"),
+            }
+        ])
+        st.dataframe(rename_columns_for_display(summary_rows), use_container_width=True, hide_index=True)
+
+        st.write(best_row.get("maintenance_comment", "Aucun commentaire disponible."))
+    else:
+        st.info("Aucune recommandation disponible.")
+
+with page_tabs[4]:
     st.subheader("Exports")
 
     st.session_state["pm_virtual_all"] = all_planned_rows
@@ -738,7 +705,7 @@ with page_tabs[3]:
     else:
         if st.button("Générer le PDF de maintenance", use_container_width=True):
             tasks_for_pdf = all_planned_rows if include_full_planning_in_pdf else due_rows
-            metrics_table = pd.DataFrame(all_planned_rows).to_dict("records") if all_planned_rows else []
+            metrics_table = optimization_dataframe.to_dict("records")
             try:
                 output_path = export_pm_plan_with_kits_pdf(
                     tasks_due=tasks_for_pdf,

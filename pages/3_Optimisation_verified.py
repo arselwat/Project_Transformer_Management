@@ -205,20 +205,10 @@ DISPLAY_COLUMN_NAMES = {
 }
 
 
-def drop_aic_columns(dataframe: pd.DataFrame) -> pd.DataFrame:
-    if dataframe is None or dataframe.empty:
-        return dataframe
-    filtered_dataframe = dataframe.copy()
-    aic_columns = [column for column in filtered_dataframe.columns if str(column).strip().lower() == "aic"]
-    if aic_columns:
-        filtered_dataframe = filtered_dataframe.drop(columns=aic_columns, errors="ignore")
-    return filtered_dataframe
-
-
 def rename_columns_for_display(dataframe: pd.DataFrame) -> pd.DataFrame:
     if dataframe is None or dataframe.empty:
         return dataframe
-    renamed_dataframe = drop_aic_columns(dataframe)
+    renamed_dataframe = dataframe.copy()
     renamed_dataframe = renamed_dataframe.rename(columns={
         column: DISPLAY_COLUMN_NAMES.get(column, column)
         for column in renamed_dataframe.columns
@@ -346,6 +336,31 @@ economic_optimization_enabled = (preventive_cost > 0) and (corrective_cost > 0)
 if not economic_optimization_enabled:
     st.warning("Le coût préventif et le coût correctif doivent être strictement positifs pour lancer l’optimisation économique.")
 
+
+with st.expander("Comprendre les paramètres d’optimisation", expanded=False):
+    st.markdown(
+        """
+**Paramètres principaux affichés**
+- **bêta** : paramètre de forme du modèle retenu par le pipeline final ; il décrit la phase de vie de l’équipement.
+- **êta** : paramètre d’échelle ou durée de vie caractéristique du modèle retenu.
+- **gamma** : décalage temporel éventuel du modèle.
+
+**Pourquoi il existait aussi une valeur de référence Weibull ?**
+Le logiciel calcule en interne un ajustement Weibull de référence pour disposer d’un point d’appui économique, même lorsque le modèle final retenu n’est pas exactement Weibull.
+Dans cette page, l’affichage met désormais l’accent sur les **paramètres principaux du modèle retenu** pour éviter la confusion.
+
+**Jours avant maintenance**
+Les jours avant maintenance sont simplement obtenus à partir de l’intervalle retenu : **jours = T_recommandé / 24**.
+Ce n’est pas la même chose que le **MTBF** :
+- le **MTBF** est une moyenne historique ou théorique entre défaillances ;
+- les **jours avant maintenance** correspondent à une **échéance de planification** calculée pour la décision actuelle.
+
+**Choix de l’intervalle recommandé**
+- on compare **T_R** et **T_cost** ;
+- si **R(T_cost) < seuil minimal**, alors **T_R** est retenu automatiquement ;
+- sinon, on garde l’intervalle qui laisse le plus de temps avant intervention tout en restant acceptable sur le plan fiabiliste.
+        """
+    )
 
 # -------------------------------------------------------------------
 # Analyse + optimisation
@@ -577,9 +592,6 @@ with page_tabs[1]:
             "beta",
             "eta_h",
             "gamma_h",
-            "beta_weibull_ref",
-            "eta_weibull_ref_h",
-            "gamma_weibull_ref_h",
             "T_R_h",
             "T_cost_h",
             "T_recommended_h",
@@ -662,13 +674,19 @@ with page_tabs[3]:
         f"- **Processus retenu** : **{selected_row.get('model', '—')}**\n"
         f"- **Variant du processus** : **{selected_row.get('process_variant', '—')}**\n"
         f"- **Loi de probabilité retenue** : **{selected_row.get('distribution', '—')}**\n"
-        f"- **Paramètres principaux** : **bêta = {format_number(selected_row.get('beta'), 2)}**, "
+        f"- **Paramètres principaux du modèle retenu** : **bêta = {format_number(selected_row.get('beta'), 2)}**, "
         f"**êta = {format_number(selected_row.get('eta_h'), 1)} heures**, "
         f"**gamma = {format_number(selected_row.get('gamma_h'), 1)} heures**\n"
+        f"- **MTBF** : **{format_number(selected_row.get('MTBF_h'), 1)} heures** ; **MTTR** : **{format_number(selected_row.get('MTTR_h'), 1)} heures** ; **Disponibilité** : **{format_number(selected_row.get('availability_pct'), 2)} %**\n"
         f"- **Intervalle issu du critère économique** : **{format_number(selected_row.get('T_cost_h'), 1)} heures**\n"
         f"- **Intervalle issu du critère de fiabilité** : **{format_number(selected_row.get('T_R_h'), 1)} heures**\n"
-        f"- **Intervalle recommandé** : **{format_number(selected_row.get('T_recommended_h'), 1)} heures**\n"
+        f"- **Intervalle recommandé** : **{format_number(selected_row.get('T_recommended_h'), 1)} heures** = **{format_number(selected_row.get('days_recommended'), 1)} jours**\n"
         f"- **Type de maintenance recommandé** : **{selected_row.get('maintenance_type', '—')}**"
+    )
+
+    st.caption(
+        "Lecture : le bêta affiché ici est le paramètre principal du modèle retenu par le pipeline. "
+        "Les jours avant maintenance proviennent de l’intervalle recommandé converti en jours et ne doivent pas être confondus avec le MTBF, qui reste une moyenne de comportement."
     )
 
     if selected_row.get("decision_reason"):
@@ -678,7 +696,7 @@ with page_tabs[3]:
 
     st.markdown("#### Actions suggérées")
     for action in suggested_actions(
-        float(selected_row["beta_weibull_ref"]) if is_positive_number(selected_row.get("beta_weibull_ref")) else 1.0
+float(selected_row["beta"]) if is_positive_number(selected_row.get("beta")) else 1.0
     ):
         st.markdown(f"- {action}")
 
