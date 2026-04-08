@@ -451,25 +451,35 @@ def _build_optimized_curve_plot(ttf_series: list[float], reliability_result: Dic
     tr = _safe_float(summary_row.get("T_R_h"))
     tc = _safe_float(summary_row.get("T_cost_h"))
     trec = _safe_float(summary_row.get("T_recommended_h"))
+
     if trec is not None:
-        ax.axvline(trec, color="green", linestyle="-", linewidth=2.0, label=f"T_recommandé = {_fmt(trec,1)} h")
+        ax.axvline(trec, color="green", linestyle="-", linewidth=2.2, label=f"T_recommandé = {_fmt(trec,1)} h")
     if tr is not None:
-        ax.axvline(tr, color=("green" if trec is not None and abs(tr-trec) < 1e-9 else "red"), linestyle="--", linewidth=1.4, label=f"T_R = {_fmt(tr,1)} h")
+        ax.axvline(tr, color="green", linestyle="--", linewidth=1.8, label=f"T_R = {_fmt(tr,1)} h")
     if tc is not None:
-        ax.axvline(tc, color=("green" if trec is not None and abs(tc-trec) < 1e-9 else "red"), linestyle=":", linewidth=1.6, label=f"T_cost = {_fmt(tc,1)} h")
+        ax.axvline(tc, color="red", linestyle=":", linewidth=1.8, label=f"T_cost = {_fmt(tc,1)} h")
 
     ax.set_xlabel("Temps (heures)")
     ax.set_ylabel("R(t)")
     ax.set_title("Courbe optimisée")
     ax.grid(True, alpha=0.28)
-    ax.legend(fontsize=8)
+
+    handles, labels = ax.get_legend_handles_labels()
+    seen = set()
+    uniq_h, uniq_l = [], []
+    for handle, label in zip(handles, labels):
+        if label not in seen:
+            seen.add(label)
+            uniq_h.append(handle)
+            uniq_l.append(label)
+    ax.legend(uniq_h, uniq_l, fontsize=8)
+
     fig.tight_layout()
     legend = (
-        f"La courbe de fiabilité est tracée à partir du modèle retenu. La ligne verte correspond à l’intervalle recommandé, "
-        f"tandis que les repères rouges représentent les autres intervalles candidats (T_R et T_cost) lorsqu’ils ne sont pas retenus."
+        f"La courbe de fiabilité est tracée à partir du modèle retenu. Les repères verts correspondent à T_recommandé et T_R, "
+        f"tandis que le repère rouge correspond à T_cost."
     )
     return fig, legend
-
 
 def _build_executive_summary(summary_df: pd.DataFrame) -> list[str]:
     lines: list[str] = []
