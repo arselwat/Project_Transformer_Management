@@ -280,9 +280,7 @@ def _prepare_single_sheet(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
         "timestamp",
         "is_failure",
         "repair_time_hours",
-        "temp_amb_C",
-        "charge_pct",
-        "etat_ventilateurs",
+       
     ]
     work = work[ordered_cols]
 
