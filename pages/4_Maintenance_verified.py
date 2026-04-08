@@ -31,6 +31,8 @@ render_page_header(
     "Choix moderne de maintenance, hiérarchisation des cas critiques et génération du rapport.",
     "🛠️",
 )
+
+
 st.markdown(
     """
     <style>
@@ -455,6 +457,11 @@ def build_virtual_maintenance_plan_from_optimization(
         base_maintenance_type = maintenance_label(str(row.get("maintenance_type") or "").strip())
         beta_value = safe_float(row.get("beta"), None)
         eta_value = safe_float(row.get("eta_h"), None)
+        gamma_value = safe_float(row.get("gamma_h"), None)
+        mttf_value = safe_float(pick_first_present(row, "MTTF_h", "mttf_h", "MTTF", "mttf"), None)
+        mtbf_value = safe_float(pick_first_present(row, "MTBF_h", "mtbf_h", "MTBF", "mtbf"), None)
+        mttr_value = safe_float(pick_first_present(row, "MTTR_h", "mttr_h", "MTTR", "mttr"), None)
+        availability_pct_value = availability_percent_from_row(row)
 
         preview_task = {
             "equipment_code": equipment_code,
@@ -485,7 +492,7 @@ def build_virtual_maintenance_plan_from_optimization(
             "days_left": int(days_left),
             "beta": beta_value,
             "eta_h": eta_value,
-            "gamma_h": row.get("gamma_h"),
+            "gamma_h": gamma_value,
             "MTTF_h": mttf_value,
             "MTBF_h": mtbf_value,
             "MTTR_h": mttr_value,

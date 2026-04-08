@@ -86,6 +86,41 @@ def _compact(text: Any, max_len: int = 140) -> str:
     return s if len(s) <= max_len else s[: max_len - 3] + "..."
 
 
+def _pick_first(row: Dict[str, Any], *keys: str):
+    for key in keys:
+        if key in row and row.get(key) not in (None, ""):
+            return row.get(key)
+    return None
+
+
+def _metric_mttf(row: Dict[str, Any]):
+    return _pick_first(row, "MTTF_h", "mttf_h", "MTTF", "mttf")
+
+
+def _metric_mtbf(row: Dict[str, Any]):
+    return _pick_first(row, "MTBF_h", "mtbf_h", "MTBF", "mtbf")
+
+
+def _metric_mttr(row: Dict[str, Any]):
+    return _pick_first(row, "MTTR_h", "mttr_h", "MTTR", "mttr")
+
+
+def _metric_availability_pct(row: Dict[str, Any]):
+    direct = _pick_first(row, "availability_pct", "availability", "Disponibilite_pct", "Disponibilité_pct")
+    direct_num = safe_float(direct)
+    if direct_num is not None:
+        return 100.0 * direct_num if direct_num <= 1.0 else direct_num
+    intrinsic = _pick_first(row, "availability_intrinsic")
+    intrinsic_num = safe_float(intrinsic)
+    if intrinsic_num is not None:
+        return 100.0 * intrinsic_num if intrinsic_num <= 1.0 else intrinsic_num
+    mtbf = safe_float(_metric_mtbf(row))
+    mttr = safe_float(_metric_mttr(row))
+    if mtbf is not None and mttr is not None and (mtbf + mttr) > 0:
+        return 100.0 * mtbf / (mtbf + mttr)
+    return None
+
+
 def _page_available_width(left_margin_mm: float = 16, right_margin_mm: float = 16) -> float:
     return A4[0] - (left_margin_mm * mm + right_margin_mm * mm)
 
@@ -193,6 +228,14 @@ def _build_choice_explanation(row: Dict[str, Any]) -> str:
         parts.append(f"Le paramètre beta = {fnum(row.get('beta'), 2)} influence directement le type de maintenance.")
     if row.get("eta_h") is not None:
         parts.append(f"La durée caractéristique eta vaut {fnum(row.get('eta_h'), 1)} h.")
+    if _metric_mttf(row) is not None:
+        parts.append(f"Le MTTF vaut {fnum(_metric_mttf(row), 1)} h.")
+    if _metric_mtbf(row) is not None:
+        parts.append(f"Le MTBF vaut {fnum(_metric_mtbf(row), 1)} h.")
+    if _metric_mttr(row) is not None:
+        parts.append(f"Le MTTR vaut {fnum(_metric_mttr(row), 1)} h.")
+    if _metric_availability_pct(row) is not None:
+        parts.append(f"La disponibilité est de {fnum(_metric_availability_pct(row), 1)} %.")
     if row.get("T_recommended_h") is not None:
         parts.append(f"L’intervalle recommandé est {fnum(row.get('T_recommended_h'), 1)} h.")
     if row.get("days_left") is not None:
@@ -217,6 +260,10 @@ def _build_influence_table(row: Dict[str, Any]):
         ["T_recommended (h)", fnum(row.get("T_recommended_h"), 1), "Intervalle principal proposé."],
         ["T_R (h)", fnum(row.get("T_R_h"), 1), "Intervalle issu du critère de fiabilité."],
         ["T_cost (h)", fnum(row.get("T_cost_h"), 1), "Intervalle issu du critère économique."],
+        ["MTTF (h)", fnum(_metric_mttf(row), 1), "Temps moyen avant défaillance."],
+        ["MTBF (h)", fnum(_metric_mtbf(row), 1), "Temps moyen entre défaillances."],
+        ["MTTR (h)", fnum(_metric_mttr(row), 1), "Temps moyen de remise en état."],
+        ["Disponibilité (%)", fnum(_metric_availability_pct(row), 1), "Part du temps où l’équipement reste disponible."],
         ["Jours restants", SAN(row.get("days_left", "")), "Plus l’échéance est proche, plus la priorité augmente."],
         ["Niveau de priorité", SAN(row.get("priority_level", "")), "Les cas critiques sont mis en évidence en rouge."],
     ]
@@ -261,7 +308,7 @@ def _tasks_table(tasks_due: List[Dict[str, Any]], available_width: float):
 
 
 def _summary_table(metrics_table: List[Dict[str, Any]], available_width: float):
-    data = [["Équipement", "Choix final", "Modèle", "Loi", "beta", "eta (h)", "Intervalle (h)", "Jours", "Priorité"]]
+    data = [["Équipement", "Choix final", "Modèle", "Loi", "beta", "eta (h)", "MTTF (h)", "MTBF (h)", "MTTR (h)", "Disponibilité (%)", "Intervalle (h)", "Jours", "Priorité"]]
     for row in metrics_table:
         data.append([
             SAN(row.get("equipment_code", "")),
@@ -270,12 +317,16 @@ def _summary_table(metrics_table: List[Dict[str, Any]], available_width: float):
             SAN(row.get("distribution", "")),
             fnum(row.get("beta"), 2),
             fnum(row.get("eta_h"), 1),
+            fnum(_metric_mttf(row), 1),
+            fnum(_metric_mtbf(row), 1),
+            fnum(_metric_mttr(row), 1),
+            fnum(_metric_availability_pct(row), 1),
             fnum(row.get("interval_h", row.get("T_recommended_h")), 1),
             SAN(row.get("days_left", "")),
             SAN(row.get("priority_level", "")),
         ])
-    table = _mk_table(data, available_width=available_width, font_size=7.3)
-    return _apply_critical_style(table, data, priority_col=8)
+    table = _mk_table(data, available_width=available_width, font_size=7.0)
+    return _apply_critical_style(table, data, priority_col=12)
 
 
 def _add_reference_sections(story, styles, available_width: float, tools_checklist):
@@ -449,6 +500,10 @@ def export_pm_plan_with_kits_pdf(
             ["beta", fnum(row.get("beta"), 2)],
             ["eta (h)", fnum(row.get("eta_h"), 1)],
             ["gamma (h)", fnum(row.get("gamma_h"), 1)],
+            ["MTTF (h)", fnum(_metric_mttf(row), 1)],
+            ["MTBF (h)", fnum(_metric_mtbf(row), 1)],
+            ["MTTR (h)", fnum(_metric_mttr(row), 1)],
+            ["Disponibilité (%)", fnum(_metric_availability_pct(row), 1)],
             ["Intervalle recommandé (h)", fnum(row.get("T_recommended_h"), 1)],
             ["Intervalle fiabiliste (h)", fnum(row.get("T_R_h"), 1)],
             ["Intervalle économique (h)", fnum(row.get("T_cost_h"), 1)],
