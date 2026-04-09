@@ -1382,14 +1382,11 @@ def build_reliability_tables(reliability_result: Dict[str, Any]) -> Dict[str, pd
 
     rows = []
     for name, fit in reliability_result.get("candidates", {}).items():
-        ls = fit.get("ls_params") or {}
         rows.append(
             {
                 "Modèle": name,
-                "Paramètres MLE": str(fit.get("params")),
-                "Paramètres LS": None if not ls else str(ls),
+                "Paramètres": str(fit.get("params")),
                 "Méthode estimation": fit.get("estimation_method"),
-                "LogLik": fit.get("loglik"),
                 "KS p": fit.get("ks_p"),
                 "Chi2 p": fit.get("chi2_p"),
                 "CvM p": fit.get("cvm_p"),
@@ -1408,13 +1405,9 @@ def build_reliability_tables(reliability_result: Dict[str, Any]) -> Dict[str, pd
                 "Beta": params.get("beta"),
                 "Eta": params.get("eta"),
                 "Gamma": params.get("gamma"),
-                "Beta_LS": params.get("beta_ls"),
-                "Eta_LS": params.get("eta_ls"),
                 "Lambda_HPP (1/h)": params.get("lambda_hpp_h"),
                 "Mu": params.get("mu"),
                 "Alpha": params.get("alpha"),
-                "Beta_kernel": params.get("beta_kernel"),
-                "Branch_ratio": params.get("branch_ratio"),
                 "KS p": goodness.get("ks_p"),
                 "Chi2 p": goodness.get("chi2_p"),
                 "CvM p": goodness.get("cvm_p"),
