@@ -225,6 +225,59 @@ def _safe_float(value: Any) -> Optional[float]:
         return None
 
 
+def _first_positive_value(mapping: Dict[str, Any], keys: List[str]) -> Optional[float]:
+    for key in keys:
+        value = _safe_float(mapping.get(key))
+        if value is not None and value > 0:
+            return value
+    return None
+
+
+def _extract_interval_from_tables(tables: Optional[Dict[str, Any]], expected_keys: List[str]) -> Optional[float]:
+    if not isinstance(tables, dict):
+        return None
+
+    normalized_expected = {str(key).strip().lower() for key in expected_keys}
+    for table_name in ["optimization_table", "trace_optimization"]:
+        df = tables.get(table_name)
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            continue
+
+        if {"Variable", "Valeur"}.issubset(df.columns):
+            for _, row in df.iterrows():
+                variable = str(row.get("Variable", "")).strip().lower()
+                if variable in normalized_expected:
+                    value = _safe_float(row.get("Valeur"))
+                    if value is not None and value > 0:
+                        return value
+
+        for key in expected_keys:
+            if key in df.columns:
+                series = pd.to_numeric(df[key], errors="coerce").dropna()
+                series = series[series > 0]
+                if not series.empty:
+                    return float(series.iloc[0])
+
+    return None
+
+
+def _merge_summary_row_with_optimization(summary_row: Dict[str, Any], tables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    merged = dict(summary_row or {})
+    if _first_positive_value(merged, ["T_R_h", "T_R"]) is None:
+        value = _extract_interval_from_tables(tables, ["T_R_h", "T_R"])
+        if value is not None:
+            merged["T_R_h"] = value
+    if _first_positive_value(merged, ["T_cost_h", "T_cost"]) is None:
+        value = _extract_interval_from_tables(tables, ["T_cost_h", "T_cost"])
+        if value is not None:
+            merged["T_cost_h"] = value
+    if _first_positive_value(merged, ["T_recommended_h", "T_recommended"]) is None:
+        value = _extract_interval_from_tables(tables, ["T_recommended_h", "T_recommended"])
+        if value is not None:
+            merged["T_recommended_h"] = value
+    return merged
+
+
 def _set_plot_style(fig, ax):
     fig.patch.set_facecolor("white")
     ax.set_facecolor("white")
@@ -432,10 +485,17 @@ def _build_time_horizon(reliability_result: Dict[str, Any], ttf_series: list[flo
     return base
 
 
-def _build_optimized_curve_plot(ttf_series: list[float], reliability_result: Dict[str, Any], summary_row: Dict[str, Any]):
+def _build_optimized_curve_plot(
+    ttf_series: list[float],
+    reliability_result: Dict[str, Any],
+    summary_row: Dict[str, Any],
+    tables: Optional[Dict[str, Any]] = None,
+):
     if not ttf_series:
         return None, "Aucune courbe d’optimisation disponible."
-    tmax = _build_time_horizon(reliability_result, ttf_series, summary_row)
+
+    effective_row = _merge_summary_row_with_optimization(summary_row, tables)
+    tmax = _build_time_horizon(reliability_result, ttf_series, effective_row)
     t = np.linspace(1e-6, max(tmax, 1.0), 350)
     y = _compute_model_reliability_curve(reliability_result, ttf_series, t)
     if y is None:
@@ -443,14 +503,14 @@ def _build_optimized_curve_plot(ttf_series: list[float], reliability_result: Dic
 
     fig, ax = plt.subplots(figsize=(8.6, 4.9), dpi=140)
     _set_plot_style(fig, ax)
-    beta = _fmt(summary_row.get("beta"), 2)
-    eta = _fmt(summary_row.get("eta_h"), 1)
-    gamma = _fmt(summary_row.get("gamma_h"), 1)
+    beta = _fmt(effective_row.get("beta"), 2)
+    eta = _fmt(effective_row.get("eta_h"), 1)
+    gamma = _fmt(effective_row.get("gamma_h"), 1)
     ax.plot(t, y, linewidth=2.2, color="#1f77b4", label=f"Courbe du modèle retenu | beta={beta}, eta={eta}, gamma={gamma}")
 
-    tr = _safe_float(summary_row.get("T_R_h"))
-    tc = _safe_float(summary_row.get("T_cost_h"))
-    trec = _safe_float(summary_row.get("T_recommended_h"))
+    tr = _first_positive_value(effective_row, ["T_R_h", "T_R"])
+    tc = _first_positive_value(effective_row, ["T_cost_h", "T_cost"])
+    trec = _first_positive_value(effective_row, ["T_recommended_h", "T_recommended"])
 
     if trec is not None:
         ax.axvline(trec, color="green", linestyle="-", linewidth=2.2, label=f"T_recommandé = {_fmt(trec,1)} h")
@@ -476,8 +536,8 @@ def _build_optimized_curve_plot(ttf_series: list[float], reliability_result: Dic
 
     fig.tight_layout()
     legend = (
-        f"La courbe de fiabilité est tracée à partir du modèle retenu. Les repères verts correspondent à T_recommandé et T_R, "
-        f"tandis que le repère rouge correspond à T_cost."
+        "La courbe de fiabilité est tracée à partir du modèle retenu. Les repères verts correspondent à T_recommandé et T_R, "
+        "tandis que le repère rouge correspond à T_cost."
     )
     return fig, legend
 
@@ -560,7 +620,13 @@ def _split_dataframe_columns(
     while start < len(other_columns):
         end = start + available_for_other
         current_columns = fixed_columns + other_columns[start:end]
-        chunks.append((f"Partie {index}", df[current_columns].copy()))
+        if index == 1:
+            section_label = "Partie 1"
+        elif index == 2:
+            section_label = "Partie 1 (suite)"
+        else:
+            section_label = f"Partie 1 (suite {index - 1})"
+        chunks.append((section_label, df[current_columns].copy()))
         start = end
         index += 1
 
@@ -594,8 +660,7 @@ def _render_table_block(
 
     if len(work.columns) > 8:
         parts = _split_dataframe_columns(work, fixed_columns=fixed_columns, max_columns_per_part=5)
-        for part_label, part_df in parts:
-            story.append(Paragraph(_san(part_label), styles["Heading3"]))
+        for _, part_df in parts:
             story.append(_mk_table(_df_to_table_data(part_df), total_width=total_width, font_size=6))
             story.append(Spacer(1, 4))
     else:
@@ -900,7 +965,7 @@ def export_global_analysis_report_pdf(
                 story.append(Spacer(1, 8))
 
         if reliability_result and ttf_series:
-            fig_opt, legend_opt = _build_optimized_curve_plot(ttf_series, reliability_result, summary_row)
+            fig_opt, legend_opt = _build_optimized_curve_plot(ttf_series, reliability_result, summary_row, tables)
             if fig_opt is not None:
                 story.append(Paragraph("Courbe optimisée", styles["Heading2"]))
                 story.append(_fig_to_rl_image(fig_opt, width_mm=180))
