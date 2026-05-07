@@ -4,6 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 import io
 import hashlib
+import math
 from typing import Any, Optional
 
 import numpy as np
@@ -118,38 +119,61 @@ def recommend_interval(
     maintenance_type: str,
     reliability_interval_hours: Any,
     economic_interval_hours: Any,
+    reliability_at_economic_interval: Any,
+    target_reliability: float,
 ) -> Optional[float]:
-    candidate_values = [
-        float(value)
-        for value in [reliability_interval_hours, economic_interval_hours]
-        if is_positive_number(value)
-    ]
-    if not candidate_values:
-        return None
-
-    maintenance_type_lower = maintenance_type.lower()
-
+    """
+    Règle cohérente avec la logique fiabiliste :
+    - si l’horizon économique existe et respecte la cible de fiabilité, on le retient ;
+    - sinon, on revient à l’horizon issu du critère de fiabilité ;
+    - pour un cas explicitement correctif/fiabilisation, aucun intervalle automatique n’est imposé.
+    """
+    maintenance_type_lower = str(maintenance_type or "").lower()
     if "corrective" in maintenance_type_lower and "fiabilisation" in maintenance_type_lower:
         return None
 
-    return float(min(candidate_values))
+    reliability_interval_value = safe_number(reliability_interval_hours)
+    economic_interval_value = safe_number(economic_interval_hours)
+    reliability_at_economic_value = safe_number(reliability_at_economic_interval)
+
+    if (
+        economic_interval_value is not None
+        and economic_interval_value > 0
+        and reliability_at_economic_value is not None
+        and reliability_at_economic_value >= float(target_reliability)
+    ):
+        return float(economic_interval_value)
+
+    if reliability_interval_value is not None and reliability_interval_value > 0:
+        return float(reliability_interval_value)
+
+    if economic_interval_value is not None and economic_interval_value > 0:
+        return float(economic_interval_value)
+
+    return None
 
 
 def build_optimization_note(
-    characteristic_life_hours: Any,
+    scale_parameter_hours: Any,
     economic_interval_hours: Any,
     reliability_interval_hours: Any,
     recommended_interval_hours: Any,
+    reliability_at_economic_interval: Any,
+    target_reliability: Any,
+    optimization_model_source: str,
 ) -> str:
-    characteristic_life_value = safe_number(characteristic_life_hours)
+    scale_parameter_value = safe_number(scale_parameter_hours)
     economic_interval_value = safe_number(economic_interval_hours)
     reliability_interval_value = safe_number(reliability_interval_hours)
     recommended_interval_value = safe_number(recommended_interval_hours)
+    reliability_at_economic_value = safe_number(reliability_at_economic_interval)
+    target_reliability_value = safe_number(target_reliability)
 
     if recommended_interval_value is None:
         return "Aucun intervalle exploitable n’a pu être retenu automatiquement pour cet équipement."
 
     parts = [f"Intervalle retenu : {recommended_interval_value:.1f} heures."]
+    parts.append(f"Optimisation calculée avec le modèle retenu par l’organigramme ({optimization_model_source}).")
 
     if reliability_interval_value is not None:
         parts.append(f"Intervalle issu du critère de fiabilité : {reliability_interval_value:.1f} heures.")
@@ -157,15 +181,20 @@ def build_optimization_note(
     if economic_interval_value is not None:
         parts.append(f"Intervalle issu du critère économique : {economic_interval_value:.1f} heures.")
 
-    if characteristic_life_value is not None:
-        parts.append(f"Vie caractéristique estimée : {characteristic_life_value:.1f} heures.")
-        ratio = recommended_interval_value / max(characteristic_life_value, 1e-9)
-        if ratio < 0.5:
-            parts.append("La décision retenue reste prudente par rapport à la vie caractéristique.")
-        elif ratio <= 1.0:
-            parts.append("La décision retenue reste cohérente avec la vie caractéristique estimée.")
+    if reliability_at_economic_value is not None and target_reliability_value is not None:
+        if reliability_at_economic_value >= target_reliability_value:
+            parts.append(
+                f"La fiabilité à l’intervalle économique est {reliability_at_economic_value:.4f}, "
+                f"donc elle respecte la cible {target_reliability_value:.2f}."
+            )
         else:
-            parts.append("L’intervalle retenu dépasse la vie caractéristique : une vigilance renforcée est nécessaire.")
+            parts.append(
+                f"La fiabilité à l’intervalle économique est {reliability_at_economic_value:.4f}, "
+                f"donc elle est inférieure à la cible {target_reliability_value:.2f}."
+            )
+
+    if scale_parameter_value is not None:
+        parts.append(f"Paramètre d’échelle utilisé par le modèle : {scale_parameter_value:.1f} heures.")
 
     return " ".join(parts)
 
@@ -177,6 +206,152 @@ def hours_to_days(hours: Any) -> Optional[float]:
     if value is None:
         return None
     return value / 24.0
+
+
+def reliability_from_selected_model(
+    reliability_result: dict[str, Any],
+    t: Any,
+    ttf_series: Optional[list[float]] = None,
+) -> Optional[float]:
+    """Calcule R(t) avec le modèle réellement retenu par l’organigramme."""
+    time_value = safe_number(t)
+    if time_value is None or time_value < 0:
+        return None
+
+    model_name = str(reliability_result.get("model") or "").upper()
+    parameters = reliability_result.get("params", {}) or {}
+
+    if model_name == "NHPP":
+        beta_value = safe_number(parameters.get("beta"))
+        eta_value = safe_number(parameters.get("eta"))
+        if beta_value is None or eta_value is None or beta_value <= 0 or eta_value <= 0:
+            return None
+        return float(math.exp(-((time_value / eta_value) ** beta_value)))
+
+    if model_name == "RP":
+        distribution_object, distribution_parameters = get_distribution_and_parameters(reliability_result)
+        if distribution_object is None or distribution_parameters is None:
+            return None
+        try:
+            return float(distribution_object.sf(time_value, *distribution_parameters))
+        except Exception:
+            return None
+
+    if model_name == "BPP":
+        # Approximation prudente : on utilise la partie de base mu lorsque disponible.
+        # Le BPP est surtout exploité ici comme signal de surveillance renforcée.
+        mu_value = safe_number(parameters.get("mu"))
+        if mu_value is None or mu_value <= 0:
+            return None
+        return float(math.exp(-mu_value * time_value))
+
+    return None
+
+
+def reliability_interval_from_selected_model(
+    reliability_result: dict[str, Any],
+    target_reliability: float,
+) -> Optional[float]:
+    """Calcule T_R tel que R(T_R)=target_reliability avec le modèle retenu."""
+    target_value = safe_number(target_reliability)
+    if target_value is None or not (0 < target_value < 1):
+        return None
+
+    model_name = str(reliability_result.get("model") or "").upper()
+    parameters = reliability_result.get("params", {}) or {}
+
+    if model_name == "NHPP":
+        beta_value = safe_number(parameters.get("beta"))
+        eta_value = safe_number(parameters.get("eta"))
+        if beta_value is None or eta_value is None or beta_value <= 0 or eta_value <= 0:
+            return None
+        return float(eta_value * ((-math.log(target_value)) ** (1.0 / beta_value)))
+
+    if model_name == "RP":
+        distribution_object, distribution_parameters = get_distribution_and_parameters(reliability_result)
+        if distribution_object is None or distribution_parameters is None:
+            return None
+        try:
+            interval_value = float(distribution_object.isf(target_value, *distribution_parameters))
+            return interval_value if np.isfinite(interval_value) and interval_value > 0 else None
+        except Exception:
+            return None
+
+    if model_name == "BPP":
+        mu_value = safe_number(parameters.get("mu"))
+        if mu_value is None or mu_value <= 0:
+            return None
+        return float(-math.log(target_value) / mu_value)
+
+    return None
+
+
+def economic_interval_from_selected_model(
+    reliability_result: dict[str, Any],
+    preventive_cost: float,
+    corrective_cost: float,
+    minimum_reliability: float,
+) -> dict[str, Optional[float]]:
+    """
+    Recherche l’intervalle économique avec le même modèle que celui retenu
+    par l’organigramme. L’intervalle est limité à la zone où R(t) reste au moins
+    égale à minimum_reliability.
+    """
+    preventive_cost_value = safe_number(preventive_cost)
+    corrective_cost_value = safe_number(corrective_cost)
+    minimum_reliability_value = safe_number(minimum_reliability)
+
+    if (
+        preventive_cost_value is None
+        or corrective_cost_value is None
+        or preventive_cost_value <= 0
+        or corrective_cost_value <= 0
+        or minimum_reliability_value is None
+        or not (0 < minimum_reliability_value < 1)
+    ):
+        return {"T_cost": None, "R_at_T": None, "C_min": None}
+
+    upper_bound = reliability_interval_from_selected_model(
+        reliability_result=reliability_result,
+        target_reliability=minimum_reliability_value,
+    )
+    if upper_bound is None or upper_bound <= 1.0:
+        return {"T_cost": None, "R_at_T": None, "C_min": None}
+
+    # Grille suffisamment fine pour Streamlit, sans dépendance additionnelle.
+    time_grid = np.linspace(1.0, float(upper_bound), 2500)
+
+    best_time = None
+    best_reliability = None
+    best_cost = None
+
+    for current_time in time_grid:
+        reliability_value = reliability_from_selected_model(reliability_result, float(current_time))
+        if reliability_value is None or not np.isfinite(reliability_value):
+            continue
+
+        cost_value = (
+            preventive_cost_value + corrective_cost_value * (1.0 - reliability_value)
+        ) / float(current_time)
+
+        if best_cost is None or cost_value < best_cost:
+            best_time = float(current_time)
+            best_reliability = float(reliability_value)
+            best_cost = float(cost_value)
+
+    return {"T_cost": best_time, "R_at_T": best_reliability, "C_min": best_cost}
+
+
+def selected_model_source_label(reliability_result: dict[str, Any]) -> str:
+    model_name = str(reliability_result.get("model") or "?").upper()
+    distribution_name = str(reliability_result.get("distribution") or "?")
+    if model_name == "NHPP":
+        return "NHPP / loi de puissance"
+    if model_name == "RP":
+        return f"RP / {distribution_name}"
+    if model_name == "BPP":
+        return "BPP / approximation de surveillance"
+    return f"{model_name} / {distribution_name}"
 
 
 def get_distribution_and_parameters(reliability_result: dict[str, Any]):
@@ -360,6 +535,7 @@ DISPLAY_COLUMN_NAMES = {
     "days_recommended": "Jours avant maintenance retenus",
     "maintenance_type": "Type de maintenance recommandé",
     "decision_reason": "Justification de la décision fiabiliste",
+    "optimization_model_source": "Modèle utilisé pour l’optimisation",
     "optimization_note": "Note d’optimisation",
     "trend_direction": "Sens global de la tendance",
     "trend_confidence": "Niveau de confiance sur la tendance",
@@ -553,18 +729,10 @@ if not weibull_reference_fits:
     st.error("Pas assez de temps entre défaillances exploitables (au moins 3 valeurs positives) pour les équipements sélectionnés.")
     st.stop()
 
-economic_results_by_equipment: dict[str, dict[str, Any]] = {}
-if economic_optimization_enabled:
-    try:
-        economic_results_by_equipment = propose_intervals_cost_and_reliability(
-            fits=weibull_reference_fits,
-            C_prev=float(preventive_cost),
-            C_corr=float(corrective_cost),
-            R_target=float(target_reliability),
-            R_min_cost=float(minimum_reliability_for_economic_interval),
-        )
-    except Exception:
-        economic_results_by_equipment = {}
+# Les fits Weibull restent calculés comme référence affichable et pour compatibilité
+# avec certains exports historiques. Cependant, les intervalles T_R, T_cost et
+# R(T_cost) sont désormais calculés avec le modèle réellement retenu par
+# l’organigramme, afin d’éviter de mélanger paramètres NHPP et optimisation Weibull.
 
 for equipment_code, weibull_fit in weibull_reference_fits.items():
     pipeline_result = pipeline_results_by_equipment.get(equipment_code, {}) or {}
@@ -583,17 +751,34 @@ for equipment_code, weibull_fit in weibull_reference_fits.items():
     primary_eta = safe_number(parameters.get("eta"), weibull_eta_reference)
     primary_gamma = safe_number(parameters.get("gamma"), weibull_gamma_reference)
 
-    reliability_interval_hours = (economic_results_by_equipment.get(equipment_code) or {}).get("T_R")
-    economic_interval_hours = (economic_results_by_equipment.get(equipment_code) or {}).get("T_cost")
-    reliability_at_economic_interval = (economic_results_by_equipment.get(equipment_code) or {}).get("R_at_T")
-    minimum_hourly_cost = (economic_results_by_equipment.get(equipment_code) or {}).get("C_min")
+    reliability_interval_hours = reliability_interval_from_selected_model(
+        reliability_result=reliability_result,
+        target_reliability=float(target_reliability),
+    )
+
+    if economic_optimization_enabled:
+        economic_result = economic_interval_from_selected_model(
+            reliability_result=reliability_result,
+            preventive_cost=float(preventive_cost),
+            corrective_cost=float(corrective_cost),
+            minimum_reliability=float(minimum_reliability_for_economic_interval),
+        )
+    else:
+        economic_result = {"T_cost": None, "R_at_T": None, "C_min": None}
+
+    economic_interval_hours = economic_result.get("T_cost")
+    reliability_at_economic_interval = economic_result.get("R_at_T")
+    minimum_hourly_cost = economic_result.get("C_min")
 
     recommended_maintenance_type = recommend_maintenance_type(reliability_result)
     recommended_interval_hours = recommend_interval(
-        recommended_maintenance_type,
-        reliability_interval_hours,
-        economic_interval_hours,
+        maintenance_type=recommended_maintenance_type,
+        reliability_interval_hours=reliability_interval_hours,
+        economic_interval_hours=economic_interval_hours,
+        reliability_at_economic_interval=reliability_at_economic_interval,
+        target_reliability=float(target_reliability),
     )
+    optimization_model_source = selected_model_source_label(reliability_result)
 
     mann_kendall_test_result = tests.get("trend_mk", {}) or {}
     laplace_test_result = tests.get("trend_laplace", {}) or {}
@@ -636,11 +821,15 @@ for equipment_code, weibull_fit in weibull_reference_fits.items():
             "days_recommended": hours_to_days(recommended_interval_hours),
             "maintenance_type": recommended_maintenance_type,
             "decision_reason": decision.get("reason"),
+            "optimization_model_source": optimization_model_source,
             "optimization_note": build_optimization_note(
                 primary_eta,
                 economic_interval_hours,
                 reliability_interval_hours,
                 recommended_interval_hours,
+                reliability_at_economic_interval,
+                float(target_reliability),
+                optimization_model_source,
             ),
         }
     )
@@ -728,6 +917,7 @@ with page_tabs[1]:
             "model",
             "process_variant",
             "distribution",
+            "optimization_model_source",
             "beta",
             "eta_h",
             "gamma_h",
@@ -743,6 +933,11 @@ with page_tabs[1]:
     ].copy()
 
     st.dataframe(rename_columns_for_display(optimization_view), use_container_width=True, hide_index=True)
+
+    st.info(
+        "Les intervalles T_R, T_cost et R(T_cost) sont calculés avec le modèle retenu par l’organigramme. "
+        "Les paramètres Weibull de référence restent disponibles uniquement comme repères historiques ou pour compatibilité d’export."
+    )
 
     st.success(
         f"Résultat envoyé vers la future page Maintenance | lignes={len(optimization_dataframe)} | empreinte={dataframe_hash(optimization_dataframe)}"
@@ -801,6 +996,7 @@ with page_tabs[3]:
         f"- **Processus retenu** : **{selected_row.get('model', '—')}**\n"
         f"- **Variant du processus** : **{selected_row.get('process_variant', '—')}**\n"
         f"- **Loi de probabilité retenue** : **{selected_row.get('distribution', '—')}**\n"
+        f"- **Modèle utilisé pour l’optimisation** : **{selected_row.get('optimization_model_source', '—')}**\n"
         f"- **Paramètres principaux** : **bêta = {format_number(selected_row.get('beta'), 2)}**, "
         f"**êta = {format_number(selected_row.get('eta_h'), 1)} heures**, "
         f"**gamma = {format_number(selected_row.get('gamma_h'), 1)} heures**\n"

@@ -26,7 +26,7 @@ if not st.session_state["auth_ok"]:
 render_shell("app.py")
 render_page_header(
     "Fiabilité et maintenance des transformateurs",
-    "Importation des données, analyse, optimisation, maintenance et décision finale.",
+    "",
     "⚡",
 )
 
