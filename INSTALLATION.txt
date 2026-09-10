@@ -1,0 +1,53 @@
+INSTALLATION — PARCOURS SCIENTIFIQUE CORRIGÉ
+
+1. Sauvegarder le dossier actuel du projet.
+2. Copier les dossiers core et pages de cette archive à la racine du projet,
+   en remplaçant les fichiers de même nom. Ne pas supprimer les autres fichiers.
+   core/scientific_ui.py est un nouveau fichier indispensable.
+3. Redémarrer : streamlit run app.py
+4. Réimporter les données dans Sources, sélectionner un équipement dans
+   Indicateurs et lancer le calcul. Passer à Optimisation, puis Maintenance
+   et Résultats. Les calculs sont conservés pendant la session ; après un
+   redémarrage, relancer l'analyse.
+
+CONTENU
+Cinq pages complètes Sources, Indicateurs, Optimisation, Maintenance, Résultats.
+Les trois modules datahub.py, organigram.py et optimize.py précédemment corrigés.
+Un module commun core/scientific_ui.py.
+Les pages 6 à 9 (stock, transformateurs, temps réel, alertes) restent celles du projet.
+
+UTILISATION
+CSV événements : asset_id,event_start,repair_time_hours (durée optionnelle).
+CSV intervalles : equipment_code,ttf_h,duree_rep_h (durée optionnelle).
+Excel : feuilles events_history, analysis_settings, asset_info et autres feuilles.
+Réglages optionnels : asset_id,observation_start,observation_end,decision_time.
+Les dates doivent être non ambiguës, de préférence ISO AAAA-MM-JJ.
+Les fichiers d'intervalles seuls ne produisent pas d'échéance calendaire.
+La sélection AICc est le défaut. Sélection prédictive et scénario explicite
+sont disponibles dans Indicateurs. Le bootstrap est optionnel, désactivé par
+ défaut et calculé pour le modèle retenu lorsqu'il est demandé.
+
+CHANGEMENTS D'INTERFACE
+Les cinq pages sont des versions simplifiées utilisant le calcul commun.
+L'import scientifique utilise le datahub ; il n'alimente plus l'ancienne table
+SQLite de la page Sources. Les données et fonctions des autres pages restent
+hors de ce raccordement. Les exports scientifiques sont CSV et JSON dans un ZIP ;
+l'ancien export PDF et ses formules indépendantes ne sont pas utilisés.
+Les imports ZIP et les anciennes variantes de colonnes non documentées ici
+ne sont pas pris en charge par cette nouvelle page Sources.
+
+VÉRIFICATIONS
+Compilation des neuf fichiers Python.
+Streamlit AppTest : exécution des cinq pages, lancement de l'analyse,
+optimisation, affichage maintenance et résultats sur données synthétiques.
+Vérification de la cible de fiabilité, création de l'export et diminution
+exacte d'un jour du délai restant entre deux consultations espacées de 24 h.
+Ces tests isolent l'authentification et le thème existants : ils ne constituent
+pas un test de connexion réel ni une inspection visuelle dans votre navigateur.
+L'import via le sélecteur de fichier reste à vérifier dans votre installation.
+
+LIMITES SCIENTIFIQUES
+Les horizons sont exploratoires si l'adéquation est absente ou rejetée.
+Pour renouvellements et GRP, seul l'horizon fiabiliste est fourni ; aucun
+optimum économique n'est calculé. Aucun score arbitraire de priorité.
+Une date indicative n'est jamais une date certaine de panne.

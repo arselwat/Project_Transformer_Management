@@ -1,0 +1,94 @@
+"""Parcours scientifique commun : une analyse et une optimisation par jeu de données."""
+import hashlib
+import io
+import json
+import zipfile
+import numpy as np
+import pandas as pd
+import streamlit as st
+from core.datahub import get_current_failures_df, get_current_project_data, get_pipeline_inputs
+from core.reliability.organigram import analyze_project_inputs
+from core.reliability.optimize import optimize_maintenance
+
+LABELS = {'expon':'HPP', 'power_law_nhpp':'PLP-NHPP', 'weibull_2p':'Renouvellement Weibull', 'lognorm':'Renouvellement lognormal', 'grp_kijima_i':'GRP Kijima I'}
+
+def start(title, path):
+    from core.security.auth import require_login
+    from core.ui import render_shell, render_page_header
+    st.set_page_config(page_title=title, layout='wide')
+    require_login()
+    render_shell(path)
+    render_page_header(title, 'Analyse commune, prévision conditionnelle et traçabilité.', '📊')
+
+def invalidate():
+    for key in ('science_analysis','science_optimization','science_input_hash','science_inputs'):
+        st.session_state.pop(key, None)
+
+def input_context():
+    frames = get_current_project_data()
+    ids = set()
+    for frame, column in [(frames.get('events_history',pd.DataFrame()),'asset_id'), (get_current_failures_df(),'equipment_code')]:
+        if column in frame:
+            ids.update(frame[column].dropna().astype(str))
+    if not ids:
+        st.info('Importez les données dans Sources pour commencer.')
+        st.stop()
+    asset = st.selectbox('Équipement', sorted(ids), key='science_asset')
+    inputs = get_pipeline_inputs(asset)
+    signature = hashlib.sha256(repr((asset, inputs['ttf_series'], inputs['repair_series'], inputs['observation_windows'].to_dict(), inputs['project_meta'], inputs['failures_meta'])).encode()).hexdigest()
+    if st.session_state.get('science_input_hash') != signature:
+        invalidate()
+        st.session_state['science_input_hash'] = signature
+    st.session_state['science_inputs'] = inputs
+    return inputs
+
+def analysis_required():
+    inputs = input_context()
+    result = st.session_state.get('science_analysis')
+    if not result:
+        st.info('Lancez le calcul dans la page Indicateurs pour cet équipement.')
+        st.stop()
+    return inputs, result
+
+def notices(r):
+    for warning in r.get('warnings',[]):
+        if not warning.startswith('Les anciennes pages'):
+            st.warning(warning)
+    st.caption('La sélection statistique ne démontre ni une cause physique ni une opération de maintenance nécessaire.')
+
+def show_optimization(o):
+    st.dataframe(pd.DataFrame([{'Horizon fiabiliste (h)':o.get('T_R'), 'Horizon économique (h)':o.get('T_cost'), 'Horizon retenu (h)':o.get('T_recommended'), 'Fiabilité retenue':o.get('reliability_at_recommended'), 'Statut':o.get('status')}]), hide_index=True)
+    st.write(o.get('selection_reason', o.get('reason','')))
+    if o.get('economic_status') == 'unsupported_model':
+        st.info('Modèle de renouvellement ou GRP : horizon fiabiliste uniquement ; optimisation économique indisponible.')
+    notices(o)
+
+def plan(inputs, o, today=None):
+    windows = inputs.get('observation_windows',pd.DataFrame())
+    horizon = o.get('T_recommended')
+    if windows.empty or horizon is None or not np.isfinite(horizon):
+        return {'statut':'Date indisponible : référence calendaire ou horizon absent.'}
+    reference = pd.to_datetime(windows.iloc[0]['decision_time'], utc=True)
+    due = reference + pd.Timedelta(hours=float(horizon))
+    now = pd.Timestamp.now(tz='UTC') if today is None else pd.to_datetime(today,utc=True)
+    remaining = (due-now).total_seconds()/86400
+    return {'référence':reference.isoformat(), 'échéance indicative':due.isoformat(), 'jours restants':remaining,
+            'statut':'Échéance dépassée : actualiser les données et réexaminer le plan.' if remaining<0 else 'Échéance indicative à examiner avec le diagnostic technique.',
+            'qualification':o.get('status')}
+
+def export_bundle(inputs, analysis, optimization):
+    def default(x):
+        if isinstance(x,pd.DataFrame): return x.to_dict(orient='records')
+        if isinstance(x,np.ndarray): return x.tolist()
+        if isinstance(x,np.generic): return x.item()
+        return str(x)
+    payload = {'asset_id':inputs['asset_id'], 'analysis':analysis, 'optimization':optimization,
+               'plan':plan(inputs,optimization) if optimization else None,
+               'observation_windows':inputs['observation_windows'], 'quality_report':inputs['data_quality_report']}
+    b = io.BytesIO()
+    with zipfile.ZipFile(b,'w',zipfile.ZIP_DEFLATED) as z:
+        z.writestr('resultats.json',json.dumps(payload,ensure_ascii=False,indent=2,default=default))
+        for name, df in analysis['tables'].items():
+            z.writestr(name+'.csv',df.to_csv(index=False))
+        z.writestr('LISEZ_MOI.txt','Les CSV et le JSON proviennent du même calcul. Voir analysis_hash et les options de validation. Une échéance est indicative, non une date certaine de panne.')
+    return b.getvalue()

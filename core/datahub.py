@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import hashlib
 import json
+import math
 from typing import Any, Dict, Optional
 
 import pandas as pd
@@ -17,6 +18,9 @@ PROJECT_DIR = DATA_DIR / "current_project"
 PROJECT_DIR.mkdir(parents=True, exist_ok=True)
 PROJECT_META_FILE = PROJECT_DIR / "project_meta.json"
 
+DATAHUB_VERSION = "2.0"
+FAILURES_META_FILE = DATA_DIR / "failures_meta.json"
+
 REQUIRED_COLS = {"equipment_code", "ttf_h"}
 PROJECT_SHEETS = [
     "asset_info",
@@ -26,6 +30,9 @@ PROJECT_SHEETS = [
     "maintenance_policies",
     "analysis_settings",
     "failures_ttf",
+    "events_validated",
+    "observation_windows",
+    "data_quality_report",
 ]
 
 
@@ -42,52 +49,50 @@ def _safe_df(df: Optional[pd.DataFrame]) -> pd.DataFrame:
 
 
 def _coerce_bool01(s: pd.Series) -> pd.Series:
+    """Les codes inconnus restent manquants ; ils ne deviennent jamais 0."""
     if s is None:
-        return pd.Series(dtype="int64")
+        return pd.Series(dtype="Int64")
+    mapping = {"1": 1, "0": 0, "true": 1, "false": 0,
+               "yes": 1, "no": 0, "oui": 1, "non": 0, "y": 1, "n": 0}
+    out = s.astype("string").str.strip().str.lower().map(mapping)
+    numeric = pd.to_numeric(s, errors="coerce")
+    return out.fillna(numeric.where(numeric.isin([0, 1]))).astype("Int64")
 
-    if s.dtype == bool:
-        return s.astype(int)
 
-    mapping = {
-        "1": 1,
-        "0": 0,
-        "true": 1,
-        "false": 0,
-        "yes": 1,
-        "no": 0,
-        "oui": 1,
-        "non": 0,
-        "y": 1,
-        "n": 0,
-    }
+def _invalidate_results() -> None:
+    # Clés de résultats connues. Les widgets et les données métier sont conservés.
+    for key in ("optimization_df", "optimization_src", "opt_meta", "opt_pdf_path"):
+        st.session_state.pop(key, None)
 
-    return (
-        s.astype(str)
-        .str.strip()
-        .str.lower()
-        .map(mapping)
-        .fillna(pd.to_numeric(s, errors="coerce"))
-        .fillna(0)
-        .astype(int)
-    )
+
+def _finite_numeric(s: pd.Series) -> pd.Series:
+    return pd.to_numeric(s, errors="coerce").replace([float("inf"), -float("inf")], float("nan"))
+
+
+def _dates(s: pd.Series) -> pd.Series:
+    # Parsing scalaire pour accepter les formats ISO mixtes sans heuristique jour/mois.
+    # Les dates sans fuseau sont supposées dans une même base locale.
+    values = s.map(lambda v: pd.to_datetime(v, errors="coerce"))
+    aware = values.map(lambda v: pd.notna(v) and getattr(v, "tzinfo", None) is not None)
+    if aware.any() and not aware[values.notna()].all():
+        raise ValueError("Dates avec et sans fuseau mélangées : uniformiser les horodatages.")
+    if aware.any():
+        return pd.to_datetime(values, utc=True).dt.tz_localize(None)
+    return pd.to_datetime(values)
+
+
+def _issue(log: list, row: Any, code: str, message: str, asset: Any = "") -> None:
+    log.append({"source_row": str(row), "asset_id": str(asset),
+                "code": code, "message": message})
 
 
 def _dataset_hash(df: pd.DataFrame) -> str:
+    """Inclut dates, conventions et contexte ; aucune réduction aux seuls TBF."""
     if df is None or df.empty:
         return ""
-    x = df.copy()
-    x.columns = [str(c).strip() for c in x.columns]
-    keep = [c for c in ["equipment_code", "ttf_h", "duree_rep_h"] if c in x.columns]
-    x = x[keep].copy()
-    if "equipment_code" in x.columns:
-        x["equipment_code"] = x["equipment_code"].astype(str)
-    if "ttf_h" in x.columns:
-        x["ttf_h"] = pd.to_numeric(x["ttf_h"], errors="coerce").round(6)
-    if "duree_rep_h" in x.columns:
-        x["duree_rep_h"] = pd.to_numeric(x["duree_rep_h"], errors="coerce").round(6)
-
-    blob = x.to_csv(index=False).encode("utf-8")
-    return hashlib.sha256(blob).hexdigest()[:16]
+    blob = DATAHUB_VERSION + "\n" + df.to_csv(index=False)
+    blob += json.dumps(df.attrs.get("analysis_context", {}), sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
 
 def _project_hash(frames: Dict[str, pd.DataFrame]) -> str:
@@ -96,7 +101,7 @@ def _project_hash(frames: Dict[str, pd.DataFrame]) -> str:
         df = _safe_df(frames[name])
         chunks.append(f"##{name}\n")
         chunks.append(df.to_csv(index=False))
-    blob = "".join(chunks).encode("utf-8")
+    blob = (DATAHUB_VERSION + "".join(chunks)).encode("utf-8")
     return hashlib.sha256(blob).hexdigest()[:16]
 
 
@@ -105,108 +110,93 @@ def _project_hash(frames: Dict[str, pd.DataFrame]) -> str:
 # ============================================================
 
 def _clean_failures_df(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame(columns=["equipment_code", "ttf_h", "duree_rep_h"])
-
-    df = df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
-
-    if not REQUIRED_COLS.issubset(set(df.columns)):
-        return pd.DataFrame(columns=["equipment_code", "ttf_h", "duree_rep_h"])
-
-    if "duree_rep_h" not in df.columns:
-        df["duree_rep_h"] = None
-
-    df["equipment_code"] = df["equipment_code"].astype(str)
-    df["ttf_h"] = pd.to_numeric(df["ttf_h"], errors="coerce")
-    df["duree_rep_h"] = pd.to_numeric(df["duree_rep_h"], errors="coerce")
-
-    df = df.dropna(subset=["ttf_h"])
-    df = df[df["ttf_h"] > 0].reset_index(drop=True)
-    return df
+    out = _safe_df(df)
+    log = list(out.attrs.get("quality_report", []))
+    if out.empty:
+        empty = pd.DataFrame(columns=["equipment_code", "ttf_h", "duree_rep_h"])
+        empty.attrs = dict(out.attrs)
+        empty.attrs["quality_report"] = log
+        return empty
+    missing = REQUIRED_COLS - set(out.columns)
+    if missing:
+        empty = pd.DataFrame(columns=["equipment_code", "ttf_h", "duree_rep_h"])
+        _issue(log, "", "missing_columns", "Colonnes absentes : " + ", ".join(sorted(missing)))
+        empty.attrs["quality_report"] = log
+        return empty
+    out["equipment_code"] = out["equipment_code"].astype("string").str.strip()
+    valid_id = out["equipment_code"].notna() & out["equipment_code"].ne("")
+    out["ttf_h"] = _finite_numeric(out["ttf_h"])
+    valid_ttf = out["ttf_h"].notna() & out["ttf_h"].gt(0)
+    for idx in out.index[~(valid_id & valid_ttf)]:
+        _issue(log, idx, "excluded_interval", "Identifiant absent ou intervalle non fini/non positif.")
+    if "duree_rep_h" not in out:
+        out["duree_rep_h"] = float("nan")
+    original = out["duree_rep_h"].copy()
+    repair = _finite_numeric(original)
+    bad = (original.notna() & repair.isna()) | repair.lt(0)
+    for idx in out.index[bad]:
+        _issue(log, idx, "invalid_repair", "Durée de réparation invalide remplacée par une valeur manquante.")
+    out["duree_rep_h"] = repair.mask(bad)
+    if "time_basis" not in out:
+        out["time_basis"] = "unspecified"
+    out = out.loc[valid_id & valid_ttf].reset_index(drop=True)
+    out.attrs["quality_report"] = log
+    return out
 
 
 def set_current_failures_df(
-    df: pd.DataFrame,
-    source_name: str = "unknown",
-    persist: bool = True,
+    df: pd.DataFrame, source_name: str = "unknown", persist: bool = True,
 ) -> Dict[str, Any]:
     df2 = _clean_failures_df(df)
+    log = df2.attrs.get("quality_report", [])
+    context = df2.attrs.get("analysis_context", {})
+    h = _dataset_hash(df2)
+    if st.session_state.get("failures_hash") != h:
+        _invalidate_results()
+    meta = {"ok": not df2.empty, "rows": len(df2), "hash": h,
+            "source": source_name, "file": str(FAILURES_FILE),
+            "quality_report": log, "analysis_context": context,
+            "datahub_version": DATAHUB_VERSION}
     if df2.empty:
-        return {
-            "ok": False,
-            "msg": "Dataset vide ou invalide. Il faut equipment_code et ttf_h (>0).",
-        }
-
+        meta["msg"] = "Aucun intervalle exploitable. Consulter quality_report."
     if persist:
         FAILURES_FILE.parent.mkdir(parents=True, exist_ok=True)
         df2.to_csv(FAILURES_FILE, index=False, encoding="utf-8")
-
-    h = _dataset_hash(df2)
-    st.session_state["failures_df"] = df2
-    st.session_state["failures_hash"] = h
-    st.session_state["failures_source"] = source_name
-
-    return {
-        "ok": True,
-        "rows": int(len(df2)),
-        "hash": h,
-        "file": str(FAILURES_FILE),
-    }
+        FAILURES_META_FILE.write_text(json.dumps(meta, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    # Une importation vide remplace aussi le jeu actif : jamais de retour à un ancien jeu.
+    st.session_state.update({"failures_df": df2, "failures_hash": h,
+                             "failures_source": source_name, "failures_metadata": meta})
+    return meta
 
 
 def get_current_failures_df() -> pd.DataFrame:
-    if isinstance(st.session_state.get("failures_df"), pd.DataFrame):
-        df = _clean_failures_df(st.session_state["failures_df"])
-        if not df.empty:
-            if not st.session_state.get("failures_hash"):
-                st.session_state["failures_hash"] = _dataset_hash(df)
-            return df
-
+    current = st.session_state.get("failures_df")
+    if isinstance(current, pd.DataFrame):
+        return current.copy()
     if not FAILURES_FILE.exists():
         return pd.DataFrame(columns=["equipment_code", "ttf_h", "duree_rep_h"])
-
     try:
-        df = pd.read_csv(FAILURES_FILE)
-    except Exception:
-        try:
-            df = pd.read_csv(FAILURES_FILE, engine="python", on_bad_lines="skip", sep=None)
-        except Exception:
-            return pd.DataFrame(columns=["equipment_code", "ttf_h", "duree_rep_h"])
-
-    df = _clean_failures_df(df)
-    if df.empty:
-        return df
-
-    st.session_state["failures_df"] = df
-    st.session_state["failures_hash"] = _dataset_hash(df)
-    st.session_state["failures_source"] = f"file:{FAILURES_FILE.name}"
-    return df
+        # Ne jamais ignorer silencieusement une ligne CSV mal formée.
+        df = pd.read_csv(FAILURES_FILE, dtype={"equipment_code": "string"})
+        meta = json.loads(FAILURES_META_FILE.read_text(encoding="utf-8")) if FAILURES_META_FILE.exists() else {}
+        df.attrs["analysis_context"] = meta.get("analysis_context", {})
+        df.attrs["quality_report"] = meta.get("quality_report", [])
+        set_current_failures_df(df, meta.get("source", "file:failures_saved.csv"), persist=False)
+    except (ValueError, OSError, pd.errors.ParserError) as exc:
+        empty = pd.DataFrame(columns=["equipment_code", "ttf_h", "duree_rep_h"])
+        empty.attrs["quality_report"] = [{"code": "read_error", "message": str(exc)}]
+        set_current_failures_df(empty, "file:failures_saved.csv", persist=False)
+    return st.session_state["failures_df"].copy()
 
 
 def get_failures_meta() -> Dict[str, Any]:
     df = get_current_failures_df()
-    if df.empty:
-        return {
-            "ok": False,
-            "rows": 0,
-            "hash": "",
-            "source": "",
-            "file": str(FAILURES_FILE),
-        }
+    meta = dict(st.session_state.get("failures_metadata", {}))
+    meta.update(ok=not df.empty, rows=len(df),
+                hash=st.session_state.get("failures_hash", ""),
+                source=st.session_state.get("failures_source", ""), file=str(FAILURES_FILE))
+    return meta
 
-    return {
-        "ok": True,
-        "rows": int(len(df)),
-        "hash": str(st.session_state.get("failures_hash", "")),
-        "source": str(st.session_state.get("failures_source", "")),
-        "file": str(FAILURES_FILE),
-    }
-
-
-# ============================================================
-# Project normalization
-# ============================================================
 
 def _normalize_project_frames(frames: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
     out: Dict[str, pd.DataFrame] = {}
@@ -246,17 +236,7 @@ def _normalize_project_frames(frames: Dict[str, pd.DataFrame]) -> Dict[str, pd.D
                     ren[lower[k]] = v
             df = df.rename(columns=ren)
 
-            for c in ["event_start", "event_end"]:
-                if c in df.columns:
-                    df[c] = pd.to_datetime(df[c], errors="coerce")
-
-            for c in ["is_failure", "is_planned"]:
-                if c in df.columns:
-                    df[c] = _coerce_bool01(df[c])
-
-            for c in ["repair_time_hours", "downtime_hours", "cost_corrective_usd"]:
-                if c in df.columns:
-                    df[c] = pd.to_numeric(df[c], errors="coerce")
+            # Conversion et contrôle dans prepare_event_data ; historique brut conservé.
 
         elif name == "thermal_timeseries":
             aliases = {
@@ -369,45 +349,174 @@ def _normalize_project_frames(frames: Dict[str, pd.DataFrame]) -> Dict[str, pd.D
 # Public project builder
 # ============================================================
 
-def build_ttf_from_events(events: pd.DataFrame) -> pd.DataFrame:
-    df = _safe_df(events)
+def prepare_event_data(events: pd.DataFrame, settings: Optional[pd.DataFrame] = None) -> Dict[str, pd.DataFrame]:
+    """Prépare les événements sans inventer de première durée de fonctionnement.
 
-    needed = {"event_id", "asset_id", "event_start", "is_failure"}
-    if df.empty or not needed.issubset(df.columns):
-        return pd.DataFrame(columns=["equipment_code", "ttf_h", "duree_rep_h", "failure_time", "event_id"])
-
-    if "repair_time_hours" not in df.columns:
-        df["repair_time_hours"] = None
-
-    df["event_start"] = pd.to_datetime(df["event_start"], errors="coerce")
-    df = df.dropna(subset=["event_start"]).copy()
-
-    df["asset_id"] = df["asset_id"].astype(str)
-    df["is_failure"] = _coerce_bool01(df["is_failure"])
-    df["repair_time_hours"] = pd.to_numeric(df["repair_time_hours"], errors="coerce")
-
-    df = df[df["is_failure"] == 1].sort_values(["asset_id", "event_start"]).reset_index(drop=True)
-
-    out = []
-    for asset_id, g in df.groupby("asset_id"):
-        g = g.sort_values("event_start").reset_index(drop=True)
+    Référence par défaut : première panne enregistrée (pas la mise en service).
+    Colonnes optionnelles de settings, par asset_id : observation_start,
+    observation_end, decision_time. Sans bornes fournies, le début et la fin
+    sont les événements extrêmes et cette convention est indiquée.
+    ttf_h reste l'intervalle CALENDAIRE pour compatibilité des pages existantes.
+    operating_time_h représente seulement la durée entre une remise en service
+    documentée et la panne suivante ; d'autres arrêts peuvent s'y trouver.
+    """
+    df = _safe_df(events).reset_index(drop=True)
+    log = []
+    cols = ["equipment_code", "ttf_h", "duree_rep_h", "failure_time", "event_id",
+            "previous_failure_time", "previous_event_id", "time_basis", "operating_time_h"]
+    empty = pd.DataFrame(columns=cols)
+    def result(intervals, valid, windows):
+        report = pd.DataFrame(log, columns=["source_row", "asset_id", "code", "message"])
+        intervals.attrs["quality_report"] = log
+        return {"failures_ttf": intervals, "events_validated": valid,
+                "observation_windows": windows, "data_quality_report": report}
+    missing = {"asset_id", "event_start", "is_failure"} - set(df)
+    if df.empty or missing:
+        _issue(log, "", "missing_events", "Historique vide ou colonnes absentes : " + ", ".join(sorted(missing)))
+        return result(empty, pd.DataFrame(), pd.DataFrame())
+    df["source_row"] = df.index + 2  # ligne de fichier avec en-tête
+    if "event_id" not in df:
+        df["event_id"] = ["row_" + str(i) for i in df.source_row]
+        _issue(log, "", "generated_ids", "Identifiants techniques générés à partir des lignes source.")
+    df["asset_id"] = df.asset_id.astype("string").str.strip()
+    try:
+        df["event_start"] = _dates(df.event_start)
+        if "event_end" in df:
+            df["event_end"] = _dates(df.event_end)
+    except ValueError as exc:
+        _issue(log, "", "ambiguous_timezone", str(exc))
+        return result(empty, pd.DataFrame(), pd.DataFrame())
+    df["is_failure"] = _coerce_bool01(df.is_failure)
+    planned_supplied = "is_planned" in df
+    df["is_planned"] = _coerce_bool01(df.is_planned) if planned_supplied else 0
+    for col in ("repair_time_hours", "downtime_hours"):
+        if col not in df:
+            df[col] = float("nan")
+        original = df[col].copy()
+        values = _finite_numeric(original)
+        bad = (original.notna() & values.isna()) | values.lt(0)
+        for i in df.index[bad]:
+            _issue(log, df.at[i, "source_row"], "invalid_duration", col + " invalide ; conservé manquant.", df.at[i, "asset_id"])
+        df[col] = values.mask(bad)
+    valid_ids = df.asset_id.notna() & df.asset_id.ne("")
+    for i in df.index[~valid_ids]:
+        _issue(log, df.at[i, "source_row"], "missing_asset", "Ligne exclue : équipement non identifié.")
+    df = df.loc[valid_ids].copy()
+    output, validated, windows = [], [], []
+    settings = _safe_df(settings)
+    for asset, group in df.groupby("asset_id", sort=False):
+        g = group.copy()
+        invalid = g.event_start.isna() | g.is_failure.isna() | g.is_planned.isna()
+        if invalid.any():
+            for i in g.index[invalid]:
+                _issue(log, g.at[i, "source_row"], "blocked_asset", "Date ou indicateur ambigu : équipement non analysé pour éviter de relier artificiellement des pannes.", asset)
+            continue
+        duplicate = g.drop(columns="source_row").duplicated()
+        for i in g.index[duplicate]:
+            _issue(log, g.at[i, "source_row"], "exact_duplicate", "Doublon exact exclu.", asset)
+        g = g.loc[~duplicate].copy()
+        known_id = g.event_id.notna() & g.event_id.astype("string").str.strip().ne("")
+        if g.loc[known_id, "event_id"].duplicated().any():
+            _issue(log, "", "conflicting_id", "Identifiant événement répété avec contenu différent : équipement bloqué.", asset)
+            continue
+        for i in g.index[~known_id]:
+            g.at[i, "event_id"] = "row_" + str(g.at[i, "source_row"])
+            _issue(log, g.at[i, "source_row"], "generated_id", "Identifiant technique généré.", asset)
+        selected = g.is_failure.eq(1) & g.is_planned.eq(0)
+        for i in g.index[~selected]:
+            _issue(log, g.at[i, "source_row"], "excluded_non_failure", "Événement programmé ou non défaillant, hors comptage des pannes.", asset)
+        g = g.loc[selected].sort_values("event_start", kind="stable").reset_index(drop=True)
+        if g.empty:
+            continue
+        if g.event_start.duplicated().any():
+            _issue(log, "", "simultaneous_events", "Plusieurs pannes au même instant : consolider l'historique avant analyse.", asset)
+            continue
+        settings_asset = settings
+        if "asset_id" in settings:
+            settings_asset = settings[settings.asset_id.astype("string").eq(str(asset))]
+        elif len(settings) > 1:
+            _issue(log, "", "ambiguous_settings", "Plusieurs réglages sans asset_id : équipement bloqué.", asset)
+            continue
+        if len(settings_asset) > 1:
+            _issue(log, "", "ambiguous_settings", "Plusieurs réglages pour le même équipement.", asset)
+            continue
+        config = settings_asset.iloc[0].to_dict() if len(settings_asset) else {}
+        first, last = g.event_start.iloc[0], g.event_start.iloc[-1]
+        try:
+            def boundary(key, default):
+                value = config.get(key)
+                if value is None or pd.isna(value) or str(value).strip() == "":
+                    return default
+                parsed = _dates(pd.Series([value])).iloc[0]
+                if pd.isna(parsed):
+                    raise ValueError("Borne temporelle invalide : " + key)
+                return parsed
+            start = boundary("observation_start", first)
+            end = boundary("observation_end", last)
+            decision = boundary("decision_time", end)
+            if start > first or end < last or decision < end:
+                raise ValueError("Exiger début <= première panne, fin >= dernière panne, décision >= fin.")
+        except ValueError as exc:
+            _issue(log, "", "invalid_window", str(exc), asset)
+            continue
+        explicit_start = pd.notna(config.get("observation_start")) and str(config.get("observation_start", "")).strip() != ""
+        explicit_end = pd.notna(config.get("observation_end")) and str(config.get("observation_end", "")).strip() != ""
+        window = {"asset_id": str(asset), "observation_start": start,
+                  "observation_end": end, "decision_time": decision,
+                  "first_failure_time": first, "last_failure_time": last,
+                  "time_origin": first, "origin_convention": "first_recorded_failure",
+                  "start_source": "provided" if explicit_start else "first_recorded_failure",
+                  "end_source": "provided" if explicit_end else "last_recorded_failure",
+                  "time_basis": "calendar", "unit": "hours",
+                  "failure_count": len(g), "interval_count": max(0, len(g)-1),
+                  "exposure_h": (end-start).total_seconds()/3600,
+                  "history_time_h": (last-first).total_seconds()/3600,
+                  "decision_time_h": (decision-first).total_seconds()/3600,
+                  "right_censor_h": (end-last).total_seconds()/3600,
+                  "pre_first_observation_h": (first-start).total_seconds()/3600,
+                  "unobserved_after_end_h": (decision-end).total_seconds()/3600}
+        windows.append(window)
+        g["return_to_service_time"] = g.get("event_end", pd.Series(pd.NaT, index=g.index))
+        for i in g.index:
+            rt = g.at[i, "return_to_service_time"]
+            if pd.notna(rt) and rt < g.at[i, "event_start"]:
+                _issue(log, g.at[i, "source_row"], "invalid_return", "Remise en service antérieure à la panne ; date écartée.", asset)
+                g.at[i, "return_to_service_time"] = pd.NaT
+            elif pd.notna(rt):
+                measured = (rt-g.at[i, "event_start"]).total_seconds()/3600
+                given = g.at[i, "downtime_hours"]
+                if pd.notna(given) and abs(given-measured) > 1e-6:
+                    _issue(log, g.at[i, "source_row"], "downtime_mismatch", "Durée d'arrêt déclarée différente des horodatages ; les deux sont conservées.", asset)
+        g["event_time_h"] = (g.event_start-first).dt.total_seconds()/3600
+        validated.append(g)
         for i in range(1, len(g)):
-            dt_h = (g.loc[i, "event_start"] - g.loc[i - 1, "event_start"]).total_seconds() / 3600.0
-            if dt_h > 0:
-                out.append(
-                    {
-                        "equipment_code": str(asset_id),
-                        "ttf_h": float(dt_h),
-                        "duree_rep_h": g.loc[i, "repair_time_hours"],
-                        "failure_time": g.loc[i, "event_start"],
-                        "event_id": g.loc[i, "event_id"],
-                    }
-                )
+            prev, row = g.iloc[i-1], g.iloc[i]
+            gap = (row.event_start-prev.event_start).total_seconds()/3600
+            uptime = float("nan")
+            if pd.notna(prev.return_to_service_time):
+                uptime = (row.event_start-prev.return_to_service_time).total_seconds()/3600
+                if uptime < 0:
+                    _issue(log, row.source_row, "overlapping_outage", "Panne avant remise en service précédente ; durée de fonctionnement non calculable.", asset)
+                    uptime = float("nan")
+            output.append({"equipment_code": str(asset), "ttf_h": gap,
+                           "duree_rep_h": row.repair_time_hours,
+                           "failure_time": row.event_start, "event_id": row.event_id,
+                           "previous_failure_time": prev.event_start, "previous_event_id": prev.event_id,
+                           "return_to_service_time": row.return_to_service_time,
+                           "previous_return_to_service_time": prev.return_to_service_time,
+                           "downtime_hours": row.downtime_hours,
+                           "operating_time_h": uptime, "time_basis": "calendar",
+                           "event_time_h": row.event_time_h, "time_origin": first,
+                           "observation_start": start, "observation_end": end,
+                           "decision_time": decision, "right_censor_h": window["right_censor_h"]})
+    return result(pd.DataFrame(output) if output else empty,
+                  pd.concat(validated, ignore_index=True) if validated else pd.DataFrame(),
+                  pd.DataFrame(windows))
 
-    if not out:
-        return pd.DataFrame(columns=["equipment_code", "ttf_h", "duree_rep_h", "failure_time", "event_id"])
 
-    return pd.DataFrame(out)
+def build_ttf_from_events(events: pd.DataFrame) -> pd.DataFrame:
+    """API historique conservée ; le rapport de contrôle est dans DataFrame.attrs."""
+    return prepare_event_data(events)["failures_ttf"]
 
 
 def set_current_project_data(
@@ -422,11 +531,14 @@ def set_current_project_data(
     for name in ["asset_info", "events_history", "thermal_timeseries", "thermal_params", "maintenance_policies", "analysis_settings"]:
         frames.setdefault(name, pd.DataFrame())
 
-    failures_ttf = build_ttf_from_events(frames.get("events_history", pd.DataFrame()))
-    frames["failures_ttf"] = failures_ttf
+    prepared = prepare_event_data(frames.get("events_history", pd.DataFrame()), frames.get("analysis_settings"))
+    frames.update(prepared)
+    failures_ttf = frames["failures_ttf"]
 
     h = _project_hash(frames)
 
+    if st.session_state.get("project_hash") != h:
+        _invalidate_results()
     st.session_state["project_data"] = frames
     st.session_state["project_hash"] = h
     st.session_state["project_source"] = source_name
@@ -434,6 +546,8 @@ def set_current_project_data(
     if persist:
         PROJECT_DIR.mkdir(parents=True, exist_ok=True)
         for name, df in frames.items():
+            if Path(name).name != name or name in (".", ".."):
+                raise ValueError("Nom de feuille invalide : " + name)
             df.to_csv(PROJECT_DIR / f"{name}.csv", index=False, encoding="utf-8")
 
         meta = {
@@ -445,9 +559,11 @@ def set_current_project_data(
         }
         PROJECT_META_FILE.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    if sync_failures and not failures_ttf.empty:
+    if sync_failures:
+        failures_ttf.attrs["analysis_context"] = {"project_hash": h,
+            "windows": frames["observation_windows"].to_dict(orient="records")}
         set_current_failures_df(
-            failures_ttf[["equipment_code", "ttf_h", "duree_rep_h"]],
+            failures_ttf,
             source_name=f"{source_name}:events_history",
             persist=persist,
         )
@@ -472,11 +588,14 @@ def _load_project_frames_from_disk() -> Dict[str, pd.DataFrame]:
         p = PROJECT_DIR / f"{name}.csv"
         if p.exists():
             try:
-                frames[name] = pd.read_csv(p)
+                frames[name] = pd.read_csv(p, dtype={"asset_id": "string", "equipment_code": "string", "event_id": "string"})
             except Exception:
                 frames[name] = pd.DataFrame()
 
-    return _normalize_project_frames(frames)
+    frames = _normalize_project_frames(frames)
+    if not frames.get("events_history", pd.DataFrame()).empty:
+        frames.update(prepare_event_data(frames["events_history"], frames.get("analysis_settings")))
+    return frames
 
 
 def get_current_project_data() -> Dict[str, pd.DataFrame]:
@@ -537,7 +656,10 @@ def clear_current_project_data(clear_failures: bool = False) -> None:
     st.session_state.pop("project_hash", None)
     st.session_state.pop("project_source", None)
 
+    _invalidate_results()
     if clear_failures:
+        FAILURES_META_FILE.unlink(missing_ok=True)
+        st.session_state.pop("failures_metadata", None)
         if FAILURES_FILE.exists():
             try:
                 FAILURES_FILE.unlink()
@@ -614,6 +736,18 @@ def get_pipeline_inputs(asset_id: Optional[str] = None) -> Dict[str, Any]:
         if "duree_rep_h" in failures_ttf.columns:
             repair_series = pd.to_numeric(failures_ttf["duree_rep_h"], errors="coerce").dropna().tolist()
 
+    events_validated = _safe_df(proj.get("events_validated"))
+    observation_windows = _safe_df(proj.get("observation_windows"))
+    quality_report = _safe_df(proj.get("data_quality_report"))
+    if selected_asset:
+        if "asset_id" in events_validated:
+            events_validated = events_validated[events_validated.asset_id.astype(str).eq(str(selected_asset))].copy()
+        if "asset_id" in observation_windows:
+            observation_windows = observation_windows[observation_windows.asset_id.astype(str).eq(str(selected_asset))].copy()
+    # MTTR : toutes les réparations observées, y compris celle de l'événement de référence.
+    # repair_series est une série descriptive indépendante, pas un vecteur apparié aux TBF.
+    if not events_validated.empty and "repair_time_hours" in events_validated:
+        repair_series = _finite_numeric(events_validated.repair_time_hours).dropna().tolist()
     thermal_df = thermal_timeseries.copy()
 
     thermal_config: Dict[str, Any] = {}
@@ -656,12 +790,18 @@ def get_pipeline_inputs(asset_id: Optional[str] = None) -> Dict[str, Any]:
             alpha = float(analysis_settings.iloc[0]["alpha_significance"])
         except Exception:
             alpha = 0.05
+    if not math.isfinite(alpha) or not 0 < alpha < 1:
+        alpha = 0.05
 
     return {
         "asset_id": selected_asset,
         "asset_info": asset_info,
         "events_history": events_history,
         "failures_ttf": failures_ttf,
+        "events_validated": events_validated,
+        "observation_windows": observation_windows,
+        "data_quality_report": quality_report,
+        "time_basis": "calendar" if not events_validated.empty else "unspecified",
         "ttf_series": ttf_series,
         "repair_series": repair_series,
         "thermal_df": thermal_df if not thermal_df.empty else None,
