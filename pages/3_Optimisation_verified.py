@@ -1,3 +1,4 @@
+from core.scientific_ui import scientific_charts
 import streamlit as st
 from core.scientific_ui import start,analysis_required,show_optimization
 from core.reliability.optimize import optimize_maintenance
@@ -24,3 +25,6 @@ if o:
     show_optimization(o)
     with st.expander('Détail du calcul économique et contraintes'):
         st.json(o)
+
+if o:
+    scientific_charts(inputs,result,o)

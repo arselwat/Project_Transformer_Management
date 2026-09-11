@@ -10,6 +10,11 @@ from core.datahub import get_current_failures_df, get_current_project_data, get_
 from core.reliability.organigram import analyze_project_inputs
 from core.reliability.optimize import optimize_maintenance
 
+@st.cache_data(max_entries=8, ttl=3600, show_spinner=False)
+def cached_analysis(inputs, **options):
+    """Réutilise un résultat uniquement pour les mêmes données et options."""
+    return analyze_project_inputs(inputs, **options)
+
 LABELS = {'expon':'HPP', 'power_law_nhpp':'PLP-NHPP', 'weibull_2p':'Renouvellement Weibull', 'lognorm':'Renouvellement lognormal', 'grp_kijima_i':'GRP Kijima I'}
 
 def start(title, path):
@@ -92,3 +97,48 @@ def export_bundle(inputs, analysis, optimization):
             z.writestr(name+'.csv',df.to_csv(index=False))
         z.writestr('LISEZ_MOI.txt','Les CSV et le JSON proviennent du même calcul. Voir analysis_hash et les options de validation. Une échéance est indicative, non une date certaine de panne.')
     return b.getvalue()
+
+
+def scientific_charts(inputs, result, optimization=None):
+    """Graphiques issus des observations et sorties calculées, sans réajustement."""
+    x=np.asarray(inputs['ttf_series'],dtype=float)
+    if len(x):
+        st.subheader('Historique et diagnostics graphiques')
+        a,b=st.columns(2)
+        with a:
+            st.write('Nombre cumulé de pannes après la panne de référence')
+            st.line_chart(pd.DataFrame({'Temps calendaire (h)':np.r_[0,np.cumsum(x)],'Pannes cumulées':np.arange(len(x)+1)}).set_index('Temps calendaire (h)'))
+        with b:
+            st.write('Intervalles calendaires selon le rang')
+            st.line_chart(pd.DataFrame({'Rang':np.arange(1,len(x)+1),'Intervalle (h)':x}).set_index('Rang'))
+        if len(x)>1:
+            st.write('Dépendance entre intervalles successifs')
+            st.scatter_chart(pd.DataFrame({'Intervalle i (h)':x[:-1],'Intervalle i+1 (h)':x[1:]}),x='Intervalle i (h)',y='Intervalle i+1 (h)')
+    r=result['reliability']
+    st.subheader('Comparaison des modèles par AICc')
+    scores=[{'Modèle':LABELS.get(k,k),'AICc':v.get('aicc')} for k,v in r.get('candidates',{}).items() if v.get('aicc') is not None]
+    if scores:
+        st.bar_chart(pd.DataFrame(scores).set_index('Modèle'))
+    curves=r.get('curves',pd.DataFrame()).replace([np.inf,-np.inf],np.nan)
+    st.subheader('Courbes conditionnelles depuis la référence')
+    for col,title in [('R_t','Fiabilité R(u | s)'),('F_t','Probabilité de panne avant u'),('f_t','Densité du délai avant la prochaine panne (1/h)'),('h_t','Risque conditionnel / intensité NHPP (1/h)')]:
+        if col in curves and not curves.empty:
+            st.write(title)
+            st.line_chart(curves[['t',col]].rename(columns={'t':'Horizon supplémentaire (h)',col:title}).set_index('Horizon supplémentaire (h)'))
+    st.caption('Les courbes sont conditionnées par l’historique et le modèle retenu. Elles ne repartent pas de l’état neuf. Les valeurs infinies ne sont pas tracées.')
+    if optimization and optimization.get('T_recommended') is not None:
+        from core.reliability.organigram import conditional_reliability
+        from core.reliability.optimize import cost_rate_nhpp
+        o=optimization;p=r['params'];name=r['distribution']
+        top=max(o['T_recommended'],o.get('T_R') or 0,o.get('T_cost') or 0)*1.3
+        u=np.linspace(max(top/300,1e-6),top,250)
+        st.subheader('Fiabilité et cibles de planification')
+        rr=[conditional_reliability(name,p,float(t)) for t in u]
+        st.line_chart(pd.DataFrame({'Horizon (h)':u,'Fiabilité':rr,'Cible principale':o['R_target'],'Cible économique':o['R_min_cost']}).set_index('Horizon (h)'))
+        if name in ('power_law_nhpp','expon'):
+            beta=1. if name=='expon' else p['beta']
+            eta=1/p['lambda_hpp_h'] if name=='expon' else p['eta']
+            costs=[cost_rate_nhpp(float(t),beta,eta,o['C_prev'],o['C_corr'],p['reference_time_h'],p.get('origin_offset_h',0.)) for t in u]
+            st.write('Coût moyen prospectif par heure')
+            st.line_chart(pd.DataFrame({'Horizon (h)':u,'Coût / h':costs}).set_index('Horizon (h)'))
+        st.caption('Horizon retenu : %.2f h. Le tracé explore aussi des horizons hors des cibles ; ils ne sont pas des recommandations.' % o['T_recommended'])
