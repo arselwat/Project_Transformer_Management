@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
+from .interpretation import confidence,confidence_band,model_table,recommendation,GLOSSARY
 from .shared import start,input_context,analysis_required,cached_analysis,notices,plan,export_bundle,LABELS,invalidate
 from .source_import import read_source
 from .organigram import conditional_reliability
@@ -14,6 +15,13 @@ from core.datahub import get_current_project_data,get_current_failures_df,set_cu
 PATHS=['1_Sources_fully_linked_fixed.py','2_Indicateurs_verified.py','3_Optimisation_verified.py','4_Maintenance_verified.py','5_Resultat_analyse_optimisation_Maintenance_fixed.py']
 TITLES=['Sources de données','Analyse de fiabilité','Optimisation de maintenance','Plan de maintenance','Rapport et résultats']
 COLORS=['#35b9b1','#6495ed','#efa858','#ca8eff','#ef7384']
+def notices(r):
+    accepted=r.get('goodness',{}).get('accepted',r.get('validation_accepted'))
+    if accepted is False:
+        st.warning('Les tests d’adéquation rejettent l’ajustement. Les prévisions doivent être confrontées à l’état technique du transformateur.')
+    elif accepted is None:
+        st.info('Adéquation non établie : consulter la validation statistique avant de retenir le calendrier.')
+
 def fmt(x):
     try: return f'{float(x):,.1f}'.replace(',',' ') if np.isfinite(float(x)) else '—'
     except (TypeError,ValueError): return '—'
@@ -99,26 +107,27 @@ def indicators():
         with st.form('analysis_v4'):
             a,b=st.columns(2)
             with a:
-                rule=st.selectbox('Critère de sélection',['AICc','Scénario explicite','Prévision séquentielle'])
-                model=st.selectbox('Modèle du scénario',list(LABELS),format_func=LABELS.get)
+                rule=st.selectbox('Critère de sélection',['NHPP — réparation minimale','AICc (comparaison)','Scénario explicite','Prévision séquentielle'])
+                model=st.selectbox('Modèle du scénario',list(LABELS),index=1,format_func=LABELS.get)
             with b:
                 alpha=st.number_input('Seuil des tests',.001,.2,.05,format='%.3f')
-                heavy=st.checkbox('Autoriser les validations coûteuses pour ce calcul',value=False)
-                boot=st.number_input('Réplications bootstrap',0,3000,0,100)
-            st.caption('Le bootstrap et la sélection prédictive exigent une autorisation explicite ci-dessus. Ils peuvent saturer Community Cloud ; le mode AICc sans bootstrap reste disponible.')
+                heavy=st.checkbox('Autoriser la validation prédictive ou le bootstrap des modèles alternatifs',value=False)
+                boot=st.number_input('Réplications pour les intervalles de confiance',0,3000,300,100)
+            st.caption('Le NHPP représente la réparation minimale retenue dans cette étude : le fonctionnement est rétabli sans remise à zéro de l’âge. Les autres modèles servent à discuter cette hypothèse. Les intervalles de confiance sont calculés par bootstrap avec réestimation.')
             run=st.form_submit_button('Calculer l’analyse',type='primary')
         if run:
-            if (boot or rule=='Prévision séquentielle') and not heavy:
+            if (rule=='Prévision séquentielle' or (boot and rule!='NHPP — réparation minimale')) and not heavy:
                 st.error('Autorisez les validations coûteuses ou choisissez AICc avec 0 réplication.')
             else:
                 st.session_state.pop('science_analysis',None);st.session_state.pop('science_optimization',None);st.session_state.pop('maintenance_proposal_v4',None);st.session_state.pop('exports_v4',None)
                 with st.spinner('Comparaison des cinq modèles…'):
-                    result=cached_analysis(inputs,alpha=alpha,selection_rule='predictive' if rule=='Prévision séquentielle' else 'aicc',selected_model=model if rule=='Scénario explicite' else None,run_sequential=rule=='Prévision séquentielle',n_boot=int(boot))
+                    result=cached_analysis(inputs,alpha=alpha,selection_rule='predictive' if rule=='Prévision séquentielle' else 'aicc',selected_model='power_law_nhpp' if rule=='NHPP — réparation minimale' else model if rule=='Scénario explicite' else None,run_sequential=rule=='Prévision séquentielle',n_boot=int(boot))
                 if result['reliability']['status']=='computed': st.session_state['science_analysis']=result
                 else: st.error(result['reliability'].get('error','Calcul indisponible'))
     result=st.session_state.get('science_analysis')
     if not result: st.info('Les données sont prêtes. Cliquez sur Calculer l’analyse pour afficher les résultats.');return
     r=result['reliability'];ind=r['indicators']
+    st.write('**Hypothèse principale :** remise en service sans retour à l’état neuf. Le choix du NHPP est déclaré comme hypothèse de l’étude, distincte du classement AICc.')
     cards([('Intervalles',str(len(inputs['ttf_series']))),('Intervalle moyen (h)',fmt(np.mean(inputs['ttf_series']))),('MTTR renseigné (h)',fmt(ind.get('mttr_h'))),('Horizon à 80 % (h)',fmt(r['horizon']['hours']))])
     st.subheader(LABELS[r['distribution']]);notices(r)
     tabs=st.tabs(['Vue d’ensemble','Diagnostics','Modèles et paramètres','Courbes fiabilistes','Validation'])
@@ -129,13 +138,15 @@ def indicators():
         st.subheader('Dépendance');data_table(result['tables']['dependence_results'])
         st.caption('Une tendance des intervalles n’a pas le même sens qu’une tendance de l’intensité. Une corrélation non significative ne démontre pas l’indépendance.')
     with tabs[2]:
-        data_table(result['tables']['fit_candidates']);st.write('Paramètres du modèle retenu');st.json(json_safe(r['params']))
+        data_table(model_table(r));st.write('Paramètres et intervalles de confiance');ic,b=confidence(r);data_table(ic)
+        st.caption('Les renouvellements supposent une restauration statistique des cycles. Ils ne sont pas utilisés comme hypothèse physique principale du transformateur.')
         rows=[(LABELS[k],v['aicc']) for k,v in r['candidates'].items() if v.get('aicc') is not None]
         if rows:
             f=go.Figure(go.Bar(x=[x[0] for x in rows],y=[x[1] for x in rows],marker_color=COLORS));f.update_layout(title='Comparaison AICc — plus faible = meilleur classement relatif',height=330);st.plotly_chart(f,use_container_width=True)
-    with tabs[3]: reliability_plots(r)
+    with tabs[3]: reliability_plots(r); confidence_display(r)
     with tabs[4]:
-        data_table(result['tables']['predictive_validation']);st.write(r.get('bootstrap',{}));data_table(result['tables']['reliability_summary'])
+        data_table(result['tables']['predictive_validation']);confidence_display(r,draw_band=False)
+        st.subheader('Comprendre les indicateurs et les tests');data_table(GLOSSARY)
         st.caption('Les tests KS/CvM nominaux ne remplacent pas le bootstrap avec réestimation. Classement, adéquation et prévision sont trois évaluations distinctes.')
 def optimization_charts(r,o):
     if o.get('T_recommended') is None:return
@@ -174,18 +185,22 @@ def maintenance():
     if not o:st.info('Calculez les horizons dans Optimisation.');return
     p=plan(inputs,o)
     cards([('Équipement',inputs['asset_id']),('Horizon (jours)',fmt(o['T_recommended']/24) if o.get('T_recommended') is not None else '—'),('Jours restants',fmt(p.get('jours restants')))])
-    st.info(p['statut']);data_table(pd.DataFrame([p]));notices(o)
+    proposed=recommendation(result['reliability'],o,p)
+    st.subheader(proposed['Mode proposé']);st.info(proposed['Action recommandée'])
+    st.write('**Priorité :** '+proposed['Priorité proposée']);st.write(proposed['Justification'])
+    data_table(pd.DataFrame([p]).drop(columns=['qualification'],errors='ignore'))
+    confidence_display(result['reliability'])
     with st.form('proposal'):
         a,b=st.columns(2)
-        with a: action=st.selectbox('Action proposée',['Inspection technique','Révision du plan préventif','Actualisation de l’historique','Intervention à définir après diagnostic']);owner=st.text_input('Responsable / service')
-        with b: priority=st.selectbox('Priorité appréciée par l’exploitant',['À évaluer','Normale','Élevée','Urgente']);status=st.selectbox('État de la proposition',['À examiner','À planifier','Planifiée'])
-        notes=st.text_area('Justification technique et observations')
+        with a: action=st.selectbox('Action proposée',[proposed['Mode proposé'],'Maintenance conditionnelle avec inspections périodiques','Maintenance préventive planifiée','Diagnostic complémentaire']);owner=st.text_input('Responsable / service')
+        with b: priority=st.selectbox('Priorité appréciée par l’exploitant',[proposed['Priorité proposée'],'Normale','Élevée','Urgente']);status=st.selectbox('État de la proposition',['À examiner','À planifier','Planifiée'])
+        notes=st.text_area('Justification technique et observations',value=proposed['Justification'])
         save=st.form_submit_button('Enregistrer la proposition',type='primary')
     if save:
         st.session_state.pop('exports_v4',None)
         if not notes.strip():st.error('Renseignez la justification technique.')
         else:
-            st.session_state['maintenance_proposal_v4']={'asset':inputs['asset_id'],'analysis_hash':result['reliability']['analysis_hash'],'action':action,'responsable':owner,'priorite':priority,'etat':status,'justification':notes,'enregistre_le':datetime.now().isoformat(),**p};st.success('Proposition conservée dans cette session. Téléchargez-la pour la conserver après déconnexion.')
+            st.session_state['maintenance_proposal_v4']={'asset':inputs['asset_id'],'analysis_hash':result['reliability']['analysis_hash'],'proposition_automatique':proposed,'action':action,'responsable':owner,'priorite':priority,'etat':status,'justification':notes,'enregistre_le':datetime.now().isoformat(),**p};st.success('Proposition conservée dans cette session. Téléchargez-la pour la conserver après déconnexion.')
     proposal=st.session_state.get('maintenance_proposal_v4')
     if proposal and proposal['analysis_hash']==result['reliability']['analysis_hash']:
         data_table(pd.DataFrame([proposal]));st.download_button('Télécharger la fiche de maintenance',json.dumps(json_safe(proposal),ensure_ascii=False,indent=2),'fiche_maintenance.json')
@@ -196,6 +211,9 @@ def reports():
     tabs=st.tabs(['Rapport visuel','Tableaux détaillés','Téléchargements'])
     with tabs[0]:reliability_plots(r);optimization_charts(r,o) if o else None
     tables=export_tables(inputs['asset_id'],inputs,result,o,proposal)
+    tables['intervalles_confiance']=confidence(r)[0]
+    tables['guide_indicateurs']=GLOSSARY
+    tables['comparaison_modeles']=model_table(r)
     with tabs[1]:
         for title,df in tables.items():
             with st.expander(title.replace('_',' ').capitalize()):data_table(df)
@@ -211,7 +229,27 @@ def reports():
         if exports and exports['hash']==r['analysis_hash']:
             st.download_button('Rapport PDF',exports['pdf'],'rapport_fiabilite.pdf','application/pdf');st.download_button('Classeur Excel complet',exports['xlsx'],'resultats.xlsx','application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
         st.caption('Le PDF est une synthèse tabulaire. Les graphiques interactifs sont dans le rapport visuel ; toutes les données des courbes figurent dans les exports.')
+
+def confidence_display(r,draw_band=True):
+    table,b=confidence(r)
+    level=100*(1-r['context']['alpha'])
+    st.subheader('Intervalles de confiance à %g %%'%level)
+    if table.empty:
+        st.info('Intervalles non disponibles : lancer le calcul avec des réplications bootstrap et vérifier que toutes les simulations aboutissent.')
+        return
+    data_table(table)
+    st.caption('%s simulations réussies sur %s. IC percentiles conditionnels au modèle ; ils ne sont pas des intervalles de prédiction de la date de panne.'%(b.get('successful'),b.get('requested')))
+    axis=r['curves']['t'].to_numpy();band=confidence_band(r,axis)
+    if band is not None and draw_band:
+        fig=go.Figure()
+        fig.add_trace(go.Scatter(x=axis,y=band[1],mode='lines',line=dict(width=0),showlegend=False))
+        fig.add_trace(go.Scatter(x=axis,y=band[0],mode='lines',line=dict(width=0),fill='tonexty',fillcolor='rgba(53,185,177,.22)',name='IC ponctuel à %g %%'%level))
+        fig.add_trace(go.Scatter(x=axis,y=r['curves']['R_t'],name='Fiabilité estimée',line=dict(color='#35b9b1',width=3)))
+        fig.update_layout(title='Fiabilité future et incertitude paramétrique',xaxis_title='Horizon supplémentaire (h)',yaxis_title='Probabilité de fonctionnement sans panne',height=380)
+        st.plotly_chart(fig,use_container_width=True)
+    if b.get('accepted') is False:st.warning('L’ajustement est rejeté par au moins un test bootstrap. Les IC restent conditionnels à ce modèle et demandent une interprétation prudente.')
+
 def render(number):
     start(TITLES[number-1],'pages/'+PATHS[number-1])
-    st.caption('TRANSFORMATEURS · ÉTUDE DE FIABILITÉ · VERSION 4.0')
+
     [source,indicators,optimization,maintenance,reports][number-1]()

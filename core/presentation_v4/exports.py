@@ -50,13 +50,13 @@ def pdf_bytes(asset,tables):
     document=SimpleDocTemplate(target,pagesize=landscape(A4),rightMargin=26,leftMargin=26,topMargin=26,bottomMargin=26)
     flow=[Paragraph("Analyse de fiabilité — "+escape(str(asset)),styles["Title"]),Spacer(1,10)]
     # Tableaux longs et résultats complets disponibles en Excel/JSON ; PDF de synthèse.
-    for name in ("tracabilite","reliability_summary","fit_candidates","predictive_validation","optimisation","proposition_maintenance","limites"):
+    for name in ("intervalles_confiance","guide_indicateurs","tracabilite","reliability_summary","fit_candidates","predictive_validation","optimisation","proposition_maintenance","limites"):
         frame=tables.get(name,pd.DataFrame())
         if frame.empty: continue
         flow.append(Paragraph(escape(name.replace("_"," ")),styles["Heading2"]))
         # Présentation verticale pour garder tous les champs lisibles.
         for _,row in frame.iterrows():
-            pairs=[[Paragraph(escape(str(k)),styles["BodyText"]),Paragraph(escape(str(json_safe(v))),styles["BodyText"])] for k,v in row.items()]
+            pairs=[[Paragraph(escape(str(k)),styles["BodyText"]),Paragraph(escape(str(json_safe(v)).replace('β','beta').replace('η','eta').replace('λ','lambda').replace('μ','mu').replace('σ','sigma')),styles["BodyText"])] for k,v in row.items()]
             table=Table(pairs,colWidths=[215,550],hAlign="LEFT")
             table.setStyle(TableStyle([("VALIGN",(0,0),(-1,-1),"TOP"),("GRID",(0,0),(-1,-1),.25,colors.lightgrey),("BACKGROUND",(0,0),(0,-1),colors.HexColor("#eef4ff"))]))
             flow.extend([table,Spacer(1,8)])

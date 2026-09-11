@@ -1,54 +1,46 @@
-VERSION 4 — PARCOURS SCIENTIFIQUE DE PRESENTATION
+MISE A JOUR DU PARCOURS SCIENTIFIQUE
 
-1. Arrêter l'application et sauvegarder le projet actuel.
-2. Copier ENSEMBLE les dossiers core et pages de cette archive à la racine
-   du projet existant. Fusionner les dossiers, remplacer les fichiers homonymes.
-   Ne pas supprimer les autres modules du projet.
-3. Vérifier que core/presentation_v4/dashboard.py existe bien.
-4. Dans le dossier du projet : python verifier_installation_v4.py
-5. Relancer : python -m streamlit run app.py
+Copier ensemble core et pages à la racine du projet existant, ainsi que
+verifier_installation_v4.py et manifest_v4.json. Fusionner les dossiers,
+ne pas supprimer les autres modules. Sauvegarder préalablement le projet.
+Vérifier : python verifier_installation_v4.py
+Lancer : python -m streamlit run app.py
+Sur Cloud : un seul commit contenant tous les fichiers, puis redémarrage.
+Réimporter l’historique et relancer l’analyse pour obtenir les IC.
 
-SUR STREAMLIT CLOUD
-Envoyer dans le même commit les cinq pages, core/datahub.py et tout le dossier
-core/presentation_v4, puis redémarrer l'application après le déploiement.
-Ne pas copier uniquement les fichiers pages : ils ont besoin du dossier complet.
-Une ancienne restriction CPU de la plateforme reste indépendante de cette livraison.
+MODIFICATIONS
+NHPP principal par défaut : réparation minimale sans remise à zéro de l’âge.
+Les renouvellements restent des références de comparaison statistique.
+Ils ne représentent pas un retour physique du transformateur à l’état neuf.
+L’hypothèse NHPP est déclarée, pas présentée comme gagnante automatique à l’AICc.
 
-CONTENU ET FONCTIONS
-Sources : formats historiques CSV/Excel, aperçu, contrôles, export des intervalles,
-édition de la fin documentée de la période d'observation.
-Indicateurs : synthèse, diagnostics, modèles, courbes, validation dans cinq onglets.
-Optimisation : paramètres regroupés, indicateurs et courbes interactives.
-Maintenance : échéance, priorité humaine justifiée, fiche enregistrée en session
-et exportable en JSON. Aucun score automatique arbitraire.
-Résultats : rapport visuel, tableaux détaillés, CSV/JSON, PDF et Excel.
-Le PDF est une synthèse tabulaire ; les graphiques sont dans le rapport visuel.
-Les séries numériques des courbes sont incluses dans les exports.
+300 simulations bootstrap par défaut pour le NHPP. IC percentiles à 95 %
+au seuil alpha=0,05 sur beta, eta et l’horizon à 80 % de fiabilité.
+Bande ponctuelle d’incertitude paramétrique sur R(u|s), non bande simultanée
+ni intervalle de prédiction de la date de panne. Les simulations sont mises en cache.
+Une calibration incomplète ne fournit pas d’IC artificiel.
+Les IC sont conditionnels au modèle, même lorsqu’un test rejette l’ajustement.
+Pour une autre cible dans Optimisation, l’IC d’horizon affiché reste celui de
+la cible d’analyse à 80 %, explicitement indiqué dans le tableau.
 
-DEPENDANCES
-Les dépendances du requirements.txt d'origine couvrent ce parcours :
-streamlit, numpy, pandas, scipy, plotly, openpyxl et reportlab.
-L'authentification, le thème, l'accueil et les modules 6 à 9 d'origine sont conservés.
-Les pages V4 n'importent plus core/scientific_ui.py ni core/workflow.py.
-Les anciens fichiers peuvent rester sans être appelés par les cinq pages V4.
+Maintenance : proposition automatique de mode, action, priorité et justification.
+NHPP d’intensité croissante : préventif planifié avec surveillance conditionnelle.
+Autres cas : maintenance conditionnelle et inspections périodiques.
+Echéance dépassée : actualisation et inspection proposées en priorité ;
+le logiciel ne suppose pas que la panne aurait déjà dû se produire.
+Règles heuristiques explicites, non politique de maintenance validée par terrain.
+L’agent peut compléter ou modifier la proposition et l’exporter.
+La fiche reste en session : la télécharger pour la conserver.
 
-VALIDATION EFFECTUEE
-Test Streamlit AppTest avec vrais core/ui.py, core/security/auth.py et app.py.
-Session authentifiée injectée pour les tests ; formulaire de connexion non modifié.
-Navigation réelle entre les cinq pages, import CSV historique Funa par le lecteur,
-comparaison des modèles, scénario PLP : horizon à 80 % = environ 1813,4 h.
-Huit graphiques interactifs présents dans Indicateurs.
-Optimisation, proposition de maintenance, génération PDF et Excel,
-retour à Indicateurs sans perte d'analyse : aucune exception dans ce parcours.
-Première page du PDF rendue et inspectée.
-Ces tests ne garantissent pas tous les fichiers ni toutes les versions du cloud.
+Tableaux : noms français, paramètres séparés, IC et guide des indicateurs.
+Guide inclus dans Validation et les exports. Mentions de version retirées des pages.
+Les avertissements scientifiques nécessaires sont conservés sans répétitions inutiles.
+PDF tabulaire, Excel complet, CSV/JSON ; graphiques interactifs dans les pages.
 
-UTILISATION
-Réimporter l'historique, cliquer Utiliser ces données ; ouvrir Indicateurs,
-Calculer l'analyse ; ouvrir Optimisation et Calculer les horizons.
-Les résultats sont conservés pendant la session. Télécharger les rapports avant
-une déconnexion ou un redémarrage.
-Bootstrap et validation prédictive sont disponibles mais exigent d'autoriser
-explicitement le calcul coûteux. Ils ne démarrent jamais automatiquement.
-L'AICc ne prouve pas l'adéquation ; le modèle choisi peut rester exploratoire.
-L'économie des renouvellements/GRP n'est pas implémentée : horizon fiabiliste seul.
+TESTS
+Parcours Streamlit AppTest avec modules d’origine, Funa, NHPP par défaut,
+300 réplications abouties, bande d’incertitude, optimisation, fiche maintenance,
+exports PDF/Excel et navigation sans perte d’analyse : tests réussis.
+Horizon Funa : environ 1813,4 h à 80 % ; les IC varient avec le protocole.
+Le déploiement sur votre hébergement reste à vérifier. Un blocage CPU antérieur
+n’est pas levé par le changement des fichiers.
